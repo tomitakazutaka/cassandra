@@ -50,5 +50,7 @@
   </root>
   
   <logger name="com.thinkaurelius.thrift" level="ERROR"/>
-  <logger name="org.apache.cassandra.db.compaction.CompactionManager" level="DEBUG"/>
+  <logger name="org.apache.cassandra.db.compaction.CompactionManager" level="INFO"/>
+  <logger name="org.apache.cassandra.db.ColumnFamilyStore" level="INFO"/>
+  <logger name="org.apache.cassandra.config.CFMetaData" level="INFO"/> */
 </configuration>
