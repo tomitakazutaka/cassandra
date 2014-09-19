@@ -16,13 +16,13 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
 {
     protected OverlappingTieredCompactionStrategyOptions options;
     protected volatile int estimatedRemainingTasks;
-	
-	protected OverlappingTieredCompactionStrategy(ColumnFamilyStore cfs,Map<String, String> options) {
-		super(cfs, options);
-	}
+    
+    public OverlappingTieredCompactionStrategy(ColumnFamilyStore cfs,Map<String, String> options) {
+        super(cfs, options);
+    }
 
-	private static final Logger logger = LoggerFactory.getLogger(OverlappingTieredCompactionStrategy.class);
-	
+    private static final Logger logger = LoggerFactory.getLogger(OverlappingTieredCompactionStrategy.class);
+    
     private static final Comparator<Pair<List<SSTableReader>,Double>> bucketsByHotnessComparator = new Comparator<Pair<List<SSTableReader>, Double>>()
     {
         public int compare(Pair<List<SSTableReader>, Double> o1, Pair<List<SSTableReader>, Double> o2)
@@ -42,7 +42,6 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
         }
     };
 
-	
     public static <T> List<List<T>> getBuckets(Collection<Pair<T, Long>> files)
     {
         List<Pair<T, Long>> sortedFiles = new ArrayList<Pair<T, Long>>(files);
@@ -81,8 +80,8 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
         return new ArrayList<List<T>>(buckets.values());
 
 }
-    private static double hotness(SSTableReader sstr)
-    {
+
+    private static double hotness(SSTableReader sstr) {
         // system tables don't have read meters, just use 0.0 for the hotness
         return sstr.readMeter == null ? 0.0 : sstr.readMeter.twoHourRate() / sstr.estimatedKeys();
     }
@@ -112,12 +111,14 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
 
         return Pair.create(bucket, bucketHotness);
     }
+
     public static List<Pair<SSTableReader, Long>> createSSTableAndLengthPairs(Iterable<SSTableReader> sstables) {
         List<Pair<SSTableReader, Long>> sstableLengthPairs = new ArrayList<Pair<SSTableReader, Long>>(Iterables.size(sstables));
         for(SSTableReader sstable : sstables)
             sstableLengthPairs.add(Pair.create(sstable, sstable.bytesOnDisk()));
         return sstableLengthPairs;
     }
+
     public static List<SSTableReader> mostInterestingBucket(List<List<SSTableReader>> buckets) {
         final List<Pair<List<SSTableReader>, Double>> prunedBucketsAndHotness = new ArrayList<>(buckets.size());
         for (List<SSTableReader> bucket : buckets) {
@@ -143,10 +144,9 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
         estimatedRemainingTasks = n;
     }
 
-
     private List<SSTableReader> getNextBackgroundSSTables(int gcBefore) {
 
-        	if (!isEnabled()) return Collections.emptyList();
+            if (!isEnabled()) return Collections.emptyList();
         
         Iterable<SSTableReader> candidates = filterSuspectSSTables(cfs.getUncompactingSSTables());
 
@@ -156,11 +156,10 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
         updateEstimatedCompactionsByTasks(buckets);
         List<SSTableReader> mostInteresting = mostInterestingBucket(buckets);
         return mostInteresting;
-	}
+    }
 
-
-	@Override
-	public AbstractCompactionTask getNextBackgroundTask(int gcBefore) {
+    @Override
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore) {
         if (!isEnabled()) return null;
 
         while (true)
@@ -172,12 +171,11 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
             if (cfs.getDataTracker().markCompacting(hottestBucket))
                 return new CompactionTask(cfs, hottestBucket, gcBefore, false);
         }
-	}
+    }
 
-
-	@Override
-	public Collection<AbstractCompactionTask> getMaximalTask(int gcBefore) {
-		
+    @Override
+    public Collection<AbstractCompactionTask> getMaximalTask(int gcBefore) {
+        
         Iterable<SSTableReader> allSSTables = cfs.markAllCompacting();
         if (allSSTables == null || Iterables.isEmpty(allSSTables)) 
             return null;
@@ -185,34 +183,32 @@ public class OverlappingTieredCompactionStrategy extends AbstractCompactionStrat
         Set<SSTableReader> sstables = Sets.newHashSet(allSSTables);
         Set<SSTableReader> repaired = new HashSet<>();
         Set<SSTableReader> unrepaired = new HashSet<>();
-        for (SSTableReader sstable : sstables)
-        {
-            if (sstable.isRepaired())
+        for (SSTableReader sstable : sstables) {
+            if (sstable.isRepaired()) {
                 repaired.add(sstable);
-            else
+            } else {
                 unrepaired.add(sstable);
+            }
         }
         return Arrays.<AbstractCompactionTask>asList(new CompactionTask(cfs, repaired, gcBefore, false), new CompactionTask(cfs, unrepaired, gcBefore, false));
-	}
+    }
 
-	@Override
-	public AbstractCompactionTask getUserDefinedTask(
-			Collection<SSTableReader> sstables, int gcBefore) {
-		// TODO Auto-generated method stub
-		return null;
-	}
+    @Override
+    public AbstractCompactionTask getUserDefinedTask(
+            Collection<SSTableReader> sstables, int gcBefore) {
+        // TODO Auto-generated method stub
+        return null;
+    }
 
-	@Override
-	public int getEstimatedRemainingTasks() {
-		// TODO Auto-generated method stub
-		return 0;
-	}
+    @Override
+    public int getEstimatedRemainingTasks() {
+        // TODO Auto-generated method stub
+        return 0;
+    }
 
-	@Override
-	public long getMaxSSTableBytes() {
-		// TODO Auto-generated method stub
-		return 0;
-	}
-
+    @Override
+    public long getMaxSSTableBytes() {
+        return Long.MAX_VALUE;
+    }
 
 }
