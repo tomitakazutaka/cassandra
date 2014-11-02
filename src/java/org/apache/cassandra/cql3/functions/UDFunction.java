@@ -40,7 +40,7 @@ import org.apache.cassandra.utils.FBUtilities;
 /**
  * Base class for User Defined Functions.
  */
-public abstract class UDFunction extends AbstractFunction
+public abstract class UDFunction extends AbstractFunction implements ScalarFunction
 {
     protected static final Logger logger = LoggerFactory.getLogger(UDFunction.class);
 
@@ -59,10 +59,16 @@ public abstract class UDFunction extends AbstractFunction
                          boolean deterministic)
     {
         super(name, argTypes, returnType);
+        assert new HashSet<>(argNames).size() == argNames.size() : "duplicate argument names";
         this.argNames = argNames;
         this.language = language;
         this.body = body;
         this.deterministic = deterministic;
+    }
+
+    public boolean isAggregate()
+    {
+        return false;
     }
 
     public static UDFunction create(FunctionName name,
@@ -76,10 +82,22 @@ public abstract class UDFunction extends AbstractFunction
     {
         switch (language)
         {
-            case "class": return new ReflectionBasedUDF(name, argNames, argTypes, returnType, language, body, deterministic);
-            case "java": return new JavaSourceBasedUDF(name, argNames, argTypes, returnType, language, body, deterministic);
-            default: throw new InvalidRequestException(String.format("Invalid language %s for '%s'", language, name));
+            case "java": return JavaSourceUDFFactory.buildUDF(name, argNames, argTypes, returnType, body, deterministic);
+            default: return new ScriptBasedUDF(name, argNames, argTypes, returnType, language, body, deterministic);
         }
+    }
+
+    static Class<?>[] javaParamTypes(List<AbstractType<?>> argTypes)
+    {
+        Class<?> paramTypes[] = new Class[argTypes.size()];
+        for (int i = 0; i < paramTypes.length; i++)
+            paramTypes[i] = javaType(argTypes.get(i));
+        return paramTypes;
+    }
+
+    static Class<?> javaType(AbstractType<?> type)
+    {
+        return type.getSerializer().getType();
     }
 
     /**

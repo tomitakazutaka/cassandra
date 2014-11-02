@@ -18,6 +18,8 @@
 package org.apache.cassandra.cql3;
 
 import java.io.File;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
@@ -37,7 +39,6 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.*;
@@ -45,7 +46,6 @@ import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
  * Base class for CQL tests.
@@ -54,7 +54,7 @@ public abstract class CQLTester
 {
     protected static final Logger logger = LoggerFactory.getLogger(CQLTester.class);
 
-    private static final String KEYSPACE = "cql_test_keyspace";
+    public static final String KEYSPACE = "cql_test_keyspace";
     private static final boolean USE_PREPARED_VALUES = Boolean.valueOf(System.getProperty("cassandra.test.use_prepared", "true"));
     private static final AtomicInteger seqNumber = new AtomicInteger();
 
@@ -140,11 +140,7 @@ public abstract class CQLTester
             if (currentTable != null)
                 Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable).forceFlush().get();
         }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (ExecutionException e)
+        catch (InterruptedException | ExecutionException e)
         {
             throw new RuntimeException(e);
         }
@@ -287,7 +283,6 @@ public abstract class CQLTester
             for (int j = 0; j < meta.size(); j++)
             {
                 ColumnSpecification column = meta.get(j);
-                Object expectedValue = expected[j];
                 ByteBuffer expectedByteValue = makeByteBuffer(expected[j], (AbstractType)column.type);
                 ByteBuffer actualValue = actual.getBytes(column.name.toString());
 
@@ -307,7 +302,7 @@ public abstract class CQLTester
             Assert.fail(String.format("Got less rows than expected. Expected %d but got %d.", rows.length, i));
         }
 
-        Assert.assertTrue(String.format("Got more rows than expected. Expected %d but got %d", rows.length, i), i == rows.length);
+        Assert.assertTrue(String.format("Got %s rows than expected. Expected %d but got %d", rows.length>i ? "less" : "more", rows.length, i), i == rows.length);
     }
 
     protected void assertAllRows(Object[]... rows) throws Throwable
@@ -404,7 +399,7 @@ public abstract class CQLTester
         // it would complain with ClassCastException if we pass say a string where an int is excepted (since
         // it bases conversion on what the value should be, not what it is). For testing, we sometimes
         // want to pass value of the wrong type and assert that this properly raise an InvalidRequestException
-        // and executeOnceInternal goes into way. So instead, we pre-convert everything to bytes here base
+        // and executeOnceInternal goes into way. So instead, we pre-convert everything to bytes here based
         // on the value.
         // Besides, we need to handle things like TupleValue that executeOnceInternal don't know about.
 
@@ -619,6 +614,12 @@ public abstract class CQLTester
 
         if (value instanceof Double)
             return DoubleType.instance;
+
+        if (value instanceof BigInteger)
+            return IntegerType.instance;
+
+        if (value instanceof BigDecimal)
+            return DecimalType.instance;
 
         if (value instanceof String)
             return UTF8Type.instance;

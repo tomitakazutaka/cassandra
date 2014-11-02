@@ -17,6 +17,9 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -24,59 +27,6 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 
 public class UFTest extends CQLTester
 {
-    public static Double sin(Double val)
-    {
-        return val != null ? Math.sin(val) : null;
-    }
-
-    public static Float sin(Float val)
-    {
-        return val != null ? (float)Math.sin(val) : null;
-    }
-
-    public static Double badSin(Double val)
-    {
-        return 42.0;
-    }
-
-    public static String badSinBadReturn(Double val)
-    {
-        return "foo";
-    }
-
-    public Float nonStaticMethod(Float val)
-    {
-        return new Float(1.0);
-    }
-
-    private static Float privateMethod(Float val)
-    {
-        return new Float(1.0);
-    }
-
-    public static String repeat(String v, Integer n)
-    {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < n; i++)
-            sb.append(v);
-        return sb.toString();
-    }
-
-    public static String overloaded(String v)
-    {
-        return "f1";
-    }
-
-    public static String overloaded(Integer v)
-    {
-        return "f2";
-    }
-
-    public static String overloaded(String v1, String v2)
-    {
-        return "f3";
-    }
-
     @Test
     public void testFunctionCreationAndDrop() throws Throwable
     {
@@ -86,26 +36,12 @@ public class UFTest extends CQLTester
         execute("INSERT INTO %s(key, d) VALUES (?, ?)", 2, 2d);
         execute("INSERT INTO %s(key, d) VALUES (?, ?)", 3, 3d);
 
-        // creation with a bad class
-        assertInvalid("CREATE FUNCTION foo::sin1 ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.DoesNotExist#doesnotexist'");
-        // and a good class but inexisting method
-        assertInvalid("CREATE FUNCTION foo::sin2 ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#doesnotexist'");
-        // with a non static method
-        assertInvalid("CREATE FUNCTION foo::sin3 ( input float ) RETURNS float USING 'org.apache.cassandra.cql3.UFTest#nonStaticMethod'");
-        // with a non public method
-        assertInvalid("CREATE FUNCTION foo::sin4 ( input float ) RETURNS float USING 'org.apache.cassandra.cql3.UFTest#privateMethod'");
-
-        // creation with bad argument types
-        assertInvalid("CREATE FUNCTION foo::sin5 ( input text ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#sin'");
-        // with bad return types
-        assertInvalid("CREATE FUNCTION foo::sin6 ( input double ) RETURNS text USING 'org.apache.cassandra.cql3.UFTest#sin'");
-
         // simple creation
-        execute("CREATE FUNCTION foo::sin ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#sin'");
+        execute("CREATE FUNCTION foo::sin ( input double ) RETURNS double LANGUAGE java AS 'return Double.valueOf(Math.sin(input.doubleValue()));'");
         // check we can't recreate the same function
-        assertInvalid("CREATE FUNCTION foo::sin ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#sin'");
+        assertInvalid("CREATE FUNCTION foo::sin ( input double ) RETURNS double LANGUAGE java AS 'return Double.valueOf(Math.sin(input.doubleValue()));'");
         // but that it doesn't complay with "IF NOT EXISTS"
-        execute("CREATE FUNCTION IF NOT EXISTS foo::sin ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#sin'");
+        execute("CREATE FUNCTION IF NOT EXISTS foo::sin ( input double ) RETURNS double LANGUAGE java AS 'return Double.valueOf(Math.sin(input.doubleValue()));'");
 
         // Validate that it works as expected
         assertRows(execute("SELECT key, foo::sin(d) FROM %s"),
@@ -114,10 +50,8 @@ public class UFTest extends CQLTester
             row(3, Math.sin(3d))
         );
 
-        // Replace the method with incompatible return type
-        assertInvalid("CREATE OR REPLACE FUNCTION foo::sin ( input double ) RETURNS text USING 'org.apache.cassandra.cql3.UFTest#badSinBadReturn'");
         // proper replacement
-        execute("CREATE OR REPLACE FUNCTION foo::sin ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#badSin'");
+        execute("CREATE OR REPLACE FUNCTION foo::sin ( input double ) RETURNS double LANGUAGE java AS 'return Double.valueOf(42d);'");
 
         // Validate the method as been replaced
         assertRows(execute("SELECT key, foo::sin(d) FROM %s"),
@@ -127,7 +61,7 @@ public class UFTest extends CQLTester
         );
 
         // same function but without namespace
-        execute("CREATE FUNCTION sin ( input double ) RETURNS double USING 'org.apache.cassandra.cql3.UFTest#sin'");
+        execute("CREATE FUNCTION sin ( input double ) RETURNS double LANGUAGE java AS 'return Double.valueOf(Math.sin(input.doubleValue()));'");
         assertRows(execute("SELECT key, sin(d) FROM %s"),
             row(1, Math.sin(1d)),
             row(2, Math.sin(2d)),
@@ -146,6 +80,9 @@ public class UFTest extends CQLTester
         // can't drop native functions
         assertInvalid("DROP FUNCTION dateof");
         assertInvalid("DROP FUNCTION uuid");
+
+        // sin() no longer exists
+        assertInvalid("SELECT key, sin(d) FROM %s");
     }
 
     @Test
@@ -155,7 +92,10 @@ public class UFTest extends CQLTester
 
         execute("INSERT INTO %s(v) VALUES (?)", "aaa");
 
-        execute("CREATE FUNCTION repeat (v text, n int) RETURNS text USING 'org.apache.cassandra.cql3.UFTest#repeat'");
+        execute("CREATE FUNCTION repeat (v text, n int) RETURNS text LANGUAGE java AS 'StringBuilder sb = new StringBuilder();\n" +
+                "        for (int i = 0; i < n.intValue(); i++)\n" +
+                "            sb.append(v);\n" +
+                "        return sb.toString();'");
 
         assertRows(execute("SELECT v FROM %s WHERE v=repeat(?, ?)", "a", 3), row("aaa"));
         assertEmpty(execute("SELECT v FROM %s WHERE v=repeat(?, ?)", "a", 2));
@@ -168,13 +108,13 @@ public class UFTest extends CQLTester
 
         execute("INSERT INTO %s(k, v) VALUES (?, ?)", "f2", 1);
 
-        execute("CREATE FUNCTION overloaded(v varchar) RETURNS text USING 'org.apache.cassandra.cql3.UFTest'");
-        execute("CREATE OR REPLACE FUNCTION overloaded(i int) RETURNS text USING 'org.apache.cassandra.cql3.UFTest'");
-        execute("CREATE OR REPLACE FUNCTION overloaded(v1 text, v2 text) RETURNS text USING 'org.apache.cassandra.cql3.UFTest'");
-        execute("CREATE OR REPLACE FUNCTION overloaded(v ascii) RETURNS text USING 'org.apache.cassandra.cql3.UFTest'");
+        execute("CREATE FUNCTION overloaded(v varchar) RETURNS text LANGUAGE java AS 'return \"f1\";'");
+        execute("CREATE OR REPLACE FUNCTION overloaded(i int) RETURNS text LANGUAGE java AS 'return \"f2\";'");
+        execute("CREATE OR REPLACE FUNCTION overloaded(v1 text, v2 text) RETURNS text LANGUAGE java AS 'return \"f3\";'");
+        execute("CREATE OR REPLACE FUNCTION overloaded(v ascii) RETURNS text LANGUAGE java AS 'return \"f1\";'");
 
         // text == varchar, so this should be considered as a duplicate
-        assertInvalid("CREATE FUNCTION overloaded(v varchar) RETURNS text USING 'org.apache.cassandra.cql3.UFTest'");
+        assertInvalid("CREATE FUNCTION overloaded(v varchar) RETURNS text LANGUAGE java AS 'return \"f1\";'");
 
         assertRows(execute("SELECT overloaded(k), overloaded(v), overloaded(k, k) FROM %s"),
             row("f1", "f2", "f3")
@@ -213,6 +153,11 @@ public class UFTest extends CQLTester
     @Test
     public void testCreateOrReplaceJavaFunction() throws Throwable
     {
+        createTable("CREATE TABLE %s (key int primary key, val double)");
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1d);
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 2, 2d);
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 3, 3d);
+
         execute("create function foo::corjf ( input double ) returns double language java\n" +
                 "AS '\n" +
                 "  // parameter val is of type java.lang.Double\n" +
@@ -223,16 +168,25 @@ public class UFTest extends CQLTester
                 "  double v = Math.sin( input.doubleValue() );\n" +
                 "  return Double.valueOf(v);\n" +
                 "';");
+
+        // just check created function
+        assertRows(execute("SELECT key, val, foo::corjf(val) FROM %s"),
+                   row(1, 1d, Math.sin(1d)),
+                   row(2, 2d, Math.sin(2d)),
+                   row(3, 3d, Math.sin(3d))
+        );
+
         execute("create or replace function foo::corjf ( input double ) returns double language java\n" +
                 "AS '\n" +
-                "  // parameter val is of type java.lang.Double\n" +
-                "  /* return type is of type java.lang.Double */\n" +
-                "  if (input == null) {\n" +
-                "    return null;\n" +
-                "  }\n" +
-                "  double v = Math.sin( input.doubleValue() );\n" +
-                "  return Double.valueOf(v);\n" +
+                "  return input;\n" +
                 "';");
+
+        // check if replaced function returns correct result
+        assertRows(execute("SELECT key, val, foo::corjf(val) FROM %s"),
+                   row(1, 1d, 1d),
+                   row(2, 2d, 2d),
+                   row(3, 3d, 3d)
+        );
     }
 
     @Test
@@ -409,5 +363,235 @@ public class UFTest extends CQLTester
 
         // function throws a RuntimeException which is wrapped by InvalidRequestException
         assertInvalid("SELECT key, val, foo::jrtef(val) FROM %s");
+    }
+
+    @Test
+    public void testJavaDollarQuotedFunction() throws Throwable
+    {
+        String functionBody = "\n" +
+                              "  // parameter val is of type java.lang.Double\n" +
+                              "  /* return type is of type java.lang.Double */\n" +
+                              "  if (input == null) {\n" +
+                              "    return null;\n" +
+                              "  }\n" +
+                              "  double v = Math.sin( input.doubleValue() );\n" +
+                              "  return \"'\"+Double.valueOf(v)+'\\\'';\n";
+
+        execute("create function foo::pgfun1 ( input double ) returns text language java\n" +
+                "AS $$" + functionBody + "$$;");
+        execute("CREATE FUNCTION foo::pgsin ( input double ) RETURNS double LANGUAGE java AS $$return Double.valueOf(Math.sin(input.doubleValue()));$$");
+
+        assertRows(execute("SELECT language, body FROM system.schema_functions WHERE namespace='foo' AND name='pgfun1'"),
+                   row("java", functionBody));
+    }
+
+    @Test
+    public void testJavascriptFunction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, val double)");
+
+        String functionBody = "\n" +
+                              "  Math.sin(val);\n";
+
+        String cql = "CREATE OR REPLACE FUNCTION jsft(val double) RETURNS double LANGUAGE javascript\n" +
+                     "AS '" + functionBody + "';";
+
+        execute(cql);
+
+        assertRows(execute("SELECT language, body FROM system.schema_functions WHERE namespace='' AND name='jsft'"),
+                   row("javascript", functionBody));
+
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1d);
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 2, 2d);
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 3, 3d);
+        assertRows(execute("SELECT key, val, jsft(val) FROM %s"),
+                   row(1, 1d, Math.sin(1d)),
+                   row(2, 2d, Math.sin(2d)),
+                   row(3, 3d, Math.sin(3d))
+        );
+    }
+
+    @Test
+    public void testJavascriptBadReturnType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, val double)");
+
+        execute("CREATE OR REPLACE FUNCTION jsft(val double) RETURNS double LANGUAGE javascript\n" +
+                "AS '\"string\";';");
+
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1d);
+        // throws IRE with ClassCastException
+        assertInvalid("SELECT key, val, jsft(val) FROM %s");
+    }
+
+    @Test
+    public void testJavascriptThrow() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, val double)");
+
+        execute("CREATE OR REPLACE FUNCTION jsft(val double) RETURNS double LANGUAGE javascript\n" +
+                "AS 'throw \"fool\";';");
+
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1d);
+        // throws IRE with ScriptException
+        assertInvalid("SELECT key, val, jsft(val) FROM %s");
+    }
+
+    @Test
+    public void testDuplicateArgNames() throws Throwable
+    {
+        assertInvalid("CREATE OR REPLACE FUNCTION scrinv(val double, val text) RETURNS text LANGUAGE javascript\n" +
+                      "AS '\"foo bar\";';");
+    }
+
+    @Test
+    public void testJavascriptCompileFailure() throws Throwable
+    {
+        assertInvalid("CREATE OR REPLACE FUNCTION scrinv(val double) RETURNS double LANGUAGE javascript\n" +
+                      "AS 'foo bar';");
+    }
+
+    @Test
+    public void testScriptInvalidLanguage() throws Throwable
+    {
+        assertInvalid("CREATE OR REPLACE FUNCTION scrinv(val double) RETURNS double LANGUAGE artificial_intelligence\n" +
+                      "AS 'question for 42?';");
+    }
+
+    @Test
+    public void testScriptReturnTypeCasting() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, val double)");
+        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1d);
+
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS boolean LANGUAGE javascript\n" +
+                "AS 'true;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, true));
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS boolean LANGUAGE javascript\n" +
+                "AS 'false;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, false));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = int , return type = int
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS int LANGUAGE javascript\n" +
+                "AS '100;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = int , return type = double
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS int LANGUAGE javascript\n" +
+                "AS '100.;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = double , return type = int
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS double LANGUAGE javascript\n" +
+                "AS '100;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100d));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = double , return type = double
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS double LANGUAGE javascript\n" +
+                "AS '100.;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100d));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = bigint , return type = int
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS bigint LANGUAGE javascript\n" +
+                "AS '100;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100L));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = bigint , return type = double
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS bigint LANGUAGE javascript\n" +
+                "AS '100.;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, 100L));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = varint , return type = int
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS varint LANGUAGE javascript\n" +
+                "AS '100;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, BigInteger.valueOf(100L)));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = varint , return type = double
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS varint LANGUAGE javascript\n" +
+                "AS '100.;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, BigInteger.valueOf(100L)));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = decimal , return type = int
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS decimal LANGUAGE javascript\n" +
+                "AS '100;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, BigDecimal.valueOf(100L)));
+        execute("DROP FUNCTION js(double)");
+
+        // declared rtype = decimal , return type = double
+        execute("CREATE OR REPLACE FUNCTION js(val double) RETURNS decimal LANGUAGE javascript\n" +
+                "AS '100.;';");
+        assertRows(execute("SELECT key, val, js(val) FROM %s"),
+                   row(1, 1d, BigDecimal.valueOf(100d)));
+        execute("DROP FUNCTION js(double)");
+    }
+
+    @Test
+    public void testScriptParamReturnTypes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (key int primary key, ival int, lval bigint, fval float, dval double, vval varint, ddval decimal)");
+        execute("INSERT INTO %s (key, ival, lval, fval, dval, vval, ddval) VALUES (?, ?, ?, ?, ?, ?, ?)", 1,
+                1, 1L, 1f, 1d, BigInteger.valueOf(1L), BigDecimal.valueOf(1d));
+
+        // type = int
+        execute("CREATE OR REPLACE FUNCTION jsint(val int) RETURNS int LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, ival, jsint(ival) FROM %s"),
+                   row(1, 1, 2));
+        execute("DROP FUNCTION jsint(int)");
+
+        // bigint
+        execute("CREATE OR REPLACE FUNCTION jsbigint(val bigint) RETURNS bigint LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, lval, jsbigint(lval) FROM %s"),
+                   row(1, 1L, 2L));
+        execute("DROP FUNCTION jsbigint(bigint)");
+
+        // float
+        execute("CREATE OR REPLACE FUNCTION jsfloat(val float) RETURNS float LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, fval, jsfloat(fval) FROM %s"),
+                   row(1, 1f, 2f));
+        execute("DROP FUNCTION jsfloat(float)");
+
+        // double
+        execute("CREATE OR REPLACE FUNCTION jsdouble(val double) RETURNS double LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, dval, jsdouble(dval) FROM %s"),
+                   row(1, 1d, 2d));
+        execute("DROP FUNCTION jsdouble(double)");
+
+        // varint
+        execute("CREATE OR REPLACE FUNCTION jsvarint(val varint) RETURNS varint LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, vval, jsvarint(vval) FROM %s"),
+                   row(1, BigInteger.valueOf(1L), BigInteger.valueOf(2L)));
+        execute("DROP FUNCTION jsvarint(varint)");
+
+        // decimal
+        execute("CREATE OR REPLACE FUNCTION jsdecimal(val decimal) RETURNS decimal LANGUAGE javascript\n" +
+                "AS 'val+1;';");
+        assertRows(execute("SELECT key, ddval, jsdecimal(ddval) FROM %s"),
+                   row(1, BigDecimal.valueOf(1d), BigDecimal.valueOf(2d)));
+        execute("DROP FUNCTION jsdecimal(decimal)");
     }
 }

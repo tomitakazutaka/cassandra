@@ -149,7 +149,10 @@ syntax_rules = r'''
 
 JUNK ::= /([ \t\r\f\v]+|(--|[/][/])[^\n\r]*([\n\r]|$)|[/][*].*?[*][/])/ ;
 
-<stringLiteral> ::= /'([^']|'')*'/ ;
+<stringLiteral> ::= <quotedStringLiteral>
+                  | <pgStringLiteral> ;
+<quotedStringLiteral> ::= /'([^']|'')*'/ ;
+<pgStringLiteral> ::= /\$\$.*\$\$/;
 <quotedName> ::=    /"([^"]|"")*"/ ;
 <float> ::=         /-?[0-9]+\.[0-9]+/ ;
 <uuid> ::=          /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ ;
@@ -229,11 +232,13 @@ JUNK ::= /([ \t\r\f\v]+|(--|[/][/])[^\n\r]*([\n\r]|$)|[/][*].*?[*][/])/ ;
                           | <createIndexStatement>
                           | <createUserTypeStatement>
                           | <createFunctionStatement>
+                          | <createTriggerStatement>
                           | <dropKeyspaceStatement>
                           | <dropColumnFamilyStatement>
                           | <dropIndexStatement>
                           | <dropUserTypeStatement>
                           | <dropFunctionStatement>
+                          | <dropTriggerStatement>
                           | <alterTableStatement>
                           | <alterKeyspaceStatement>
                           | <alterUserTypeStatement>
@@ -464,6 +469,10 @@ def cf_prop_val_mapkey_completer(ctxt, cass):
             opts.add('cold_reads_to_omit')
         elif csc == 'LeveledCompactionStrategy':
             opts.add('sstable_size_in_mb')
+        elif csc == 'DateTieredCompactionStrategy':
+            opts.add('base_time_seconds')
+            opts.add('max_sstable_age_days')
+            opts.add('timestamp_resolution')
         return map(escape_value, opts)
     return ()
 
@@ -605,7 +614,10 @@ syntax_rules += r'''
                  | "*"
                  | "COUNT" "(" star=( "*" | "1" ) ")" ("AS" <cident>)?
                  ;
+<udtSubfieldSelection> ::= <identifier> "." <identifier>
+                         ;
 <selector> ::= [colname]=<cident>
+             | <udtSubfieldSelection>
              | "WRITETIME" "(" [colname]=<cident> ")"
              | "TTL" "(" [colname]=<cident> ")"
              | <functionName> <selectionFunctionArguments>
@@ -979,7 +991,7 @@ def create_cf_composite_primary_key_comma_completer(ctxt, cass):
 
 syntax_rules += r'''
 <createIndexStatement> ::= "CREATE" "CUSTOM"? "INDEX" ("IF" "NOT" "EXISTS")? indexname=<identifier>? "ON"
-                               cf=<columnFamilyName> "(" col=<cident> ")"
+                               cf=<columnFamilyName> ( "(" col=<cident> ")" | "(" "KEYS"  "(" col=<cident> ")" ")")
                                ( "USING" <stringLiteral> ( "WITH" "OPTIONS" "=" <mapLiteral> )? )?
                          ;
 
@@ -996,14 +1008,7 @@ syntax_rules += r'''
                               ( "," [newcolname]=<cident> <storageType> )* )?
                             ")" )?
                             "RETURNS" <storageType>
-                            (
-                              ("LANGUAGE" <cident> "AS"
-                                (
-                                  <stringLiteral>
-                                )
-                              )
-                              | ("USING" <stringLiteral>)
-                            )
+                            "LANGUAGE" <cident> "AS" <stringLiteral>
                          ;
 
 '''
@@ -1081,10 +1086,10 @@ syntax_rules += r'''
 <alterUserTypeStatement> ::= "ALTER" "TYPE" ut=<userTypeName>
                                <alterTypeInstructions>
                              ;
-<alterTypeInstructions> ::= "RENAME" "TO" typename=<cfOrKsName>
-                           | "ALTER" existcol=<cident> "TYPE" <storageType>
+<alterTypeInstructions> ::= "ALTER" existcol=<cident> "TYPE" <storageType>
                            | "ADD" newcol=<cident> <storageType>
                            | "RENAME" existcol=<cident> "TO" newcol=<cident>
+                              ( "AND" existcol=<cident> "TO" newcol=<cident> )*
                            ;
 '''
 
@@ -1101,12 +1106,11 @@ def alter_type_field_completer(ctxt, cass):
     return map(maybe_escape_name, fields)
 
 explain_completion('alterInstructions', 'newcol', '<new_column_name>')
-explain_completion('alterTypeInstructions', 'typename', '<new_type_name>')
 explain_completion('alterTypeInstructions', 'newcol', '<new_field_name>')
 
 
 syntax_rules += r'''
-<alterKeyspaceStatement> ::= "ALTER" ( "KEYSPACE" | "SCHEMA" ) ks=<alterableKeyspaceName>
+<alterKeyspaceStatement> ::= "ALTER" wat=( "KEYSPACE" | "SCHEMA" ) ks=<alterableKeyspaceName>
                                  "WITH" <property> ( "AND" <property> )*
                            ;
 '''
@@ -1177,6 +1181,28 @@ def username_name_completer(ctxt, cass):
 
     session = cass.session
     return [maybe_quote(row.values()[0].replace("'", "''")) for row in session.execute("LIST USERS")]
+
+syntax_rules += r'''
+<createTriggerStatement> ::= "CREATE" "TRIGGER" ( "IF" "NOT" "EXISTS" )? <cident>
+                               "ON" cf=<columnFamilyName> "USING" class=<stringLiteral>
+                           ;
+
+<dropTriggerStatement> ::= "DROP" "TRIGGER" ( "IF" "EXISTS" )? triggername=<cident>
+                             "ON" cf=<columnFamilyName>
+                         ;
+'''
+explain_completion('createTriggerStatement', 'class', '\'fully qualified class name\'')
+
+def get_trigger_names(ctxt, cass):
+    ks = ctxt.get_binding('ksname', None)
+    if ks is not None:
+        ks = dequote_name(ks)
+    return cass.get_trigger_names(ks)
+
+@completer_for('dropTriggerStatement', 'triggername')
+def alter_type_field_completer(ctxt, cass):
+    names = get_trigger_names(ctxt, cass)
+    return map(maybe_escape_name, names)
 
 # END SYNTAX/COMPLETION RULE DEFINITIONS
 

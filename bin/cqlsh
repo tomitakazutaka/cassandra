@@ -105,7 +105,7 @@ except ImportError, e:
              'Module load path: %r\n\n'
              'Error: %s\n' % (sys.executable, sys.path, e))
 
-from cassandra.cluster import Cluster
+from cassandra.cluster import Cluster, PagedResult
 from cassandra.query import SimpleStatement, ordered_dict_factory
 from cassandra.policies import WhiteListRoundRobinPolicy
 from cassandra.metadata import protect_name, protect_names, protect_value
@@ -124,22 +124,6 @@ from cqlshlib.formatting import format_by_type, formatter_for, format_value_utyp
 from cqlshlib.util import trim_if_present
 from cqlshlib.tracing import print_trace_session, print_trace
 
-HISTORY_DIR = os.path.expanduser(os.path.join('~', '.cassandra'))
-CONFIG_FILE = os.path.join(HISTORY_DIR, 'cqlshrc')
-HISTORY = os.path.join(HISTORY_DIR, 'cqlsh_history')
-if not os.path.exists(HISTORY_DIR):
-    try:
-        os.mkdir(HISTORY_DIR)
-    except OSError:
-        print '\nWarning: Cannot create directory at `%s`. Command history will not be saved.\n' % HISTORY_DIR
-
-OLD_CONFIG_FILE = os.path.expanduser(os.path.join('~', '.cqlshrc'))
-if os.path.exists(OLD_CONFIG_FILE):
-    os.rename(OLD_CONFIG_FILE, CONFIG_FILE)
-OLD_HISTORY = os.path.expanduser(os.path.join('~', '.cqlsh_history'))
-if os.path.exists(OLD_HISTORY):
-    os.rename(OLD_HISTORY, HISTORY)
-
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 9042
 DEFAULT_CQLVER = '3.2.0'
@@ -147,7 +131,6 @@ DEFAULT_PROTOCOL_VERSION = 3
 
 DEFAULT_TIME_FORMAT = '%Y-%m-%d %H:%M:%S%z'
 DEFAULT_FLOAT_PRECISION = 5
-DEFAULT_SELECT_LIMIT = 10000
 DEFAULT_MAX_TRACE_WAIT = 10
 
 if readline is not None and readline.__doc__ is not None and 'libedit' in readline.__doc__:
@@ -174,10 +157,40 @@ parser.add_option('-k', '--keyspace', help='Authenticate to the given keyspace.'
 parser.add_option("-f", "--file", help="Execute commands from FILE, then exit")
 parser.add_option('--debug', action='store_true',
                   help='Show additional debugging information')
+parser.add_option("--cqlshrc", help="Specify an alternative cqlshrc file location.")
 parser.add_option('--cqlversion', default=DEFAULT_CQLVER,
                   help='Specify a particular CQL version (default: %default).'
                        ' Examples: "3.0.3", "3.1.0"')
 parser.add_option("-e", "--execute", help='Execute the statement and quit.')
+
+optvalues = optparse.Values()
+(options, arguments) = parser.parse_args(sys.argv[1:], values=optvalues)
+
+#BEGIN history/config definition
+HISTORY_DIR = os.path.expanduser(os.path.join('~', '.cassandra'))
+
+if hasattr(options, 'cqlshrc'):
+    CONFIG_FILE = options.cqlshrc
+    if not os.path.exists(CONFIG_FILE):
+        print '\nWarning: Specified cqlshrc location `%s` does not exist.  Using `%s` instead.\n' % (CONFIG_FILE, HISTORY_DIR)
+        CONFIG_FILE = os.path.join(HISTORY_DIR, 'cqlshrc')
+else:
+    CONFIG_FILE = os.path.join(HISTORY_DIR, 'cqlshrc')
+
+HISTORY = os.path.join(HISTORY_DIR, 'cqlsh_history')
+if not os.path.exists(HISTORY_DIR):
+    try:
+        os.mkdir(HISTORY_DIR)
+    except OSError:
+        print '\nWarning: Cannot create directory at `%s`. Command history will not be saved.\n' % HISTORY_DIR
+
+OLD_CONFIG_FILE = os.path.expanduser(os.path.join('~', '.cqlshrc'))
+if os.path.exists(OLD_CONFIG_FILE):
+    os.rename(OLD_CONFIG_FILE, CONFIG_FILE)
+OLD_HISTORY = os.path.expanduser(os.path.join('~', '.cqlsh_history'))
+if os.path.exists(OLD_HISTORY):
+    os.rename(OLD_HISTORY, HISTORY)
+#END history/config definition
 
 CQL_ERRORS = (
     cassandra.AlreadyExists, cassandra.AuthenticationFailed, cassandra.InvalidRequest,
@@ -204,6 +217,7 @@ my_commands_ending_with_newline = (
     'debug',
     'tracing',
     'expand',
+    'paging',
     'exit',
     'quit'
 )
@@ -231,6 +245,7 @@ cqlsh_extra_syntax_rules = r'''
                    | <tracingCommand>
                    | <expandCommand>
                    | <exitCommand>
+                   | <pagingCommand>
                    ;
 
 <describeCommand> ::= ( "DESCRIBE" | "DESC" )
@@ -293,6 +308,9 @@ cqlsh_extra_syntax_rules = r'''
 
 <expandCommand> ::= "EXPAND" ( switch=( "ON" | "OFF" ) )?
                    ;
+
+<pagingCommand> ::= "PAGING" ( switch=( "ON" | "OFF" ) )?
+                  ;
 
 <exitCommand> ::= "exit" | "quit"
                 ;
@@ -481,8 +499,10 @@ class Shell(cmd.Cmd):
     stop = False
     last_hist = None
     shunted_query_out = None
+    use_paging = True
     csv_dialect_defaults = dict(delimiter=',', doublequote=False,
                                 escapechar='\\', quotechar='"')
+    default_page_size = 100
 
     def __init__(self, hostname, port, color=False,
                  username=None, password=None, encoding=None, stdin=None, tty=True,
@@ -705,6 +725,14 @@ class Shell(cmd.Cmd):
 
         return cql3handling.UserTypesMeta.from_layout(data)
 
+    def get_trigger_names(self, ksname=None):
+        if ksname is None:
+            ksname = self.current_keyspace
+
+        return [trigger.name
+                for table in self.get_keyspace_meta(ksname).tables.values()
+                for trigger in table.triggers.values()]
+
     def reset_statement(self):
         self.reset_prompt()
         self.statement.truncate(0)
@@ -899,16 +927,12 @@ class Shell(cmd.Cmd):
         stop_tracing = ksname == 'system_traces' or (ksname is None and self.current_keyspace == 'system_traces')
         self.tracing_enabled = self.tracing_enabled and not stop_tracing
         statement = parsed.extract_orig()
-        with_default_limit = parsed.get_binding('limit') is None
-        if with_default_limit:
-            statement = "%s LIMIT %d;" % (statement[:-1], DEFAULT_SELECT_LIMIT)
-        self.perform_statement(statement, with_default_limit=with_default_limit)
+        self.perform_statement(statement)
         self.tracing_enabled = tracing_was_enabled
 
-    def perform_statement(self, statement, with_default_limit=False):
-        stmt = SimpleStatement(statement, consistency_level=self.consistency_level)
-        result = self.perform_simple_statement(stmt,
-                                                with_default_limit=with_default_limit)
+    def perform_statement(self, statement):
+        stmt = SimpleStatement(statement, consistency_level=self.consistency_level, fetch_size=self.default_page_size if self.use_paging else None)
+        result = self.perform_simple_statement(stmt)
         if self.tracing_enabled:
             if stmt.trace:
                 print_trace(self, stmt.trace)
@@ -924,7 +948,7 @@ class Shell(cmd.Cmd):
         cf = self.cql_unprotect_name(parsed.get_binding('cfname'))
         return self.get_table_meta(ks, cf)
 
-    def perform_simple_statement(self, statement, with_default_limit=False):
+    def perform_simple_statement(self, statement):
         if not statement:
             return False
         rows = None
@@ -941,7 +965,7 @@ class Shell(cmd.Cmd):
                 return False
 
         if statement.query_string[:6].lower() == 'select' or statement.query_string.lower().startswith("list"):
-            self.print_result(rows, with_default_limit, self.parse_for_table_meta(statement.query_string))
+            self.print_result(rows, self.parse_for_table_meta(statement.query_string))
         elif rows:
             # CAS INSERT/UPDATE
             self.writeresult("")
@@ -949,14 +973,33 @@ class Shell(cmd.Cmd):
         self.flush_output()
         return True
 
-    def print_result(self, rows, with_default_limit, table_meta):
+    def print_result(self, rows, table_meta):
         self.decoding_errors = []
 
         self.writeresult("")
-        if rows:
-            rows = list(rows)  # this may be an iterator if the result is large enough to page
-        self.print_static_result(rows, table_meta)
-        self.writeresult("(%d rows)" % len(rows or []))
+        if isinstance(rows, PagedResult) and self.tty:
+            num_rows = 0
+            while True:
+                page = list(rows.current_response)
+                if not page:
+                    break
+                num_rows += len(page)
+                self.print_static_result(page, table_meta)
+                if not rows.response_future.has_more_pages:
+                    break
+                raw_input("---MORE---")
+
+                rows.response_future.start_fetching_next_page()
+                result = rows.response_future.result()
+                if rows.response_future.has_more_pages:
+                    rows.current_response = result.current_response
+                else:
+                    rows.current_response = iter(result)
+        else:
+            rows = list(rows or [])
+            num_rows = len(rows)
+            self.print_static_result(rows, table_meta)
+        self.writeresult("(%d rows)" % num_rows)
 
         if self.decoding_errors:
             for err in self.decoding_errors[:2]:
@@ -964,13 +1007,6 @@ class Shell(cmd.Cmd):
             if len(self.decoding_errors) > 2:
                 self.writeresult('%d more decoding errors suppressed.'
                                  % (len(self.decoding_errors) - 2), color=RED)
-
-        if with_default_limit:
-            if len(rows) == DEFAULT_SELECT_LIMIT:
-                self.writeresult("Default LIMIT of %d was used. "
-                                 "Specify your own LIMIT clause to get more results."
-                                 % DEFAULT_SELECT_LIMIT, color=RED)
-                self.writeresult("")
 
     def print_static_result(self, rows, table_meta):
         if not rows:
@@ -1613,29 +1649,7 @@ class Shell(cmd.Cmd):
 
           TRACING with no arguments shows the current tracing status.
         """
-        switch = parsed.get_binding('switch')
-        if switch is None:
-            if self.tracing_enabled:
-                print "Tracing is currently enabled. Use TRACING OFF to disable"
-            else:
-                print "Tracing is currently disabled. Use TRACING ON to enable."
-            return
-
-        if switch.upper() == 'ON':
-            if self.tracing_enabled:
-                self.printerr('Tracing is already enabled. '
-                              'Use TRACING OFF to disable.')
-                return
-            self.tracing_enabled = True
-            print 'Now tracing requests.'
-            return
-
-        if switch.upper() == 'OFF':
-            if not self.tracing_enabled:
-                self.printerr('Tracing is not enabled.')
-                return
-            self.tracing_enabled = False
-            print 'Disabled tracing.'
+        self.tracing_enabled = SwitchCommand("TRACING", "Tracing").execute(self.tracing_enabled, parsed, self.printerr)
 
     def do_expand(self, parsed):
         """
@@ -1655,29 +1669,7 @@ class Shell(cmd.Cmd):
 
           EXPAND with no arguments shows the current value of expand setting.
         """
-        switch = parsed.get_binding('switch')
-        if switch is None:
-            if self.expand_enabled:
-                print "Expanded output is currently enabled. Use EXPAND OFF to disable"
-            else:
-                print "Expanded output is currently disabled. Use EXPAND ON to enable."
-            return
-
-        if switch.upper() == 'ON':
-            if self.expand_enabled:
-                self.printerr('Expanded output is already enabled. '
-                              'Use EXPAND OFF to disable.')
-                return
-            self.expand_enabled = True
-            print 'Now printing expanded output'
-            return
-
-        if switch.upper() == 'OFF':
-            if not self.expand_enabled:
-                self.printerr('Expanded output is not enabled.')
-                return
-            self.expand_enabled = False
-            print 'Disabled expanded output.'
+        self.expand_enabled = SwitchCommand("EXPAND", "Expanded output").execute(self.expand_enabled, parsed, self.printerr)
 
     def do_consistency(self, parsed):
         """
@@ -1753,6 +1745,26 @@ class Shell(cmd.Cmd):
             else:
                 self.printerr("*** No help on %s" % (t,))
 
+    def do_paging(self, parsed):
+        """
+        PAGING [cqlsh]
+
+          Enables or disables query paging.
+
+        PAGING ON
+
+          Enables query paging for all further queries.
+
+        PAGING OFF
+
+          Disables paging.
+
+        PAGING
+
+          PAGING with no arguments shows the current query paging status.
+        """
+        self.use_paging = SwitchCommand("PAGING", "Query paging").execute(self.use_paging, parsed, self.printerr)
+
     def applycolor(self, text, color=None):
         if not color or not self.color:
             return text
@@ -1773,6 +1785,41 @@ class Shell(cmd.Cmd):
         if shownum:
             text = '%s:%d:%s' % (self.stdin.name, self.lineno, text)
         self.writeresult(text, color, newline=newline, out=sys.stderr)
+
+
+class SwitchCommand(object):
+    command = None
+    description = None
+
+    def __init__(self, command, desc):
+        self.command = command
+        self.description = desc
+
+    def execute(self, state, parsed, printerr):
+        switch = parsed.get_binding('switch')
+        if switch is None:
+            if state:
+                print "%s is currently enabled. Use %s OFF to disable" \
+                      % (self.description, self.command)
+            else:
+                print "%s is currently disabled. Use %s ON to enable." \
+                      % (self.description, self.command)
+            return state
+
+        if switch.upper() == 'ON':
+            if state:
+                printerr('%s is already enabled. Use %s OFF to disable.'
+                         % (self.description, self.command))
+                return state
+            print 'Now %s is enabled' % (self.description,)
+            return True
+
+        if switch.upper() == 'OFF':
+            if not state:
+                printerr('%s is not enabled.' % (self.description,))
+                return state
+            print 'Disabled %s.' % (self.description,)
+            return False
 
 
 def option_with_default(cparser_getter, section, option, default=None):

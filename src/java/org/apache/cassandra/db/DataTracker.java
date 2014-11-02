@@ -24,13 +24,13 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.dht.AbstractBounds;
-import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.notifications.*;
@@ -264,7 +264,7 @@ public class DataTracker
     {
         replace(sstables, Collections.<SSTableReader>emptyList());
         notifySSTablesChanged(sstables, allReplacements, compactionType);
-        for (SSTableReader sstable : sstables)
+        for (SSTableReader sstable : allReplacements)
         {
             long bytesOnDisk = sstable.bytesOnDisk();
             cfstore.metric.totalDiskSpaceUsed.inc(bytesOnDisk);
@@ -320,7 +320,7 @@ public class DataTracker
     void removeUnreadableSSTables(File directory)
     {
         View currentView, newView;
-        List<SSTableReader> remaining = new ArrayList<>();
+        Set<SSTableReader> remaining = new HashSet<>();
         do
         {
             currentView = view.get();
@@ -334,6 +334,9 @@ public class DataTracker
             newView = currentView.replace(currentView.sstables, remaining);
         }
         while (!view.compareAndSet(currentView, newView));
+        for (SSTableReader sstable : currentView.sstables)
+            if (!remaining.contains(sstable))
+                sstable.releaseReference();
         notifySSTablesChanged(remaining, Collections.<SSTableReader>emptySet(), OperationType.UNKNOWN);
     }
 
@@ -355,7 +358,7 @@ public class DataTracker
      * @param oldSSTables replaced readers
      * @param newSSTables replacement readers
      */
-    public void replaceReaders(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables)
+    public void replaceReaders(Collection<SSTableReader> oldSSTables, Collection<SSTableReader> newSSTables, boolean notify)
     {
         View currentView, newView;
         do
@@ -364,6 +367,9 @@ public class DataTracker
             newView = currentView.replace(oldSSTables, newSSTables);
         }
         while (!view.compareAndSet(currentView, newView));
+
+        if (!oldSSTables.isEmpty() && notify)
+            notifySSTablesChanged(oldSSTables, newSSTables, OperationType.COMPACTION);
 
         for (SSTableReader sstable : newSSTables)
             sstable.setTrackedBy(this);
@@ -505,6 +511,13 @@ public class DataTracker
     public void notifyRenewed(Memtable renewed)
     {
         INotification notification = new MemtableRenewedNotification(renewed);
+        for (INotificationConsumer subscriber : subscribers)
+            subscriber.handleNotification(notification, this);
+    }
+
+    public void notifyTruncated(long truncatedAt)
+    {
+        INotification notification = new TruncationNotification(truncatedAt);
         for (INotificationConsumer subscriber : subscribers)
             subscriber.handleNotification(notification, this);
     }

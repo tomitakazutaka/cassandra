@@ -42,6 +42,7 @@ options {
     import org.apache.cassandra.auth.IResource;
     import org.apache.cassandra.cql3.*;
     import org.apache.cassandra.cql3.statements.*;
+    import org.apache.cassandra.cql3.selection.*;
     import org.apache.cassandra.cql3.functions.*;
     import org.apache.cassandra.db.marshal.CollectionType;
     import org.apache.cassandra.exceptions.ConfigurationException;
@@ -262,14 +263,12 @@ useStatement returns [UseStatement stmt]
 selectStatement returns [SelectStatement.RawStatement expr]
     @init {
         boolean isDistinct = false;
-        boolean isCount = false;
-        ColumnIdentifier countAlias = null;
         Term.Raw limit = null;
         Map<ColumnIdentifier, Boolean> orderings = new LinkedHashMap<ColumnIdentifier, Boolean>();
         boolean allowFiltering = false;
     }
     : K_SELECT ( ( K_DISTINCT { isDistinct = true; } )? sclause=selectClause
-               | (K_COUNT '(' sclause=selectCountClause ')' { isCount = true; } (K_AS c=cident { countAlias = c; })?) )
+               | sclause=selectCountClause )
       K_FROM cf=columnFamilyName
       ( K_WHERE wclause=whereClause )?
       ( K_ORDER K_BY orderByClause[orderings] ( ',' orderByClause[orderings] )* )?
@@ -278,8 +277,6 @@ selectStatement returns [SelectStatement.RawStatement expr]
       {
           SelectStatement.Parameters params = new SelectStatement.Parameters(orderings,
                                                                              isDistinct,
-                                                                             isCount,
-                                                                             countAlias,
                                                                              allowFiltering);
           $expr = new SelectStatement.RawStatement(cf, params, sclause, wclause, limit);
       }
@@ -312,8 +309,13 @@ selectionFunctionArgs returns [List<Selectable> a]
     ;
 
 selectCountClause returns [List<RawSelector> expr]
-    : '\*'           { $expr = Collections.<RawSelector>emptyList();}
-    | i=INTEGER      { if (!i.getText().equals("1")) addRecognitionError("Only COUNT(1) is supported, got COUNT(" + i.getText() + ")"); $expr = Collections.<RawSelector>emptyList();}
+    @init{ ColumnIdentifier alias = new ColumnIdentifier("count", false); }
+    : K_COUNT '(' countArgument ')' (K_AS c=cident { alias = c; })? { $expr = new ArrayList<RawSelector>(); $expr.add( new RawSelector(new Selectable.WithFunction(new FunctionName("countRows"), Collections.<Selectable>emptyList()), alias));}
+    ;
+
+countArgument
+    : '\*'
+    | i=INTEGER { if (!i.getText().equals("1")) addRecognitionError("Only COUNT(1) is supported, got COUNT(" + i.getText() + ")");}
     ;
 
 whereClause returns [List<Relation> clause]
@@ -492,8 +494,6 @@ createFunctionStatement returns [CreateFunctionStatement expr]
         boolean ifNotExists = false;
 
         boolean deterministic = true;
-        String language = "class";
-        String bodyOrClassName = null;
         List<ColumnIdentifier> argsNames = new ArrayList<>();
         List<CQL3Type.Raw> argsTypes = new ArrayList<>();
     }
@@ -508,20 +508,10 @@ createFunctionStatement returns [CreateFunctionStatement expr]
           ( ',' k=cident v=comparatorType { argsNames.add(k); argsTypes.add(v); } )*
         )?
       ')'
-      K_RETURNS
-      rt=comparatorType
-      (
-          ( K_USING cls = STRING_LITERAL { bodyOrClassName = $cls.text; } )
-        | ( K_LANGUAGE l = IDENT { language=$l.text; } K_AS
-            (
-              ( body = STRING_LITERAL
-                { bodyOrClassName = $body.text; }
-              )
-              /* TODO placeholder for pg-style function body */
-            )
-          )
-      )
-      { $expr = new CreateFunctionStatement(fn, language.toLowerCase(), bodyOrClassName, deterministic, argsNames, argsTypes, rt, orReplace, ifNotExists); }
+      K_RETURNS rt = comparatorType
+      K_LANGUAGE language = IDENT
+      K_AS body = STRING_LITERAL
+      { $expr = new CreateFunctionStatement(fn, $language.text.toLowerCase(), $body.text, deterministic, argsNames, argsTypes, rt, orReplace, ifNotExists); }
     ;
 
 dropFunctionStatement returns [DropFunctionStatement expr]
@@ -985,6 +975,7 @@ allowedFunctionName returns [String s]
     : f=IDENT                       { $s = $f.text; }
     | u=unreserved_function_keyword { $s = u; }
     | K_TOKEN                       { $s = "token"; }
+    | K_COUNT                       { $s = "count"; }
     ;
 
 functionArgs returns [List<Term.Raw> a]
@@ -1420,9 +1411,26 @@ fragment Y: ('y'|'Y');
 fragment Z: ('z'|'Z');
 
 STRING_LITERAL
-    @init{ StringBuilder b = new StringBuilder(); }
-    @after{ setText(b.toString()); }
-    : '\'' (c=~('\'') { b.appendCodePoint(c);} | '\'' '\'' { b.appendCodePoint('\''); })* '\''
+    @init{
+        StringBuilder txt = new StringBuilder(); // temporary to build pg-style-string
+    }
+    @after{ setText(txt.toString()); }
+    :
+      /* pg-style string literal */
+      (
+        '\$' '\$'
+        ( /* collect all input until '$$' is reached again */
+          {  (input.size() - input.index() > 1)
+               && !"$$".equals(input.substring(input.index(), input.index() + 1)) }?
+             => c=. { txt.appendCodePoint(c); }
+        )*
+        '\$' '\$'
+      )
+      |
+      /* conventional quoted string literal */
+      (
+        '\'' (c=~('\'') { txt.appendCodePoint(c);} | '\'' '\'' { txt.appendCodePoint('\''); })* '\''
+      )
     ;
 
 QUOTED_NAME

@@ -28,6 +28,7 @@ import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.selection.Selection;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.composites.CBuilder;
 import org.apache.cassandra.db.composites.Composite;
@@ -56,7 +57,7 @@ public abstract class ModificationStatement implements CQLStatement, MeasurableF
     public final CFMetaData cfm;
     public final Attributes attrs;
 
-    private final Map<ColumnIdentifier, Restriction> processedKeys = new HashMap<ColumnIdentifier, Restriction>();
+    protected final Map<ColumnIdentifier, Restriction> processedKeys = new HashMap<>();
     private final List<Operation> columnOperations = new ArrayList<Operation>();
 
     // Separating normal and static conditions makes things somewhat easier
@@ -238,9 +239,12 @@ public abstract class ModificationStatement implements CQLStatement, MeasurableF
             if (relation.isMultiColumn())
             {
                 throw new InvalidRequestException(
-                        String.format("Multi-column relations cannot be used in WHERE clauses for modification statements: %s", relation));
+                        String.format("Multi-column relations cannot be used in WHERE clauses for UPDATE and DELETE statements: %s", relation));
             }
             SingleColumnRelation rel = (SingleColumnRelation) relation;
+
+            if (rel.onToken)
+                throw new InvalidRequestException(String.format("The token function cannot be used in WHERE clauses for UPDATE and DELETE statements: %s", relation));
 
             ColumnDefinition def = cfm.getColumnDefinition(rel.getEntity());
             if (def == null)
@@ -677,6 +681,16 @@ public abstract class ModificationStatement implements CQLStatement, MeasurableF
         return new UpdateParameters(cfm, options, getTimestamp(now, options), getTimeToLive(options), rows);
     }
 
+    /**
+     * If there are conditions on the statement, this is called after the where clause and conditions have been
+     * processed to check that they are compatible.
+     * @throws InvalidRequestException
+     */
+    protected void validateWhereClauseForConditions() throws InvalidRequestException
+    {
+        //  no-op by default
+    }
+
     public static abstract class Parsed extends CFStatement
     {
         protected final Attributes.Raw attrs;
@@ -753,6 +767,8 @@ public abstract class ModificationStatement implements CQLStatement, MeasurableF
                         }
                     }
                 }
+
+                stmt.validateWhereClauseForConditions();
             }
             return stmt;
         }

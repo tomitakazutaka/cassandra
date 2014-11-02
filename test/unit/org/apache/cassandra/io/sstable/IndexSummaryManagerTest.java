@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -450,7 +451,7 @@ public class IndexSummaryManagerTest
         }
 
         // don't leave replaced SSTRs around to break other tests
-        cfs.getDataTracker().replaceReaders(Collections.singleton(original), Collections.singleton(sstable));
+        cfs.getDataTracker().replaceReaders(Collections.singleton(original), Collections.singleton(sstable), true);
     }
 
     @Test
