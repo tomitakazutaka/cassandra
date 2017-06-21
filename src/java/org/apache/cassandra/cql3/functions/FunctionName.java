@@ -19,32 +19,39 @@ package org.apache.cassandra.cql3.functions;
 
 import com.google.common.base.Objects;
 
-public class FunctionName
+import org.apache.cassandra.schema.SchemaConstants;
+
+public final class FunctionName
 {
-    public final String namespace;
+    public final String keyspace;
     public final String name;
 
-    // Use by toString rather than built from 'bundle' and 'name' so as to
-    // preserve the original case.
-    private final String displayName;
-
-    public FunctionName(String name)
+    public static FunctionName nativeFunction(String name)
     {
-        this("", name);
+        return new FunctionName(SchemaConstants.SYSTEM_KEYSPACE_NAME, name);
     }
 
-    public FunctionName(String namespace, String name)
+    public FunctionName(String keyspace, String name)
     {
-        this.namespace = namespace.toLowerCase();
-        this.name = name.toLowerCase();
+        assert name != null : "Name parameter must not be null";
+        this.keyspace = keyspace;
+        this.name = name;
+    }
 
-        this.displayName = namespace.isEmpty() ? name : namespace + "::" + name;
+    public FunctionName asNativeFunction()
+    {
+        return FunctionName.nativeFunction(name);
+    }
+
+    public boolean hasKeyspace()
+    {
+        return keyspace != null;
     }
 
     @Override
     public final int hashCode()
     {
-        return Objects.hashCode(namespace, name);
+        return Objects.hashCode(keyspace, name);
     }
 
     @Override
@@ -54,13 +61,22 @@ public class FunctionName
             return false;
 
         FunctionName that = (FunctionName)o;
-        return Objects.equal(this.namespace, that.namespace)
+        return Objects.equal(this.keyspace, that.keyspace)
             && Objects.equal(this.name, that.name);
+    }
+
+    public final boolean equalsNativeFunction(FunctionName nativeFunction)
+    {
+        assert nativeFunction.keyspace.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+        if (this.hasKeyspace() && !this.keyspace.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))
+            return false;
+
+        return Objects.equal(this.name, nativeFunction.name);
     }
 
     @Override
     public String toString()
     {
-        return displayName;
+        return keyspace == null ? name : keyspace + "." + name;
     }
 }

@@ -20,53 +20,46 @@ package org.apache.cassandra.metrics;
 import java.net.InetAddress;
 import java.util.Map.Entry;
 
-import org.apache.cassandra.db.HintedHandOffManager;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import com.codahale.metrics.Counter;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.utils.UUIDGen;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Counter;
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
- * Metrics for {@link HintedHandOffManager}.
+ * Metrics for {@link org.apache.cassandra.hints.HintsService}.
  */
 public class HintedHandoffMetrics
 {
     private static final Logger logger = LoggerFactory.getLogger(HintedHandoffMetrics.class);
 
-    private final MetricNameFactory factory = new DefaultNameFactory("HintedHandOffManager");
+    private static final MetricNameFactory factory = new DefaultNameFactory("HintedHandOffManager");
 
     /** Total number of hints which are not stored, This is not a cache. */
-    private final LoadingCache<InetAddress, DifferencingCounter> notStored = CacheBuilder.newBuilder().build(new CacheLoader<InetAddress, DifferencingCounter>()
-    {
-        public DifferencingCounter load(InetAddress address)
-        {
-            return new DifferencingCounter(address);
-        }
-    });
+    private final LoadingCache<InetAddress, DifferencingCounter> notStored = Caffeine.newBuilder()
+         .executor(MoreExecutors.directExecutor())
+         .build(DifferencingCounter::new);
 
     /** Total number of hints that have been created, This is not a cache. */
-    private final LoadingCache<InetAddress, Counter> createdHintCounts = CacheBuilder.newBuilder().build(new CacheLoader<InetAddress, Counter>()
-    {
-        public Counter load(InetAddress address)
-        {
-            return Metrics.newCounter(factory.createMetricName("Hints_created-" + address.getHostAddress()));
-        }
-    });
+    private final LoadingCache<InetAddress, Counter> createdHintCounts = Caffeine.newBuilder()
+         .executor(MoreExecutors.directExecutor())
+         .build(address -> Metrics.counter(factory.createMetricName("Hints_created-" + address.getHostAddress().replace(':', '.'))));
 
     public void incrCreatedHints(InetAddress address)
     {
-        createdHintCounts.getUnchecked(address).inc();
+        createdHintCounts.get(address).inc();
     }
 
     public void incrPastWindow(InetAddress address)
     {
-        notStored.getUnchecked(address).mark();
+        notStored.get(address).mark();
     }
 
     public void log()
@@ -81,19 +74,19 @@ public class HintedHandoffMetrics
         }
     }
 
-    public class DifferencingCounter
+    public static class DifferencingCounter
     {
         private final Counter meter;
         private long reported = 0;
 
         public DifferencingCounter(InetAddress address)
         {
-            this.meter = Metrics.newCounter(factory.createMetricName("Hints_not_stored-" + address.getHostAddress()));
+            this.meter = Metrics.counter(factory.createMetricName("Hints_not_stored-" + address.getHostAddress().replace(':', '.')));
         }
 
         public long difference()
         {
-            long current = meter.count();
+            long current = meter.getCount();
             long difference = current - reported;
             this.reported = current;
             return difference;
@@ -101,7 +94,7 @@ public class HintedHandoffMetrics
 
         public long count()
         {
-            return meter.count();
+            return meter.getCount();
         }
 
         public void mark()

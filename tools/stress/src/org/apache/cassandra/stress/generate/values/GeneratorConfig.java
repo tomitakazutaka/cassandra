@@ -20,16 +20,13 @@
  */
 package org.apache.cassandra.stress.generate.values;
 
+import java.io.Serializable;
+import java.nio.ByteBuffer;
+
 import org.apache.cassandra.stress.generate.Distribution;
 import org.apache.cassandra.stress.generate.DistributionFactory;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.MurmurHash;
-
-
-import java.io.Serializable;
-import java.nio.ByteBuffer;
-import java.util.Collections;
-import java.util.Map;
 
 public class GeneratorConfig implements Serializable
 {
@@ -65,4 +62,18 @@ public class GeneratorConfig implements Serializable
         return (sizeDistributions == null ? deflt : sizeDistributions).get();
     }
 
+    public String getConfigAsString()
+    {
+        StringBuilder sb = new StringBuilder();
+        if (clusteringDistributions != null){
+            sb.append(String.format("Clustering: %s;", clusteringDistributions.getConfigAsString()));
+        }
+        if (sizeDistributions != null){
+            sb.append(String.format("Size: %s;", sizeDistributions.getConfigAsString()));
+        }
+        if (identityDistributions != null){
+            sb.append(String.format("Identity: %s;", identityDistributions.getConfigAsString()));
+        }
+        return sb.toString();
+    }
 }

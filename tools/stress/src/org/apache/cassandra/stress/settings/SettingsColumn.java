@@ -22,19 +22,18 @@ package org.apache.cassandra.stress.settings;
 
 
 import java.io.IOException;
-import java.io.Serializable;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.stress.generate.*;
+import org.apache.cassandra.stress.generate.Distribution;
+import org.apache.cassandra.stress.generate.DistributionFactory;
+import org.apache.cassandra.stress.generate.DistributionFixed;
+import org.apache.cassandra.stress.util.ResultLogger;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -42,7 +41,6 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  */
 public class SettingsColumn implements Serializable
 {
-
     public final int maxColumnsPerKey;
     public transient List<ByteBuffer> names;
     public final List<String> namestrs;
@@ -116,6 +114,8 @@ public class SettingsColumn implements Serializable
                 {
                     return new DistributionFixed(nameCount);
                 }
+                @Override
+                public String getConfigAsString(){return String.format("Count:  fixed=%d", nameCount);}
             };
         }
         else
@@ -177,6 +177,22 @@ public class SettingsColumn implements Serializable
     }
 
     // CLI Utility Methods
+    public void printSettings(ResultLogger out)
+    {
+        out.printf("  Max Columns Per Key: %d%n",maxColumnsPerKey);
+        out.printf("  Column Names: %s%n",namestrs);
+        out.printf("  Comparator: %s%n", comparator);
+        out.printf("  Timestamp: %s%n", timestamp);
+        out.printf("  Variable Column Count: %b%n", variableColumnCount);
+        out.printf("  Slice: %b%n", slice);
+        if (sizeDistribution != null){
+            out.println("  Size Distribution: " + sizeDistribution.getConfigAsString());
+        };
+        if (sizeDistribution != null){
+            out.println("  Count Distribution: " + countDistribution.getConfigAsString());
+        };
+    }
+
 
     static SettingsColumn get(Map<String, String[]> clArgs)
     {

@@ -21,15 +21,18 @@ package org.apache.cassandra.utils;
 import java.math.BigInteger;
 import java.util.*;
 
-import com.google.common.collect.AbstractIterator;
-import com.google.common.io.ByteArrayDataInput;
-import com.google.common.io.ByteArrayDataOutput;
-import com.google.common.io.ByteStreams;
+import com.google.common.collect.Lists;
 
 import org.junit.Before;
 import org.junit.Test;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.MerkleTree.Hashable;
@@ -62,9 +65,9 @@ public class MerkleTreeTest
     public void clear()
     {
         TOKEN_SCALE = new BigInteger("8");
-        partitioner = new RandomPartitioner();
+        partitioner = RandomPartitioner.instance;
         // TODO need to trickle TokenSerializer
-        DatabaseDescriptor.setPartitioner(partitioner);
+        DatabaseDescriptor.setPartitionerUnsafe(partitioner);
         mt = new MerkleTree(partitioner, fullRange(), RECOMMENDED_DEPTH, Integer.MAX_VALUE);
     }
 
@@ -397,7 +400,7 @@ public class MerkleTreeTest
         MerkleTree.serializer.serialize(mt, out, MessagingService.current_version);
         byte[] serialized = out.toByteArray();
 
-        ByteArrayDataInput in = ByteStreams.newDataInput(serialized);
+        DataInputPlus in = new DataInputBuffer(serialized);
         MerkleTree restored = MerkleTree.serializer.deserialize(in, MessagingService.current_version);
 
         assertHashEquals(initialhash, restored.hash(full));
@@ -437,6 +440,38 @@ public class MerkleTreeTest
         List<TreeRange> diffs = MerkleTree.difference(mt, mt2);
         assertEquals(diffs + " contains wrong number of differences:", 1, diffs.size());
         assertTrue(diffs.contains(new Range<>(leftmost.left, middle.right)));
+    }
+
+    /**
+     * difference should behave as expected, even with extremely small ranges
+     */
+    @Test
+    public void differenceSmallRange()
+    {
+        Token start = new BigIntegerToken("9");
+        Token end = new BigIntegerToken("10");
+        Range<Token> range = new Range<>(start, end);
+
+        MerkleTree ltree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        ltree.init();
+        MerkleTree rtree = new MerkleTree(partitioner, range, RECOMMENDED_DEPTH, 16);
+        rtree.init();
+
+        byte[] h1 = "asdf".getBytes();
+        byte[] h2 = "hjkl".getBytes();
+
+        // add dummy hashes to both trees
+        for (TreeRange tree : ltree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h1, h1.length));
+        }
+        for (TreeRange tree : rtree.invalids())
+        {
+            tree.addHash(new RowHash(range.right, h2, h2.length));
+        }
+
+        List<TreeRange> diffs = MerkleTree.difference(ltree, rtree);
+        assertEquals(Lists.newArrayList(range), diffs);
     }
 
     /**

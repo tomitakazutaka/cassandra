@@ -17,17 +17,17 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.db.composites.CellNames;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.MigrationManager;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Event;
 
 public abstract class AlterTypeStatement extends SchemaAlteringStatement
@@ -36,7 +36,6 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
 
     protected AlterTypeStatement(UTName name)
     {
-        super();
         this.name = name;
     }
 
@@ -50,19 +49,19 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
             throw new InvalidRequestException("You need to be logged in a keyspace or use a fully qualified user type name");
     }
 
-    protected abstract UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException;
+    protected abstract UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException;
 
-    public static AlterTypeStatement addition(UTName name, ColumnIdentifier fieldName, CQL3Type.Raw type)
+    public static AlterTypeStatement addition(UTName name, FieldIdentifier fieldName, CQL3Type.Raw type)
     {
-        return new AddOrAlter(name, true, fieldName, type);
+        return new Add(name, fieldName, type);
     }
 
-    public static AlterTypeStatement alter(UTName name, ColumnIdentifier fieldName, CQL3Type.Raw type)
+    public static AlterTypeStatement alter(UTName name, FieldIdentifier fieldName, CQL3Type.Raw type)
     {
-        return new AddOrAlter(name, false, fieldName, type);
+        throw new InvalidRequestException("Altering of types is not allowed");
     }
 
-    public static AlterTypeStatement renames(UTName name, Map<ColumnIdentifier, ColumnIdentifier> renames)
+    public static AlterTypeStatement renames(UTName name, Map<FieldIdentifier, FieldIdentifier> renames)
     {
         return new Renames(name, renames);
     }
@@ -78,264 +77,101 @@ public abstract class AlterTypeStatement extends SchemaAlteringStatement
         // It doesn't really change anything anyway.
     }
 
-    public Event.SchemaChange changeEvent()
-    {
-        return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
-    }
-
     @Override
     public String keyspace()
     {
         return name.getKeyspace();
     }
 
-    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange announceMigration(QueryState queryState, boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
-        KSMetaData ksm = Schema.instance.getKSMetaData(name.getKeyspace());
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(name.getKeyspace());
         if (ksm == null)
             throw new InvalidRequestException(String.format("Cannot alter type in unknown keyspace %s", name.getKeyspace()));
 
-        UserType toUpdate = ksm.userTypes.getType(name.getUserTypeName());
-        // Shouldn't happen, unless we race with a drop
-        if (toUpdate == null)
-            throw new InvalidRequestException(String.format("No user type named %s exists.", name));
+        UserType toUpdate =
+            ksm.types.get(name.getUserTypeName())
+                     .orElseThrow(() -> new InvalidRequestException(String.format("No user type named %s exists.", name)));
 
-        UserType updated = makeUpdatedType(toUpdate);
+        UserType updated = makeUpdatedType(toUpdate, ksm);
 
         // Now, we need to announce the type update to basically change it for new tables using this type,
         // but we also need to find all existing user types and CF using it and change them.
         MigrationManager.announceTypeUpdate(updated, isLocalOnly);
 
-        for (KSMetaData ksm2 : Schema.instance.getKeyspaceDefinitions())
-        {
-            for (CFMetaData cfm : ksm2.cfMetaData().values())
-            {
-                CFMetaData copy = cfm.copy();
-                boolean modified = false;
-                for (ColumnDefinition def : copy.allColumns())
-                    modified |= updateDefinition(copy, def, toUpdate.keyspace, toUpdate.name, updated);
-                if (modified)
-                    MigrationManager.announceColumnFamilyUpdate(copy, false, isLocalOnly);
-            }
-
-            // Other user types potentially using the updated type
-            for (UserType ut : ksm2.userTypes.getAllTypes().values())
-            {
-                // Re-updating the type we've just updated would be harmless but useless so we avoid it.
-                // Besides, we use the occasion to drop the old version of the type if it's a type rename
-                if (ut.keyspace.equals(toUpdate.keyspace) && ut.name.equals(toUpdate.name))
-                {
-                    if (!ut.keyspace.equals(updated.keyspace) || !ut.name.equals(updated.name))
-                        MigrationManager.announceTypeDrop(ut);
-                    continue;
-                }
-                AbstractType<?> upd = updateWith(ut, toUpdate.keyspace, toUpdate.name, updated);
-                if (upd != null)
-                    MigrationManager.announceTypeUpdate((UserType)upd, isLocalOnly);
-            }
-        }
-        return true;
+        return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 
-    private static int getIdxOfField(UserType type, ColumnIdentifier field)
+    protected void checkTypeNotUsedByAggregate(KeyspaceMetadata ksm)
     {
-        for (int i = 0; i < type.size(); i++)
-            if (field.bytes.equals(type.fieldName(i)))
-                return i;
-        return -1;
+        ksm.functions.udas().filter(aggregate -> aggregate.initialCondition() != null && aggregate.stateType().referencesUserType(name.getStringTypeName()))
+                     .findAny()
+                     .ifPresent((aggregate) -> {
+                         throw new InvalidRequestException(String.format("Cannot alter user type %s as it is still used as an INITCOND by aggregate %s", name, aggregate));
+                     });
     }
 
-    private boolean updateDefinition(CFMetaData cfm, ColumnDefinition def, String keyspace, ByteBuffer toReplace, UserType updated)
+    private static class Add extends AlterTypeStatement
     {
-        AbstractType<?> t = updateWith(def.type, keyspace, toReplace, updated);
-        if (t == null)
-            return false;
-
-        // We need to update this validator ...
-        cfm.addOrReplaceColumnDefinition(def.withNewType(t));
-
-        // ... but if it's part of the comparator or key validator, we need to go update those too.
-        switch (def.kind)
-        {
-            case PARTITION_KEY:
-                cfm.keyValidator(updateWith(cfm.getKeyValidator(), keyspace, toReplace, updated));
-                break;
-            case CLUSTERING_COLUMN:
-                cfm.comparator = CellNames.fromAbstractType(updateWith(cfm.comparator.asAbstractType(), keyspace, toReplace, updated), cfm.comparator.isDense());
-                break;
-            default:
-                // If it's a collection, we still want to modify the comparator because the collection is aliased in it
-                if (def.type instanceof CollectionType)
-                    cfm.comparator = CellNames.fromAbstractType(updateWith(cfm.comparator.asAbstractType(), keyspace, toReplace, updated), cfm.comparator.isDense());
-        }
-        return true;
-    }
-
-    // Update the provided type were all instance of a given userType is replaced by a new version
-    // Note that this methods reaches inside other UserType, CompositeType and CollectionType.
-    private static AbstractType<?> updateWith(AbstractType<?> type, String keyspace, ByteBuffer toReplace, UserType updated)
-    {
-        if (type instanceof UserType)
-        {
-            UserType ut = (UserType)type;
-
-            // If it's directly the type we've updated, then just use the new one.
-            if (keyspace.equals(ut.keyspace) && toReplace.equals(ut.name))
-                return updated;
-
-            // Otherwise, check for nesting
-            List<AbstractType<?>> updatedTypes = updateTypes(ut.fieldTypes(), keyspace, toReplace, updated);
-            return updatedTypes == null ? null : new UserType(ut.keyspace, ut.name, new ArrayList<>(ut.fieldNames()), updatedTypes);
-        }
-        else if (type instanceof CompositeType)
-        {
-            CompositeType ct = (CompositeType)type;
-            List<AbstractType<?>> updatedTypes = updateTypes(ct.types, keyspace, toReplace, updated);
-            return updatedTypes == null ? null : CompositeType.getInstance(updatedTypes);
-        }
-        else if (type instanceof ColumnToCollectionType)
-        {
-            ColumnToCollectionType ctct = (ColumnToCollectionType)type;
-            Map<ByteBuffer, CollectionType> updatedTypes = null;
-            for (Map.Entry<ByteBuffer, CollectionType> entry : ctct.defined.entrySet())
-            {
-                AbstractType<?> t = updateWith(entry.getValue(), keyspace, toReplace, updated);
-                if (t == null)
-                    continue;
-
-                if (updatedTypes == null)
-                    updatedTypes = new HashMap<>(ctct.defined);
-
-                updatedTypes.put(entry.getKey(), (CollectionType)t);
-            }
-            return updatedTypes == null ? null : ColumnToCollectionType.getInstance(updatedTypes);
-        }
-        else if (type instanceof CollectionType)
-        {
-            if (type instanceof ListType)
-            {
-                AbstractType<?> t = updateWith(((ListType)type).elements, keyspace, toReplace, updated);
-                return t == null ? null : ListType.getInstance(t);
-            }
-            else if (type instanceof SetType)
-            {
-                AbstractType<?> t = updateWith(((SetType)type).elements, keyspace, toReplace, updated);
-                return t == null ? null : SetType.getInstance(t);
-            }
-            else
-            {
-                assert type instanceof MapType;
-                MapType mt = (MapType)type;
-                AbstractType<?> k = updateWith(mt.keys, keyspace, toReplace, updated);
-                AbstractType<?> v = updateWith(mt.values, keyspace, toReplace, updated);
-                if (k == null && v == null)
-                    return null;
-                return MapType.getInstance(k == null ? mt.keys : k, v == null ? mt.values : v);
-            }
-        }
-        else
-        {
-            return null;
-        }
-    }
-
-    private static List<AbstractType<?>> updateTypes(List<AbstractType<?>> toUpdate, String keyspace, ByteBuffer toReplace, UserType updated)
-    {
-        // But this can also be nested.
-        List<AbstractType<?>> updatedTypes = null;
-        for (int i = 0; i < toUpdate.size(); i++)
-        {
-            AbstractType<?> t = updateWith(toUpdate.get(i), keyspace, toReplace, updated);
-            if (t == null)
-                continue;
-
-            if (updatedTypes == null)
-                updatedTypes = new ArrayList<>(toUpdate);
-
-            updatedTypes.set(i, t);
-        }
-        return updatedTypes;
-    }
-
-    private static class AddOrAlter extends AlterTypeStatement
-    {
-        private final boolean isAdd;
-        private final ColumnIdentifier fieldName;
+        private final FieldIdentifier fieldName;
         private final CQL3Type.Raw type;
 
-        public AddOrAlter(UTName name, boolean isAdd, ColumnIdentifier fieldName, CQL3Type.Raw type)
+        public Add(UTName name, FieldIdentifier fieldName, CQL3Type.Raw type)
         {
             super(name);
-            this.isAdd = isAdd;
             this.fieldName = fieldName;
             this.type = type;
         }
 
-        private UserType doAdd(UserType toUpdate) throws InvalidRequestException
+        protected UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException
         {
-            if (getIdxOfField(toUpdate, fieldName) >= 0)
+            if (toUpdate.fieldPosition(fieldName) >= 0)
                 throw new InvalidRequestException(String.format("Cannot add new field %s to type %s: a field of the same name already exists", fieldName, name));
 
-            List<ByteBuffer> newNames = new ArrayList<>(toUpdate.size() + 1);
+            List<FieldIdentifier> newNames = new ArrayList<>(toUpdate.size() + 1);
             newNames.addAll(toUpdate.fieldNames());
-            newNames.add(fieldName.bytes);
+            newNames.add(fieldName);
+
+            AbstractType<?> addType = type.prepare(keyspace()).getType();
+            if (addType.referencesUserType(toUpdate.getNameAsString()))
+                throw new InvalidRequestException(String.format("Cannot add new field %s of type %s to type %s as this would create a circular reference", fieldName, type, name));
 
             List<AbstractType<?>> newTypes = new ArrayList<>(toUpdate.size() + 1);
             newTypes.addAll(toUpdate.fieldTypes());
-            newTypes.add(type.prepare(keyspace()).getType());
+            newTypes.add(addType);
 
-            return new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes);
-        }
-
-        private UserType doAlter(UserType toUpdate) throws InvalidRequestException
-        {
-            int idx = getIdxOfField(toUpdate, fieldName);
-            if (idx < 0)
-                throw new InvalidRequestException(String.format("Unknown field %s in type %s", fieldName, name));
-
-            AbstractType<?> previous = toUpdate.fieldType(idx);
-            if (!type.prepare(keyspace()).getType().isCompatibleWith(previous))
-                throw new InvalidRequestException(String.format("Type %s is incompatible with previous type %s of field %s in user type %s", type, previous.asCQL3Type(), fieldName, name));
-
-            List<ByteBuffer> newNames = new ArrayList<>(toUpdate.fieldNames());
-            List<AbstractType<?>> newTypes = new ArrayList<>(toUpdate.fieldTypes());
-            newTypes.set(idx, type.prepare(keyspace()).getType());
-
-            return new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes);
-        }
-
-        protected UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException
-        {
-            return isAdd ? doAdd(toUpdate) : doAlter(toUpdate);
+            return new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes, toUpdate.isMultiCell());
         }
     }
 
     private static class Renames extends AlterTypeStatement
     {
-        private final Map<ColumnIdentifier, ColumnIdentifier> renames;
+        private final Map<FieldIdentifier, FieldIdentifier> renames;
 
-        public Renames(UTName name, Map<ColumnIdentifier, ColumnIdentifier> renames)
+        public Renames(UTName name, Map<FieldIdentifier, FieldIdentifier> renames)
         {
             super(name);
             this.renames = renames;
         }
 
-        protected UserType makeUpdatedType(UserType toUpdate) throws InvalidRequestException
+        protected UserType makeUpdatedType(UserType toUpdate, KeyspaceMetadata ksm) throws InvalidRequestException
         {
-            List<ByteBuffer> newNames = new ArrayList<>(toUpdate.fieldNames());
+            checkTypeNotUsedByAggregate(ksm);
+
+            List<FieldIdentifier> newNames = new ArrayList<>(toUpdate.fieldNames());
             List<AbstractType<?>> newTypes = new ArrayList<>(toUpdate.fieldTypes());
 
-            for (Map.Entry<ColumnIdentifier, ColumnIdentifier> entry : renames.entrySet())
+            for (Map.Entry<FieldIdentifier, FieldIdentifier> entry : renames.entrySet())
             {
-                ColumnIdentifier from = entry.getKey();
-                ColumnIdentifier to = entry.getValue();
-                int idx = getIdxOfField(toUpdate, from);
+                FieldIdentifier from = entry.getKey();
+                FieldIdentifier to = entry.getValue();
+                int idx = toUpdate.fieldPosition(from);
                 if (idx < 0)
                     throw new InvalidRequestException(String.format("Unknown field %s in type %s", from, name));
-                newNames.set(idx, to.bytes);
+                newNames.set(idx, to);
             }
 
-            UserType updated = new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes);
+            UserType updated = new UserType(toUpdate.keyspace, toUpdate.name, newNames, newTypes, toUpdate.isMultiCell());
             CreateTypeStatement.checkForDuplicateNames(updated);
             return updated;
         }

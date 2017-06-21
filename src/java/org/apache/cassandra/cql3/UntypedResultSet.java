@@ -22,12 +22,17 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import com.google.common.collect.AbstractIterator;
-
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.pager.QueryPager;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.FBUtilities;
 
 /** a utility for doing internal cql-based queries */
 public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
@@ -74,9 +79,9 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
 
         public Row one()
         {
-            if (cqlRows.rows.size() != 1)
-                throw new IllegalStateException("One row required, " + cqlRows.rows.size() + " found");
-            return new Row(cqlRows.metadata.names, cqlRows.rows.get(0));
+            if (cqlRows.size() != 1)
+                throw new IllegalStateException("One row required, " + cqlRows.size() + " found");
+            return new Row(cqlRows.metadata.requestNames(), cqlRows.rows.get(0));
         }
 
         public Iterator<Row> iterator()
@@ -89,14 +94,14 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 {
                     if (!iter.hasNext())
                         return endOfData();
-                    return new Row(cqlRows.metadata.names, iter.next());
+                    return new Row(cqlRows.metadata.requestNames(), iter.next());
                 }
             };
         }
 
         public List<ColumnSpecification> metadata()
         {
-            return cqlRows.metadata.names;
+            return cqlRows.metadata.requestNames();
         }
     }
 
@@ -154,7 +159,7 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
             this.select = select;
             this.pager = pager;
             this.pageSize = pageSize;
-            this.metadata = select.getResultMetadata().names;
+            this.metadata = select.getResultMetadata().requestNames();
         }
 
         public int size()
@@ -175,17 +180,19 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
 
                 protected Row computeNext()
                 {
-                    try {
-                        while (currentPage == null || !currentPage.hasNext())
+                    int nowInSec = FBUtilities.nowInSeconds();
+                    while (currentPage == null || !currentPage.hasNext())
+                    {
+                        if (pager.isExhausted())
+                            return endOfData();
+
+                        try (ReadExecutionController executionController = pager.executionController();
+                             PartitionIterator iter = pager.fetchPageInternal(pageSize, executionController))
                         {
-                            if (pager.isExhausted())
-                                return endOfData();
-                            currentPage = select.process(pager.fetchPage(pageSize)).rows.iterator();
+                            currentPage = select.process(iter, nowInSec).rows.iterator();
                         }
-                        return new Row(metadata, currentPage.next());
-                    } catch (RequestValidationException | RequestExecutionException e) {
-                        throw new RuntimeException(e);
                     }
+                    return new Row(metadata, currentPage.next());
                 }
             };
         }
@@ -213,6 +220,37 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
                 data.put(names.get(i).name.toString(), columns.get(i));
         }
 
+        public static Row fromInternalRow(TableMetadata metadata, DecoratedKey key, org.apache.cassandra.db.rows.Row row)
+        {
+            Map<String, ByteBuffer> data = new HashMap<>();
+
+            ByteBuffer[] keyComponents = SelectStatement.getComponents(metadata, key);
+            for (ColumnMetadata def : metadata.partitionKeyColumns())
+                data.put(def.name.toString(), keyComponents[def.position()]);
+
+            Clustering clustering = row.clustering();
+            for (ColumnMetadata def : metadata.clusteringColumns())
+                data.put(def.name.toString(), clustering.get(def.position()));
+
+            for (ColumnMetadata def : metadata.regularAndStaticColumns())
+            {
+                if (def.isSimple())
+                {
+                    Cell cell = row.getCell(def);
+                    if (cell != null)
+                        data.put(def.name.toString(), cell.value());
+                }
+                else
+                {
+                    ComplexColumnData complexData = row.getComplexColumnData(def);
+                    if (complexData != null)
+                        data.put(def.name.toString(), ((CollectionType)def.type).serializeForNativeProtocol(complexData.iterator(), ProtocolVersion.V3));
+                }
+            }
+
+            return new Row(data);
+        }
+
         public boolean has(String column)
         {
             // Note that containsKey won't work because we may have null values
@@ -232,6 +270,16 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         public boolean getBoolean(String column)
         {
             return BooleanType.instance.compose(data.get(column));
+        }
+
+        public byte getByte(String column)
+        {
+            return ByteType.instance.compose(data.get(column));
+        }
+
+        public short getShort(String column)
+        {
+            return ShortType.instance.compose(data.get(column));
         }
 
         public int getInt(String column)
@@ -272,19 +320,47 @@ public abstract class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         public <T> Set<T> getSet(String column, AbstractType<T> type)
         {
             ByteBuffer raw = data.get(column);
-            return raw == null ? null : SetType.getInstance(type).compose(raw);
+            return raw == null ? null : SetType.getInstance(type, true).compose(raw);
         }
 
         public <T> List<T> getList(String column, AbstractType<T> type)
         {
             ByteBuffer raw = data.get(column);
-            return raw == null ? null : ListType.getInstance(type).compose(raw);
+            return raw == null ? null : ListType.getInstance(type, true).compose(raw);
         }
 
         public <K, V> Map<K, V> getMap(String column, AbstractType<K> keyType, AbstractType<V> valueType)
         {
             ByteBuffer raw = data.get(column);
-            return raw == null ? null : MapType.getInstance(keyType, valueType).compose(raw);
+            return raw == null ? null : MapType.getInstance(keyType, valueType, true).compose(raw);
+        }
+
+        public Map<String, String> getTextMap(String column)
+        {
+            return getMap(column, UTF8Type.instance, UTF8Type.instance);
+        }
+
+        public <T> Set<T> getFrozenSet(String column, AbstractType<T> type)
+        {
+            ByteBuffer raw = data.get(column);
+            return raw == null ? null : SetType.getInstance(type, false).compose(raw);
+        }
+
+        public <T> List<T> getFrozenList(String column, AbstractType<T> type)
+        {
+            ByteBuffer raw = data.get(column);
+            return raw == null ? null : ListType.getInstance(type, false).compose(raw);
+        }
+
+        public <K, V> Map<K, V> getFrozenMap(String column, AbstractType<K> keyType, AbstractType<V> valueType)
+        {
+            ByteBuffer raw = data.get(column);
+            return raw == null ? null : MapType.getInstance(keyType, valueType, false).compose(raw);
+        }
+
+        public Map<String, String> getFrozenTextMap(String column)
+        {
+            return getFrozenMap(column, UTF8Type.instance, UTF8Type.instance);
         }
 
         public List<ColumnSpecification> getColumns()

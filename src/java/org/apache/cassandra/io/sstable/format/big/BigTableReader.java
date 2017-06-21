@@ -17,36 +17,34 @@
  */
 package org.apache.cassandra.io.sstable.format.big;
 
-import com.google.common.util.concurrent.RateLimiter;
-import org.apache.cassandra.cache.KeyCacheKey;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.DataRange;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RowIndexEntry;
-import org.apache.cassandra.db.RowPosition;
-import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
-import org.apache.cassandra.db.compaction.ICompactionScanner;
-import org.apache.cassandra.db.composites.CellName;
-import org.apache.cassandra.db.filter.ColumnSlice;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.CorruptSSTableException;
-import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
-import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cache.KeyCacheKey;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.columniterator.SSTableIterator;
+import org.apache.cassandra.db.columniterator.SSTableReversedIterator;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener.SelectionReason;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener.SkippingReason;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
  * SSTableReaders are open()ed by Keyspace.onStart; after that they are created by SSTableWriter.renameAndOpen.
@@ -56,40 +54,56 @@ public class BigTableReader extends SSTableReader
 {
     private static final Logger logger = LoggerFactory.getLogger(BigTableReader.class);
 
-    BigTableReader(Descriptor desc, Set<Component> components, CFMetaData metadata, IPartitioner partitioner, Long maxDataAge, StatsMetadata sstableMetadata, OpenReason openReason)
+    BigTableReader(Descriptor desc, Set<Component> components, TableMetadataRef metadata, Long maxDataAge, StatsMetadata sstableMetadata, OpenReason openReason, SerializationHeader header)
     {
-        super(desc, components, metadata, partitioner, maxDataAge, sstableMetadata, openReason);
+        super(desc, components, metadata, maxDataAge, sstableMetadata, openReason, header);
     }
 
-    public OnDiskAtomIterator iterator(DecoratedKey key, SortedSet<CellName> columns)
+    public UnfilteredRowIterator iterator(DecoratedKey key,
+                                          Slices slices,
+                                          ColumnFilter selectedColumns,
+                                          boolean reversed,
+                                          SSTableReadsListener listener)
     {
-        return new SSTableNamesIterator(this, key, columns);
+        RowIndexEntry rie = getPosition(key, SSTableReader.Operator.EQ, listener);
+        return iterator(null, key, rie, slices, selectedColumns, reversed);
     }
 
-    public OnDiskAtomIterator iterator(FileDataInput input, DecoratedKey key, SortedSet<CellName> columns, RowIndexEntry indexEntry )
+    public UnfilteredRowIterator iterator(FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry, Slices slices, ColumnFilter selectedColumns, boolean reversed)
     {
-        return new SSTableNamesIterator(this, input, key, columns, indexEntry);
+        if (indexEntry == null)
+            return UnfilteredRowIterators.noRowsIterator(metadata(), key, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, reversed);
+        return reversed
+             ? new SSTableReversedIterator(this, file, key, indexEntry, slices, selectedColumns, ifile)
+             : new SSTableIterator(this, file, key, indexEntry, slices, selectedColumns, ifile);
     }
 
-    public OnDiskAtomIterator iterator(DecoratedKey key, ColumnSlice[] slices, boolean reverse)
+    @Override
+    public ISSTableScanner getScanner(ColumnFilter columns, DataRange dataRange, SSTableReadsListener listener)
     {
-        return new SSTableSliceIterator(this, key, slices, reverse);
+        return BigTableScanner.getScanner(this, columns, dataRange, listener);
     }
 
-    public OnDiskAtomIterator iterator(FileDataInput input, DecoratedKey key, ColumnSlice[] slices, boolean reverse, RowIndexEntry indexEntry)
-    {
-        return new SSTableSliceIterator(this, input, key, slices, reverse, indexEntry);
-    }
     /**
+     * Direct I/O SSTableScanner over an iterator of bounds.
      *
-     * @param dataRange filter to use when reading the columns
+     * @param boundsIterator the keys to cover
      * @return A Scanner for seeking over the rows of the SSTable.
      */
-    public ICompactionScanner getScanner(DataRange dataRange, RateLimiter limiter)
+    public ISSTableScanner getScanner(Iterator<AbstractBounds<PartitionPosition>> boundsIterator)
     {
-        return new BigTableScanner(this, dataRange, limiter);
+        return BigTableScanner.getScanner(this, boundsIterator);
     }
 
+    /**
+     * Direct I/O SSTableScanner over the full sstable.
+     *
+     * @return A Scanner for reading the full SSTable.
+     */
+    public ISSTableScanner getScanner()
+    {
+        return BigTableScanner.getScanner(this);
+    }
 
     /**
      * Direct I/O SSTableScanner over a defined collection of ranges of tokens.
@@ -97,16 +111,21 @@ public class BigTableReader extends SSTableReader
      * @param ranges the range of keys to cover
      * @return A Scanner for seeking over the rows of the SSTable.
      */
-    public ICompactionScanner getScanner(Collection<Range<Token>> ranges, RateLimiter limiter)
+    public ISSTableScanner getScanner(Collection<Range<Token>> ranges)
     {
-        // We want to avoid allocating a SSTableScanner if the range don't overlap the sstable (#5249)
-        List<Pair<Long, Long>> positions = getPositionsForRanges(Range.normalize(ranges));
-        if (positions.isEmpty())
-            return new EmptyCompactionScanner(getFilename());
+        if (ranges != null)
+            return BigTableScanner.getScanner(this, ranges);
         else
-            return new BigTableScanner(this, ranges, limiter);
+            return getScanner();
     }
 
+
+    @SuppressWarnings("resource") // caller to close
+    @Override
+    public UnfilteredRowIterator simpleIterator(FileDataInput dfile, DecoratedKey key, RowIndexEntry position, boolean tombstoneOnly)
+    {
+        return SSTableIdentityIterator.create(this, dfile, position, key, tombstoneOnly);
+    }
 
     /**
      * @param key The key to apply as the rhs to the given Operator. A 'fake' key is allowed to
@@ -115,14 +134,18 @@ public class BigTableReader extends SSTableReader
      * @param updateCacheAndStats true if updating stats and cache
      * @return The index entry corresponding to the key, or null if the key is not present
      */
-    public RowIndexEntry getPosition(RowPosition key, Operator op, boolean updateCacheAndStats)
+    protected RowIndexEntry getPosition(PartitionPosition key,
+                                        Operator op,
+                                        boolean updateCacheAndStats,
+                                        boolean permitMatchPastLast,
+                                        SSTableReadsListener listener)
     {
-        // first, check bloom filter
         if (op == Operator.EQ)
         {
             assert key instanceof DecoratedKey; // EQ only make sense if the key is a valid row key
-            if (!bf.isPresent(((DecoratedKey)key).getKey()))
+            if (!bf.isPresent((DecoratedKey)key))
             {
+                listener.onSSTableSkipped(this, SkippingReason.BLOOM_FILTER);
                 Tracing.trace("Bloom filter allows skipping sstable {}", descriptor.generation);
                 return null;
             }
@@ -132,36 +155,52 @@ public class BigTableReader extends SSTableReader
         if ((op == Operator.EQ || op == Operator.GE) && (key instanceof DecoratedKey))
         {
             DecoratedKey decoratedKey = (DecoratedKey)key;
-            KeyCacheKey cacheKey = new KeyCacheKey(metadata.cfId, descriptor, decoratedKey.getKey());
+            KeyCacheKey cacheKey = new KeyCacheKey(metadata(), descriptor, decoratedKey.getKey());
             RowIndexEntry cachedPosition = getCachedPosition(cacheKey, updateCacheAndStats);
             if (cachedPosition != null)
             {
+                listener.onSSTableSelected(this, cachedPosition, SelectionReason.KEY_CACHE_HIT);
                 Tracing.trace("Key cache hit for sstable {}", descriptor.generation);
                 return cachedPosition;
             }
         }
 
         // check the smallest and greatest keys in the sstable to see if it can't be present
-        if (first.compareTo(key) > 0 || last.compareTo(key) < 0)
+        boolean skip = false;
+        if (key.compareTo(first) < 0)
+        {
+            if (op == Operator.EQ)
+                skip = true;
+            else
+                key = first;
+
+            op = Operator.EQ;
+        }
+        else
+        {
+            int l = last.compareTo(key);
+            // l <= 0  => we may be looking past the end of the file; we then narrow our behaviour to:
+            //             1) skipping if strictly greater for GE and EQ;
+            //             2) skipping if equal and searching GT, and we aren't permitting matching past last
+            skip = l <= 0 && (l < 0 || (!permitMatchPastLast && op == Operator.GT));
+        }
+        if (skip)
         {
             if (op == Operator.EQ && updateCacheAndStats)
                 bloomFilterTracker.addFalsePositive();
-
-            if (op.apply(1) < 0)
-            {
-                Tracing.trace("Check against min and max keys allows skipping sstable {}", descriptor.generation);
-                return null;
-            }
+            listener.onSSTableSkipped(this, SkippingReason.MIN_MAX_KEYS);
+            Tracing.trace("Check against min and max keys allows skipping sstable {}", descriptor.generation);
+            return null;
         }
 
         int binarySearchResult = indexSummary.binarySearch(key);
         long sampledPosition = getIndexScanPositionFromBinarySearchResult(binarySearchResult, indexSummary);
         int sampledIndex = getIndexSummaryIndexFromBinarySearchResult(binarySearchResult);
 
-        // if we matched the -1th position, we'll start at the first position
-        sampledPosition = sampledPosition == -1 ? 0 : sampledPosition;
-
         int effectiveInterval = indexSummary.getEffectiveIndexIntervalAfterIndex(sampledIndex);
+
+        if (ifile == null)
+            return null;
 
         // scan the on-disk index, starting at the nearest sampled position.
         // The check against IndexInterval is to be exit the loop in the EQ case when the key looked for is not present
@@ -170,84 +209,81 @@ public class BigTableReader extends SSTableReader
         // is lesser than the first key of next interval (and in that case we must return the position of the first key
         // of the next interval).
         int i = 0;
-        Iterator<FileDataInput> segments = ifile.iterator(sampledPosition);
-        while (segments.hasNext() && i <= effectiveInterval)
+        String path = null;
+        try (FileDataInput in = ifile.createReader(sampledPosition))
         {
-            FileDataInput in = segments.next();
-            try
+            path = in.getPath();
+            while (!in.isEOF())
             {
-                while (!in.isEOF() && i <= effectiveInterval)
+                i++;
+
+                ByteBuffer indexKey = ByteBufferUtil.readWithShortLength(in);
+
+                boolean opSatisfied; // did we find an appropriate position for the op requested
+                boolean exactMatch; // is the current position an exact match for the key, suitable for caching
+
+                // Compare raw keys if possible for performance, otherwise compare decorated keys.
+                if (op == Operator.EQ && i <= effectiveInterval)
                 {
-                    i++;
-
-                    ByteBuffer indexKey = ByteBufferUtil.readWithShortLength(in);
-
-                    boolean opSatisfied; // did we find an appropriate position for the op requested
-                    boolean exactMatch; // is the current position an exact match for the key, suitable for caching
-
-                    // Compare raw keys if possible for performance, otherwise compare decorated keys.
-                    if (op == Operator.EQ)
+                    opSatisfied = exactMatch = indexKey.equals(((DecoratedKey) key).getKey());
+                }
+                else
+                {
+                    DecoratedKey indexDecoratedKey = decorateKey(indexKey);
+                    int comparison = indexDecoratedKey.compareTo(key);
+                    int v = op.apply(comparison);
+                    opSatisfied = (v == 0);
+                    exactMatch = (comparison == 0);
+                    if (v < 0)
                     {
-                        opSatisfied = exactMatch = indexKey.equals(((DecoratedKey) key).getKey());
+                        listener.onSSTableSkipped(this, SkippingReason.PARTITION_INDEX_LOOKUP);
+                        Tracing.trace("Partition index lookup allows skipping sstable {}", descriptor.generation);
+                        return null;
                     }
-                    else
-                    {
-                        DecoratedKey indexDecoratedKey = partitioner.decorateKey(indexKey);
-                        int comparison = indexDecoratedKey.compareTo(key);
-                        int v = op.apply(comparison);
-                        opSatisfied = (v == 0);
-                        exactMatch = (comparison == 0);
-                        if (v < 0)
-                        {
-                            Tracing.trace("Partition index lookup allows skipping sstable {}", descriptor.generation);
-                            return null;
-                        }
-                    }
+                }
 
-                    if (opSatisfied)
+                if (opSatisfied)
+                {
+                    // read data position from index entry
+                    RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in, in.getFilePointer());
+                    if (exactMatch && updateCacheAndStats)
                     {
-                        // read data position from index entry
-                        RowIndexEntry indexEntry = rowIndexEntrySerializer.deserialize(in, descriptor.version);
-                        if (exactMatch && updateCacheAndStats)
-                        {
-                            assert key instanceof DecoratedKey; // key can be == to the index key only if it's a true row key
-                            DecoratedKey decoratedKey = (DecoratedKey)key;
+                        assert key instanceof DecoratedKey; // key can be == to the index key only if it's a true row key
+                        DecoratedKey decoratedKey = (DecoratedKey)key;
 
-                            if (logger.isTraceEnabled())
+                        if (logger.isTraceEnabled())
+                        {
+                            // expensive sanity check!  see CASSANDRA-4687
+                            try (FileDataInput fdi = dfile.createReader(indexEntry.position))
                             {
-                                // expensive sanity check!  see CASSANDRA-4687
-                                FileDataInput fdi = dfile.getSegment(indexEntry.position);
-                                DecoratedKey keyInDisk = partitioner.decorateKey(ByteBufferUtil.readWithShortLength(fdi));
+                                DecoratedKey keyInDisk = decorateKey(ByteBufferUtil.readWithShortLength(fdi));
                                 if (!keyInDisk.equals(key))
                                     throw new AssertionError(String.format("%s != %s in %s", keyInDisk, key, fdi.getPath()));
-                                fdi.close();
                             }
-
-                            // store exact match for the key
-                            cacheKey(decoratedKey, indexEntry);
                         }
-                        if (op == Operator.EQ && updateCacheAndStats)
-                            bloomFilterTracker.addTruePositive();
-                        Tracing.trace("Partition index with {} entries found for sstable {}", indexEntry.columnsIndex().size(), descriptor.generation);
-                        return indexEntry;
-                    }
 
-                    RowIndexEntry.Serializer.skip(in);
+                        // store exact match for the key
+                        cacheKey(decoratedKey, indexEntry);
+                    }
+                    if (op == Operator.EQ && updateCacheAndStats)
+                        bloomFilterTracker.addTruePositive();
+                    listener.onSSTableSelected(this, indexEntry, SelectionReason.INDEX_ENTRY_FOUND);
+                    Tracing.trace("Partition index with {} entries found for sstable {}", indexEntry.columnsIndexCount(), descriptor.generation);
+                    return indexEntry;
                 }
+
+                RowIndexEntry.Serializer.skip(in, descriptor.version);
             }
-            catch (IOException e)
-            {
-                markSuspect();
-                throw new CorruptSSTableException(e, in.getPath());
-            }
-            finally
-            {
-                FileUtils.closeQuietly(in);
-            }
+        }
+        catch (IOException e)
+        {
+            markSuspect();
+            throw new CorruptSSTableException(e, path);
         }
 
         if (op == SSTableReader.Operator.EQ && updateCacheAndStats)
             bloomFilterTracker.addFalsePositive();
+        listener.onSSTableSkipped(this, SkippingReason.INDEX_ENTRY_NOT_FOUND);
         Tracing.trace("Partition index lookup complete (bloom filter false positive) for sstable {}", descriptor.generation);
         return null;
     }

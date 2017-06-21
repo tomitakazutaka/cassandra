@@ -21,11 +21,12 @@ package org.apache.cassandra.locator;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.EndpointState;
-import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
-import org.apache.cassandra.gms.VersionedValue;
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.gms.*;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.OutboundTcpConnectionPool;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,7 +53,7 @@ public class ReconnectableSnitchHelper implements IEndpointStateChangeSubscriber
     {
         try
         {
-            reconnect(publicAddress, InetAddress.getByName(localAddressValue.value));
+            reconnect(publicAddress, InetAddress.getByName(localAddressValue.value), snitch, localDc);
         }
         catch (UnknownHostException e)
         {
@@ -60,17 +61,25 @@ public class ReconnectableSnitchHelper implements IEndpointStateChangeSubscriber
         }
     }
 
-    private void reconnect(InetAddress publicAddress, InetAddress localAddress)
+    @VisibleForTesting
+    static void reconnect(InetAddress publicAddress, InetAddress localAddress, IEndpointSnitch snitch, String localDc)
     {
-        if (snitch.getDatacenter(publicAddress).equals(localDc)
-                && MessagingService.instance().getVersion(publicAddress) == MessagingService.current_version
-                && !MessagingService.instance().getConnectionPool(publicAddress).endPoint().equals(localAddress))
+        OutboundTcpConnectionPool cp = MessagingService.instance().getConnectionPool(publicAddress);
+        //InternodeAuthenticator said don't connect
+        if (cp == null)
         {
-            MessagingService.instance().getConnectionPool(publicAddress).reset(localAddress);
-            logger.debug(String.format("Intiated reconnect to an Internal IP %s for the %s", localAddress, publicAddress));
+            logger.debug("InternodeAuthenticator said don't reconnect to {} on {}", publicAddress, localAddress);
+            return;
+        }
+
+        if (snitch.getDatacenter(publicAddress).equals(localDc)
+                && !cp.endPoint().equals(localAddress))
+        {
+            cp.reset(localAddress);
+            logger.debug("Initiated reconnect to an Internal IP {} for the {}", localAddress, publicAddress);
         }
     }
-    
+
     public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue)
     {
         // no-op
@@ -78,13 +87,13 @@ public class ReconnectableSnitchHelper implements IEndpointStateChangeSubscriber
 
     public void onJoin(InetAddress endpoint, EndpointState epState)
     {
-        if (preferLocal && epState.getApplicationState(ApplicationState.INTERNAL_IP) != null)
+        if (preferLocal && !Gossiper.instance.isDeadState(epState) && epState.getApplicationState(ApplicationState.INTERNAL_IP) != null)
             reconnect(endpoint, epState.getApplicationState(ApplicationState.INTERNAL_IP));
     }
 
     public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
     {
-        if (preferLocal && state == ApplicationState.INTERNAL_IP)
+        if (preferLocal && state == ApplicationState.INTERNAL_IP && !Gossiper.instance.isDeadState(Gossiper.instance.getEndpointStateForEndpoint(endpoint)))
             reconnect(endpoint, value);
     }
 

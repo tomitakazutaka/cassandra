@@ -17,30 +17,26 @@
  */
 package org.apache.cassandra.transport;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 import io.netty.channel.Channel;
-
 import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator.SaslAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
-
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 public class ServerConnection extends Connection
 {
     private enum State { UNINITIALIZED, AUTHENTICATION, READY }
 
-    private volatile SaslAuthenticator saslAuthenticator;
+    private volatile IAuthenticator.SaslNegotiator saslNegotiator;
     private final ClientState clientState;
     private volatile State state;
 
-    private final ConcurrentMap<Integer, QueryState> queryStates = new NonBlockingHashMap<Integer, QueryState>();
+    private final ConcurrentMap<Integer, QueryState> queryStates = new ConcurrentHashMap<>();
 
-    public ServerConnection(Channel channel, int version, Connection.Tracker tracker)
+    public ServerConnection(Channel channel, ProtocolVersion version, Connection.Tracker tracker)
     {
         super(channel, version, tracker);
         this.clientState = ClientState.forExternalCalls(channel.remoteAddress());
@@ -60,7 +56,7 @@ public class ServerConnection extends Connection
         return qState;
     }
 
-    public QueryState validateNewMessage(Message.Type type, int version, int streamId)
+    public QueryState validateNewMessage(Message.Type type, ProtocolVersion version, int streamId)
     {
         switch (state)
         {
@@ -71,7 +67,7 @@ public class ServerConnection extends Connection
             case AUTHENTICATION:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 if (type != Message.Type.AUTH_RESPONSE && type != Message.Type.CREDENTIALS)
-                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == 1 ? "CREDENTIALS" : "SASL_RESPONSE"));
+                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == ProtocolVersion.V1 ? "CREDENTIALS" : "SASL_RESPONSE"));
                 break;
             case READY:
                 if (type == Message.Type.STARTUP)
@@ -104,7 +100,7 @@ public class ServerConnection extends Connection
                 {
                     state = State.READY;
                     // we won't use the authenticator again, null it so that it can be GC'd
-                    saslAuthenticator = null;
+                    saslNegotiator = null;
                 }
                 break;
             case READY:
@@ -114,14 +110,10 @@ public class ServerConnection extends Connection
         }
     }
 
-    public SaslAuthenticator getAuthenticator()
+    public IAuthenticator.SaslNegotiator getSaslNegotiator(QueryState queryState)
     {
-        if (saslAuthenticator == null)
-        {
-            IAuthenticator authenticator = DatabaseDescriptor.getAuthenticator();
-            assert authenticator instanceof ISaslAwareAuthenticator : "Configured IAuthenticator does not support SASL authentication";
-            saslAuthenticator = ((ISaslAwareAuthenticator)authenticator).newAuthenticator();
-        }
-        return saslAuthenticator;
+        if (saslNegotiator == null)
+            saslNegotiator = DatabaseDescriptor.getAuthenticator().newSaslNegotiator(queryState.getClientAddress());
+        return saslNegotiator;
     }
 }

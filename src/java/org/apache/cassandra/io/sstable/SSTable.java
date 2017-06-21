@@ -18,6 +18,7 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.*;
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -29,17 +30,19 @@ import com.google.common.io.Files;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.DiskOptimizationStrategy;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.memory.HeapAllocator;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.memory.HeapAllocator;
 
 /**
  * This class is built on top of the SequenceFile. It stores
@@ -58,35 +61,32 @@ public abstract class SSTable
     static final Logger logger = LoggerFactory.getLogger(SSTable.class);
 
     public static final int TOMBSTONE_HISTOGRAM_BIN_SIZE = 100;
+    public static final int TOMBSTONE_HISTOGRAM_SPOOL_SIZE = 100000;
+    public static final int TOMBSTONE_HISTOGRAM_TTL_ROUND_SECONDS = Integer.valueOf(System.getProperty("cassandra.streaminghistogram.roundseconds", "60"));
 
     public final Descriptor descriptor;
     protected final Set<Component> components;
-    public final CFMetaData metadata;
-    public final IPartitioner partitioner;
     public final boolean compression;
 
     public DecoratedKey first;
     public DecoratedKey last;
 
-    protected SSTable(Descriptor descriptor, CFMetaData metadata, IPartitioner partitioner)
-    {
-        this(descriptor, new HashSet<Component>(), metadata, partitioner);
-    }
+    protected final DiskOptimizationStrategy optimizationStrategy;
+    protected final TableMetadataRef metadata;
 
-    protected SSTable(Descriptor descriptor, Set<Component> components, CFMetaData metadata, IPartitioner partitioner)
+    protected SSTable(Descriptor descriptor, Set<Component> components, TableMetadataRef metadata, DiskOptimizationStrategy optimizationStrategy)
     {
         // In almost all cases, metadata shouldn't be null, but allowing null allows to create a mostly functional SSTable without
         // full schema definition. SSTableLoader use that ability
         assert descriptor != null;
         assert components != null;
-        assert partitioner != null;
 
         this.descriptor = descriptor;
         Set<Component> dataComponents = new HashSet<>(components);
         this.compression = dataComponents.contains(Component.COMPRESSION_INFO);
         this.components = new CopyOnWriteArraySet<>(dataComponents);
         this.metadata = metadata;
-        this.partitioner = partitioner;
+        this.optimizationStrategy = Objects.requireNonNull(optimizationStrategy);
     }
 
     /**
@@ -112,10 +112,27 @@ public abstract class SSTable
 
             FileUtils.deleteWithConfirm(desc.filenameFor(component));
         }
-        FileUtils.delete(desc.filenameFor(Component.SUMMARY));
 
-        logger.debug("Deleted {}", desc);
+        if (components.contains(Component.SUMMARY))
+            FileUtils.delete(desc.filenameFor(Component.SUMMARY));
+
+        logger.trace("Deleted {}", desc);
         return true;
+    }
+
+    public TableMetadata metadata()
+    {
+        return metadata.get();
+    }
+
+    public IPartitioner getPartitioner()
+    {
+        return metadata().partitioner;
+    }
+
+    public DecoratedKey decorateKey(ByteBuffer key)
+    {
+        return getPartitioner().decorateKey(key);
     }
 
     /**
@@ -149,15 +166,49 @@ public abstract class SSTable
         return descriptor.ksname;
     }
 
+    public List<String> getAllFilePaths()
+    {
+        List<String> ret = new ArrayList<>();
+        for (Component component : components)
+            ret.add(descriptor.filenameFor(component));
+        return ret;
+    }
+
     /**
-     * @return Descriptor and Component pair. null if given file is not acceptable as SSTable component.
-     *         If component is of unknown type, returns CUSTOM component.
+     * Parse a sstable filename into both a {@link Descriptor} and {@code Component} object.
+     *
+     * @param file the filename to parse.
+     * @return a pair of the {@code Descriptor} and {@code Component} corresponding to {@code file} if it corresponds to
+     * a valid and supported sstable filename, {@code null} otherwise. Note that components of an unknown type will be
+     * returned as CUSTOM ones.
      */
-    public static Pair<Descriptor, Component> tryComponentFromFilename(File dir, String name)
+    public static Pair<Descriptor, Component> tryComponentFromFilename(File file)
     {
         try
         {
-            return Component.fromFilename(dir, name);
+            return Descriptor.fromFilenameWithComponent(file);
+        }
+        catch (Throwable e)
+        {
+            return null;
+        }
+    }
+
+    /**
+     * Parse a sstable filename into a {@link Descriptor} object.
+     * <p>
+     * Note that this method ignores the component part of the filename; if this is not what you want, use
+     * {@link #tryComponentFromFilename} instead.
+     *
+     * @param file the filename to parse.
+     * @return the {@code Descriptor} corresponding to {@code file} if it corresponds to a valid and supported sstable
+     * filename, {@code null} otherwise.
+     */
+    public static Descriptor tryDescriptorFromFilename(File file)
+    {
+        try
+        {
+            return Descriptor.fromFilename(file);
         }
         catch (Throwable e)
         {
@@ -194,7 +245,7 @@ public abstract class SSTable
         }
     }
 
-    private static Set<Component> discoverComponentsFor(Descriptor desc)
+    public static Set<Component> discoverComponentsFor(Descriptor desc)
     {
         Set<Component.Type> knownTypes = Sets.difference(Component.TYPES, Collections.singleton(Component.Type.CUSTOM));
         Set<Component> components = Sets.newHashSetWithExpectedSize(knownTypes.size());
@@ -216,7 +267,7 @@ public abstract class SSTable
         while (ifile.getFilePointer() < BYTES_CAP && keys < SAMPLES_CAP)
         {
             ByteBufferUtil.skipShortLength(ifile);
-            RowIndexEntry.Serializer.skip(ifile);
+            RowIndexEntry.Serializer.skip(ifile, descriptor.version);
             keys++;
         }
         assert keys > 0 && ifile.getFilePointer() > 0 && ifile.length() > 0 : "Unexpected empty index file: " + ifile;
@@ -269,20 +320,14 @@ public abstract class SSTable
     protected static void appendTOC(Descriptor descriptor, Collection<Component> components)
     {
         File tocFile = new File(descriptor.filenameFor(Component.TOC));
-        PrintWriter w = null;
-        try
+        try (PrintWriter w = new PrintWriter(new FileWriter(tocFile, true)))
         {
-            w = new PrintWriter(new FileWriter(tocFile, true));
             for (Component component : components)
                 w.println(component.name);
         }
         catch (IOException e)
         {
             throw new FSWriteError(e, tocFile);
-        }
-        finally
-        {
-            FileUtils.closeQuietly(w);
         }
     }
 

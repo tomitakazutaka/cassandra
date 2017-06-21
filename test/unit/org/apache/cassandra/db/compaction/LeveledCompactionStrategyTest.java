@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,38 +18,48 @@
 package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
+import java.util.Random;
 import java.util.UUID;
 
-import org.apache.cassandra.io.sstable.format.SSTableReader;
+import junit.framework.Assert;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.UpdateBuilder;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.notifications.SSTableAddedNotification;
+import org.apache.cassandra.notifications.SSTableRepairStatusChanged;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.repair.RepairJobDesc;
 import org.apache.cassandra.repair.Validator;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static java.util.Collections.singleton;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -57,6 +67,8 @@ import static org.junit.Assert.assertTrue;
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class LeveledCompactionStrategyTest
 {
+    private static final Logger logger = LoggerFactory.getLogger(LeveledCompactionStrategyTest.class);
+
     private static final String KEYSPACE1 = "LeveledCompactionStrategyTest";
     private static final String CF_STANDARDDLEVELED = "StandardLeveled";
     private Keyspace keyspace;
@@ -65,15 +77,15 @@ public class LeveledCompactionStrategyTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
-        Map<String, String> leveledOptions = new HashMap<>();
-        leveledOptions.put("sstable_size_in_mb", "1");
+        // Disable tombstone histogram rounding for tests
+        System.setProperty("cassandra.streaminghistogram.roundseconds", "1");
+
         SchemaLoader.prepareServer();
+
         SchemaLoader.createKeyspace(KEYSPACE1,
-                                    SimpleStrategy.class,
-                                    KSMetaData.optsWithRF(1),
+                                    KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARDDLEVELED)
-                                                .compactionStrategyClass(LeveledCompactionStrategy.class)
-                                                .compactionStrategyOptions(leveledOptions));
+                                                .compaction(CompactionParams.lcs(Collections.singletonMap("sstable_size_in_mb", "1"))));
         }
 
     @Before
@@ -100,30 +112,38 @@ public class LeveledCompactionStrategyTest
     public void testGrouperLevels() throws Exception{
         ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
 
+        //Need entropy to prevent compression so size is predictable with compression enabled/disabled
+        new Random().nextBytes(value.array());
+
         // Enough data to have a level 1 and 2
-        int rows = 20;
-        int columns = 10;
+        int rows = 40;
+        int columns = 20;
 
         // Adds enough data to trigger multiple sstable per level
         for (int r = 0; r < rows; r++)
         {
-            DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), String.valueOf(r));
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(CF_STANDARDDLEVELED, Util.cellname("column" + c), value, 0);
-            }
-            rm.apply();
+                update.newRow("column" + c).add("val", value);
+            update.applyUnsafe();
             cfs.forceBlockingFlush();
         }
 
         waitForLeveling(cfs);
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
+        CompactionStrategyManager strategyManager = cfs.getCompactionStrategyManager();
         // Checking we're not completely bad at math
-        assert strategy.getLevelSize(1) > 0;
-        assert strategy.getLevelSize(2) > 0;
 
-        Collection<Collection<SSTableReader>> groupedSSTables = cfs.getCompactionStrategy().groupSSTablesForAntiCompaction(cfs.getSSTables());
+        int l1Count = strategyManager.getSSTableCountPerLevel()[1];
+        int l2Count = strategyManager.getSSTableCountPerLevel()[2];
+        if (l1Count == 0 || l2Count == 0)
+        {
+            logger.error("L1 or L2 has 0 sstables. Expected > 0 on both.");
+            logger.error("L1: " + l1Count);
+            logger.error("L2: " + l2Count);
+            Assert.fail();
+        }
+
+        Collection<Collection<SSTableReader>> groupedSSTables = cfs.getCompactionStrategyManager().groupSSTablesForAntiCompaction(cfs.getLiveSSTables());
         for (Collection<SSTableReader> sstableGroup : groupedSSTables)
         {
             int groupLevel = -1;
@@ -147,152 +167,172 @@ public class LeveledCompactionStrategyTest
     @Test
     public void testValidationMultipleSSTablePerLevel() throws Exception
     {
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+        byte [] b = new byte[100 * 1024];
+        new Random().nextBytes(b);
+        ByteBuffer value = ByteBuffer.wrap(b); // 100 KB value, make it easy to have multiple files
 
         // Enough data to have a level 1 and 2
-        int rows = 20;
-        int columns = 10;
+        int rows = 40;
+        int columns = 20;
 
         // Adds enough data to trigger multiple sstable per level
         for (int r = 0; r < rows; r++)
         {
-            DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), String.valueOf(r));
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(CF_STANDARDDLEVELED, Util.cellname("column" + c), value, 0);
-            }
-            rm.applyUnsafe();
+                update.newRow("column" + c).add("val", value);
+            update.applyUnsafe();
             cfs.forceBlockingFlush();
         }
 
         waitForLeveling(cfs);
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
+        CompactionStrategyManager strategyManager = cfs.getCompactionStrategyManager();
         // Checking we're not completely bad at math
-        assert strategy.getLevelSize(1) > 0;
-        assert strategy.getLevelSize(2) > 0;
+        assertTrue(strategyManager.getSSTableCountPerLevel()[1] > 0);
+        assertTrue(strategyManager.getSSTableCountPerLevel()[2] > 0);
 
         Range<Token> range = new Range<>(Util.token(""), Util.token(""));
-        int gcBefore = keyspace.getColumnFamilyStore(CF_STANDARDDLEVELED).gcBefore(System.currentTimeMillis());
+        int gcBefore = keyspace.getColumnFamilyStore(CF_STANDARDDLEVELED).gcBefore(FBUtilities.nowInSeconds());
         UUID parentRepSession = UUID.randomUUID();
-        ActiveRepairService.instance.registerParentRepairSession(parentRepSession, Arrays.asList(cfs), Arrays.asList(range));
-        RepairJobDesc desc = new RepairJobDesc(parentRepSession, UUID.randomUUID(), KEYSPACE1, CF_STANDARDDLEVELED, range);
-        Validator validator = new Validator(desc, FBUtilities.getBroadcastAddress(), gcBefore);
+        ActiveRepairService.instance.registerParentRepairSession(parentRepSession,
+                                                                 FBUtilities.getBroadcastAddress(),
+                                                                 Arrays.asList(cfs),
+                                                                 Arrays.asList(range),
+                                                                 false,
+                                                                 ActiveRepairService.UNREPAIRED_SSTABLE,
+                                                                 true,
+                                                                 PreviewKind.NONE);
+        RepairJobDesc desc = new RepairJobDesc(parentRepSession, UUID.randomUUID(), KEYSPACE1, CF_STANDARDDLEVELED, Arrays.asList(range));
+        Validator validator = new Validator(desc, FBUtilities.getBroadcastAddress(), gcBefore, PreviewKind.NONE);
         CompactionManager.instance.submitValidation(cfs, validator).get();
     }
 
     /**
      * wait for leveled compaction to quiesce on the given columnfamily
      */
-    private void waitForLeveling(ColumnFamilyStore cfs) throws InterruptedException
+    public static void waitForLeveling(ColumnFamilyStore cfs) throws InterruptedException
     {
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
-        // L0 is the lowest priority, so when that's done, we know everything is done
-        while (strategy.getLevelSize(0) > 1)
+        CompactionStrategyManager strategyManager = cfs.getCompactionStrategyManager();
+        while (true)
+        {
+            // since we run several compaction strategies we wait until L0 in all strategies is empty and
+            // atleast one L1+ is non-empty. In these tests we always run a single data directory with only unrepaired data
+            // so it should be good enough
+            boolean allL0Empty = true;
+            boolean anyL1NonEmpty = false;
+            for (List<AbstractCompactionStrategy> strategies : strategyManager.getStrategies())
+            {
+                for (AbstractCompactionStrategy strategy : strategies)
+                {
+                    if (!(strategy instanceof LeveledCompactionStrategy))
+                        return;
+                    // note that we check > 1 here, if there is too little data in L0, we don't compact it up to L1
+                    if (((LeveledCompactionStrategy)strategy).getLevelSize(0) > 1)
+                        allL0Empty = false;
+                    for (int i = 1; i < 5; i++)
+                        if (((LeveledCompactionStrategy)strategy).getLevelSize(i) > 0)
+                            anyL1NonEmpty = true;
+                }
+            }
+            if (allL0Empty && anyL1NonEmpty)
+                return;
             Thread.sleep(100);
+        }
     }
 
     @Test
     public void testCompactionProgress() throws Exception
     {
         // make sure we have SSTables in L1
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]);
+        byte [] b = new byte[100 * 1024];
+        new Random().nextBytes(b);
+        ByteBuffer value = ByteBuffer.wrap(b);
         int rows = 2;
         int columns = 10;
         for (int r = 0; r < rows; r++)
         {
-            DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), String.valueOf(r));
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(CF_STANDARDDLEVELED, Util.cellname("column" + c), value, 0);
-            }
-            rm.applyUnsafe();
+                update.newRow("column" + c).add("val", value);
+            update.applyUnsafe();
             cfs.forceBlockingFlush();
         }
 
         waitForLeveling(cfs);
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
+        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategyManager().getStrategies().get(1).get(0);
         assert strategy.getLevelSize(1) > 0;
 
         // get LeveledScanner for level 1 sstables
         Collection<SSTableReader> sstables = strategy.manifest.getLevel(1);
-        List<ICompactionScanner> scanners = strategy.getScanners(sstables).scanners;
+        List<ISSTableScanner> scanners = strategy.getScanners(sstables).scanners;
         assertEquals(1, scanners.size()); // should be one per level
-        ICompactionScanner scanner = scanners.get(0);
+        ISSTableScanner scanner = scanners.get(0);
         // scan through to the end
         while (scanner.hasNext())
             scanner.next();
 
         // scanner.getCurrentPosition should be equal to total bytes of L1 sstables
-        assert scanner.getCurrentPosition() == SSTableReader.getTotalBytes(sstables);
+        assertEquals(scanner.getCurrentPosition(), SSTableReader.getTotalUncompressedBytes(sstables));
     }
 
     @Test
     public void testMutateLevel() throws Exception
     {
+        cfs.disableAutoCompaction();
         ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
 
         // Enough data to have a level 1 and 2
-        int rows = 20;
-        int columns = 10;
+        int rows = 40;
+        int columns = 20;
 
         // Adds enough data to trigger multiple sstable per level
         for (int r = 0; r < rows; r++)
         {
-            DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), String.valueOf(r));
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(CF_STANDARDDLEVELED, Util.cellname("column" + c), value, 0);
-            }
-            rm.applyUnsafe();
+                update.newRow("column" + c).add("val", value);
+            update.applyUnsafe();
             cfs.forceBlockingFlush();
         }
-        waitForLeveling(cfs);
         cfs.forceBlockingFlush();
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
-        cfs.disableAutoCompaction();
+        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategyManager().getStrategies().get(1).get(0);
+        cfs.forceMajorCompaction();
 
-        while(CompactionManager.instance.isCompacting(Arrays.asList(cfs)))
-            Thread.sleep(100);
-
-        for (SSTableReader s : cfs.getSSTables())
+        for (SSTableReader s : cfs.getLiveSSTables())
         {
-            assertTrue(s.getSSTableLevel() != 6);
+            assertTrue(s.getSSTableLevel() != 6 && s.getSSTableLevel() > 0);
             strategy.manifest.remove(s);
             s.descriptor.getMetadataSerializer().mutateLevel(s.descriptor, 6);
             s.reloadSSTableMetadata();
             strategy.manifest.add(s);
         }
         // verify that all sstables in the changed set is level 6
-        for (SSTableReader s : cfs.getSSTables())
+        for (SSTableReader s : cfs.getLiveSSTables())
             assertEquals(6, s.getSSTableLevel());
 
         int[] levels = strategy.manifest.getAllLevelSize();
         // verify that the manifest has correct amount of sstables
-        assertEquals(cfs.getSSTables().size(), levels[6]);
+        assertEquals(cfs.getLiveSSTables().size(), levels[6]);
     }
 
     @Test
     public void testNewRepairedSSTable() throws Exception
     {
-        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+        byte [] b = new byte[100 * 1024];
+        new Random().nextBytes(b);
+        ByteBuffer value = ByteBuffer.wrap(b); // 100 KB value, make it easy to have multiple files
 
         // Enough data to have a level 1 and 2
-        int rows = 20;
-        int columns = 10;
+        int rows = 40;
+        int columns = 20;
 
         // Adds enough data to trigger multiple sstable per level
         for (int r = 0; r < rows; r++)
         {
-            DecoratedKey key = Util.dk(String.valueOf(r));
-            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), String.valueOf(r));
             for (int c = 0; c < columns; c++)
-            {
-                rm.add(CF_STANDARDDLEVELED, Util.cellname("column" + c), value, 0);
-            }
-            rm.applyUnsafe();
+                update.newRow("column" + c).add("val", value);
+            update.applyUnsafe();
             cfs.forceBlockingFlush();
         }
         waitForLeveling(cfs);
@@ -301,61 +341,118 @@ public class LeveledCompactionStrategyTest
         while(CompactionManager.instance.isCompacting(Arrays.asList(cfs)))
             Thread.sleep(100);
 
-        LeveledCompactionStrategy strategy = (LeveledCompactionStrategy) cfs.getCompactionStrategy();
-        assertTrue(strategy.getLevelSize(1) > 0);
-        assertTrue(strategy.getLevelSize(2) > 0);
+        CompactionStrategyManager manager = cfs.getCompactionStrategyManager();
+        List<List<AbstractCompactionStrategy>> strategies = manager.getStrategies();
+        LeveledCompactionStrategy repaired = (LeveledCompactionStrategy) strategies.get(0).get(0);
+        LeveledCompactionStrategy unrepaired = (LeveledCompactionStrategy) strategies.get(1).get(0);
+        assertEquals(0, repaired.manifest.getLevelCount() );
+        assertEquals(2, unrepaired.manifest.getLevelCount());
+        assertTrue(manager.getSSTableCountPerLevel()[1] > 0);
+        assertTrue(manager.getSSTableCountPerLevel()[2] > 0);
 
-        for (SSTableReader sstable : cfs.getSSTables())
-        {
+        for (SSTableReader sstable : cfs.getLiveSSTables())
             assertFalse(sstable.isRepaired());
-        }
+
         int sstableCount = 0;
-        for (List<SSTableReader> level : strategy.manifest.generations)
+        for (List<SSTableReader> level : unrepaired.manifest.generations)
             sstableCount += level.size();
+        // we only have unrepaired sstables:
+        assertEquals(sstableCount, cfs.getLiveSSTables().size());
 
-        assertEquals(sstableCount, cfs.getSSTables().size());
+        SSTableReader sstable1 = unrepaired.manifest.generations[2].get(0);
+        SSTableReader sstable2 = unrepaired.manifest.generations[1].get(0);
 
-        assertFalse(strategy.manifest.hasRepairedData());
-        assertTrue(strategy.manifest.unrepairedL0.size() == 0);
-
-        SSTableReader sstable1 = strategy.manifest.generations[2].get(0);
-        SSTableReader sstable2 = strategy.manifest.generations[1].get(0);
-
-        // "repair" an sstable:
-        strategy.manifest.remove(sstable1);
-        sstable1.descriptor.getMetadataSerializer().mutateRepairedAt(sstable1.descriptor, System.currentTimeMillis());
+        sstable1.descriptor.getMetadataSerializer().mutateRepaired(sstable1.descriptor, System.currentTimeMillis(), null);
         sstable1.reloadSSTableMetadata();
         assertTrue(sstable1.isRepaired());
 
-        // make sure adding a repaired sstable makes the manifest contain only repaired data;
-        strategy.manifest.add(sstable1);
-        assertTrue(strategy.manifest.hasRepairedData());
-        assertTrue(strategy.manifest.generations[2].contains(sstable1));
-        assertFalse(strategy.manifest.generations[1].contains(sstable2));
-        assertTrue(strategy.manifest.unrepairedL0.contains(sstable2));
-        sstableCount = 0;
-        for (int i = 0; i < strategy.manifest.generations.length; i++)
-        {
-            sstableCount += strategy.manifest.generations[i].size();
-            if (i != 2)
-                assertEquals(strategy.manifest.generations[i].size(), 0);
-            else
-                assertEquals(strategy.manifest.generations[i].size(), 1);
+        manager.handleNotification(new SSTableRepairStatusChanged(Arrays.asList(sstable1)), this);
+
+        int repairedSSTableCount = 0;
+        for (List<SSTableReader> level : repaired.manifest.generations)
+            repairedSSTableCount += level.size();
+        assertEquals(1, repairedSSTableCount);
+        // make sure the repaired sstable ends up in the same level in the repaired manifest:
+        assertTrue(repaired.manifest.generations[2].contains(sstable1));
+        // and that it is gone from unrepaired
+        assertFalse(unrepaired.manifest.generations[2].contains(sstable1));
+
+        unrepaired.removeSSTable(sstable2);
+        manager.handleNotification(new SSTableAddedNotification(singleton(sstable2)), this);
+        assertTrue(unrepaired.manifest.getLevel(1).contains(sstable2));
+        assertFalse(repaired.manifest.getLevel(1).contains(sstable2));
+    }
+
+
+
+    @Test
+    public void testTokenRangeCompaction() throws Exception
+    {
+        // Remove any existing data so we can start out clean with predictable number of sstables
+        cfs.truncateBlocking();
+
+        // Disable auto compaction so cassandra does not compact
+        CompactionManager.instance.disableAutoCompaction();
+
+        ByteBuffer value = ByteBuffer.wrap(new byte[100 * 1024]); // 100 KB value, make it easy to have multiple files
+
+        DecoratedKey key1 = Util.dk(String.valueOf(1));
+        DecoratedKey key2 = Util.dk(String.valueOf(2));
+        List<DecoratedKey> keys = new ArrayList<>(Arrays.asList(key1, key2));
+        int numIterations = 10;
+        int columns = 2;
+
+        // Add enough data to trigger multiple sstables.
+
+        // create 10 sstables that contain data for both key1 and key2
+        for (int i = 0; i < numIterations; i++) {
+            for (DecoratedKey key : keys) {
+                UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), key);
+                for (int c = 0; c < columns; c++)
+                    update.newRow("column" + c).add("val", value);
+                update.applyUnsafe();
+            }
+            cfs.forceBlockingFlush();
         }
-        assertEquals(1, sstableCount);
 
-        // make sure adding an unrepaired sstable puts it in unrepairedL0:
-        strategy.manifest.remove(sstable2);
-        strategy.manifest.add(sstable2);
-        assertTrue(strategy.manifest.unrepairedL0.contains(sstable2));
-        assertEquals(strategy.manifest.unrepairedL0.size(), cfs.getSSTables().size() - 1);
+        // create 20 more sstables with 10 containing data for key1 and other 10 containing data for key2
+        for (int i = 0; i < numIterations; i++) {
+            for (DecoratedKey key : keys) {
+                UpdateBuilder update = UpdateBuilder.create(cfs.metadata(), key);
+                for (int c = 0; c < columns; c++)
+                    update.newRow("column" + c).add("val", value);
+                update.applyUnsafe();
+                cfs.forceBlockingFlush();
+            }
+        }
 
-        // make sure repairing an sstable takes it away from unrepairedL0 and puts it in the correct level:
-        strategy.manifest.remove(sstable2);
-        sstable2.descriptor.getMetadataSerializer().mutateRepairedAt(sstable2.descriptor, System.currentTimeMillis());
-        sstable2.reloadSSTableMetadata();
-        strategy.manifest.add(sstable2);
-        assertFalse(strategy.manifest.unrepairedL0.contains(sstable2));
-        assertTrue(strategy.manifest.generations[1].contains(sstable2));
+        // We should have a total of 30 sstables by now
+        assertEquals(30, cfs.getLiveSSTables().size());
+
+        // Compact just the tables with key2
+        // Bit hackish to use the key1.token as the prior key but works in BytesToken
+        Range<Token> tokenRange = new Range<>(key2.getToken(), key2.getToken());
+        Collection<Range<Token>> tokenRanges = new ArrayList<>(Arrays.asList(tokenRange));
+        cfs.forceCompactionForTokenRange(tokenRanges);
+
+        while(CompactionManager.instance.isCompacting(Arrays.asList(cfs))) {
+            Thread.sleep(100);
+        }
+
+        // 20 tables that have key2 should have been compacted in to 1 table resulting in 11 (30-20+1)
+        assertEquals(11, cfs.getLiveSSTables().size());
+
+        // Compact just the tables with key1. At this point all 11 tables should have key1
+        Range<Token> tokenRange2 = new Range<>(key1.getToken(), key1.getToken());
+        Collection<Range<Token>> tokenRanges2 = new ArrayList<>(Arrays.asList(tokenRange2));
+        cfs.forceCompactionForTokenRange(tokenRanges2);
+
+
+        while(CompactionManager.instance.isCompacting(Arrays.asList(cfs))) {
+            Thread.sleep(100);
+        }
+
+        // the 11 tables containing key1 should all compact to 1 table
+        assertEquals(1, cfs.getLiveSSTables().size());
     }
 }

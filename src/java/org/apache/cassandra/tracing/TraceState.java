@@ -19,40 +19,51 @@ package org.apache.cassandra.tracing;
 
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.base.Stopwatch;
 import org.slf4j.helpers.MessageFormatter;
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.ArrayBackedSortedColumns;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
-import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.utils.progress.ProgressEvent;
+import org.apache.cassandra.utils.progress.ProgressEventNotifier;
+import org.apache.cassandra.utils.progress.ProgressListener;
 
 /**
  * ThreadLocal state for a tracing session. The presence of an instance of this class as a ThreadLocal denotes that an
  * operation is being traced.
  */
-public class TraceState
+public abstract class TraceState implements ProgressEventNotifier
 {
     public final UUID sessionId;
     public final InetAddress coordinator;
     public final Stopwatch watch;
     public final ByteBuffer sessionIdBytes;
+    public final Tracing.TraceType traceType;
+    public final int ttl;
+
+    private boolean notify;
+    private final List<ProgressListener> listeners = new CopyOnWriteArrayList<>();
+    private String tag;
+
+    public enum Status
+    {
+        IDLE,
+        ACTIVE,
+        STOPPED
+    }
+
+    private volatile Status status;
 
     // Multiple requests can use the same TraceState at a time, so we need to reference count.
     // See CASSANDRA-7626 for more details.
     private final AtomicInteger references = new AtomicInteger(1);
 
-    public TraceState(InetAddress coordinator, UUID sessionId)
+    protected TraceState(InetAddress coordinator, UUID sessionId, Tracing.TraceType traceType)
     {
         assert coordinator != null;
         assert sessionId != null;
@@ -60,13 +71,84 @@ public class TraceState
         this.coordinator = coordinator;
         this.sessionId = sessionId;
         sessionIdBytes = ByteBufferUtil.bytes(sessionId);
+        this.traceType = traceType;
+        this.ttl = traceType.getTTL();
         watch = Stopwatch.createStarted();
+        this.status = Status.IDLE;
+    }
+
+    /**
+     * Activate notification with provided {@code tag} name.
+     *
+     * @param tag Tag name to add when emitting notification
+     */
+    public void enableActivityNotification(String tag)
+    {
+        assert traceType == Tracing.TraceType.REPAIR;
+        notify = true;
+        this.tag = tag;
+    }
+
+    @Override
+    public void addProgressListener(ProgressListener listener)
+    {
+        assert traceType == Tracing.TraceType.REPAIR;
+        listeners.add(listener);
+    }
+
+    @Override
+    public void removeProgressListener(ProgressListener listener)
+    {
+        assert traceType == Tracing.TraceType.REPAIR;
+        listeners.remove(listener);
     }
 
     public int elapsed()
     {
         long elapsed = watch.elapsed(TimeUnit.MICROSECONDS);
         return elapsed < Integer.MAX_VALUE ? (int) elapsed : Integer.MAX_VALUE;
+    }
+
+    public synchronized void stop()
+    {
+        waitForPendingEvents();
+
+        status = Status.STOPPED;
+        notifyAll();
+    }
+
+    /*
+     * Returns immediately if there has been trace activity since the last
+     * call, otherwise waits until there is trace activity, or until the
+     * timeout expires.
+     * @param timeout timeout in milliseconds
+     * @return activity status
+     */
+    public synchronized Status waitActivity(long timeout)
+    {
+        if (status == Status.IDLE)
+        {
+            try
+            {
+                wait(timeout);
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException();
+            }
+        }
+        if (status == Status.ACTIVE)
+        {
+            status = Status.IDLE;
+            return Status.ACTIVE;
+        }
+        return status;
+    }
+
+    protected synchronized void notifyActivity()
+    {
+        status = Status.ACTIVE;
+        notifyAll();
     }
 
     public void trace(String format, Object arg)
@@ -86,28 +168,22 @@ public class TraceState
 
     public void trace(String message)
     {
-        TraceState.trace(sessionIdBytes, message, elapsed());
+        if (notify)
+            notifyActivity();
+
+        traceImpl(message);
+
+        for (ProgressListener listener : listeners)
+        {
+            listener.progress(tag, ProgressEvent.createNotification(message));
+        }
     }
 
-    public static void trace(final ByteBuffer sessionIdBytes, final String message, final int elapsed)
-    {
-        final ByteBuffer eventId = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
-        final String threadName = Thread.currentThread().getName();
+    protected abstract void traceImpl(String message);
 
-        StageManager.getStage(Stage.TRACING).execute(new WrappedRunnable()
-        {
-            public void runMayThrow()
-            {
-                CFMetaData cfMeta = CFMetaData.TraceEventsCf;
-                ColumnFamily cf = ArrayBackedSortedColumns.factory.create(cfMeta);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("activity")), message);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("source")), FBUtilities.getBroadcastAddress());
-                if (elapsed >= 0)
-                    Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("source_elapsed")), elapsed);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("thread")), threadName);
-                Tracing.mutateWithCatch(new Mutation(Tracing.TRACE_KS, sessionIdBytes, cf));
-            }
-        });
+    protected void waitForPendingEvents()
+    {
+        // if tracing events are asynchronous, then you can use this method to wait for them to complete
     }
 
     public boolean acquireReference()
@@ -124,6 +200,7 @@ public class TraceState
 
     public int releaseReference()
     {
+        waitForPendingEvents();
         return references.decrementAndGet();
     }
 }

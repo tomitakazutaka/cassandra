@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.cql3.statements;
 
+import org.apache.cassandra.schema.ColumnMetadata;
+
 public enum Bound
 {
     START(0), END(1);
@@ -28,8 +30,29 @@ public enum Bound
         this.idx = idx;
     }
 
-    public static Bound reverse(Bound b)
+    /**
+     * Reverses the bound if the column type is a reversed one.
+     *
+     * @param columnMetadata the column definition
+     * @return the bound reversed if the column type was a reversed one or the original bound
+     */
+    public Bound reverseIfNeeded(ColumnMetadata columnMetadata)
     {
-        return b == START ? END : START;
+        return columnMetadata.isReversedType() ? reverse() : this;
+    }
+
+    public Bound reverse()
+    {
+        return isStart() ? END : START;
+    }
+
+    public boolean isStart()
+    {
+        return this == START;
+    }
+
+    public boolean isEnd()
+    {
+        return this == END;
     }
 }

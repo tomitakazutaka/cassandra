@@ -22,10 +22,15 @@ import java.util.concurrent.*;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.streaming.messages.OutgoingFileMessage;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
  * StreamTransferTask sends sections of SSTable files in certain ColumnFamily.
@@ -37,20 +42,22 @@ public class StreamTransferTask extends StreamTask
     private final AtomicInteger sequenceNumber = new AtomicInteger(0);
     private boolean aborted = false;
 
-    private final Map<Integer, OutgoingFileMessage> files = new HashMap<>();
+    @VisibleForTesting
+    protected final Map<Integer, OutgoingFileMessage> files = new HashMap<>();
     private final Map<Integer, ScheduledFuture> timeoutTasks = new HashMap<>();
 
     private long totalSize;
 
-    public StreamTransferTask(StreamSession session, UUID cfId)
+    public StreamTransferTask(StreamSession session, TableId tableId)
     {
-        super(session, cfId);
+        super(session, tableId);
     }
 
-    public synchronized void addTransferFile(SSTableReader sstable, long estimatedKeys, List<Pair<Long, Long>> sections, long repairedAt)
+    public synchronized void addTransferFile(Ref<SSTableReader> ref, long estimatedKeys, List<Pair<Long, Long>> sections)
     {
-        assert sstable != null && cfId.equals(sstable.metadata.cfId);
-        OutgoingFileMessage message = new OutgoingFileMessage(sstable, sequenceNumber.getAndIncrement(), estimatedKeys, sections, repairedAt, session.keepSSTableLevel());
+        assert ref.get() != null && tableId.equals(ref.get().metadata().id);
+        OutgoingFileMessage message = new OutgoingFileMessage(ref, sequenceNumber.getAndIncrement(), estimatedKeys, sections, session.keepSSTableLevel());
+        message = StreamHook.instance.reportOutgoingFile(session, ref.get(), message);
         files.put(message.header.sequenceNumber, message);
         totalSize += message.header.size();
     }
@@ -71,7 +78,7 @@ public class StreamTransferTask extends StreamTask
 
             OutgoingFileMessage file = files.remove(sequenceNumber);
             if (file != null)
-                file.sstable.releaseReference();
+                file.complete();
 
             signalComplete = files.isEmpty();
         }
@@ -91,8 +98,22 @@ public class StreamTransferTask extends StreamTask
             future.cancel(false);
         timeoutTasks.clear();
 
+        Throwable fail = null;
         for (OutgoingFileMessage file : files.values())
-            file.sstable.releaseReference();
+        {
+            try
+            {
+                file.complete();
+            }
+            catch (Throwable t)
+            {
+                if (fail == null) fail = t;
+                else fail.addSuppressed(t);
+            }
+        }
+        files.clear();
+        if (fail != null)
+            Throwables.propagate(fail);
     }
 
     public synchronized int getTotalNumberOfFiles()
@@ -108,7 +129,7 @@ public class StreamTransferTask extends StreamTask
     public synchronized Collection<OutgoingFileMessage> getFileMessages()
     {
         // We may race between queuing all those messages and the completion of the completion of
-        // the first ones. So copy tthe values to avoid a ConcurrentModificationException
+        // the first ones. So copy the values to avoid a ConcurrentModificationException
         return new ArrayList<>(files.values());
     }
 

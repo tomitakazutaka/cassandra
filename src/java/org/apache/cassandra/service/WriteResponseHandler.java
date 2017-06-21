@@ -34,7 +34,7 @@ import org.apache.cassandra.db.WriteType;
 /**
  * Handles blocking writes for ONE, ANY, TWO, THREE, QUORUM, and ALL consistency levels.
  */
-public class WriteResponseHandler extends AbstractWriteResponseHandler
+public class WriteResponseHandler<T> extends AbstractWriteResponseHandler<T>
 {
     protected static final Logger logger = LoggerFactory.getLogger(WriteResponseHandler.class);
 
@@ -47,26 +47,31 @@ public class WriteResponseHandler extends AbstractWriteResponseHandler
                                 ConsistencyLevel consistencyLevel,
                                 Keyspace keyspace,
                                 Runnable callback,
-                                WriteType writeType)
+                                WriteType writeType,
+                                long queryStartNanoTime)
     {
-        super(keyspace, writeEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
+        super(keyspace, writeEndpoints, pendingEndpoints, consistencyLevel, callback, writeType, queryStartNanoTime);
         responses = totalBlockFor();
     }
 
-    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, Runnable callback)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, Runnable callback, long queryStartNanoTime)
     {
-        this(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ONE, null, callback, writeType);
+        this(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ONE, null, callback, writeType, queryStartNanoTime);
     }
 
-    public WriteResponseHandler(InetAddress endpoint, WriteType writeType)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, long queryStartNanoTime)
     {
-        this(endpoint, writeType, null);
+        this(endpoint, writeType, null, queryStartNanoTime);
     }
 
-    public void response(MessageIn m)
+    public void response(MessageIn<T> m)
     {
         if (responsesUpdater.decrementAndGet(this) == 0)
             signal();
+        //Must be last after all subclass processing
+        //The two current subclasses both assume logResponseToIdealCLDelegate is called
+        //here.
+        logResponseToIdealCLDelegate(m);
     }
 
     protected int ackCount()

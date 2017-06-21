@@ -21,18 +21,22 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Determines a single output value based on a single input value.
  */
 public interface ScalarFunction extends Function
 {
+    public boolean isCalledOnNullInput();
+
     /**
      * Applies this function to the specified parameter.
      *
+     * @param protocolVersion protocol version used for parameters and return value
      * @param parameters the input parameters
      * @return the result of applying this function to the parameter
      * @throws InvalidRequestException if this function cannot not be applied to the parameter
      */
-    public ByteBuffer execute(List<ByteBuffer> parameters) throws InvalidRequestException;
+    public ByteBuffer execute(ProtocolVersion protocolVersion, List<ByteBuffer> parameters) throws InvalidRequestException;
 }

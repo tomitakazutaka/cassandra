@@ -30,6 +30,7 @@ import com.google.common.collect.ImmutableList;
 
 import org.apache.cassandra.stress.generate.DistributionFactory;
 import org.apache.cassandra.stress.generate.PartitionGenerator;
+import org.apache.cassandra.stress.util.ResultLogger;
 
 public class SettingsPopulation implements Serializable
 {
@@ -107,12 +108,12 @@ public class SettingsPopulation implements Serializable
     private static final class SequentialOptions extends GenerateOptions
     {
         final OptionSimple populate;
-        final OptionDistribution lookback = new OptionDistribution("read-lookback=", "fixed(1)", "Select read seeds from the recently visited write seeds");
+        final OptionDistribution lookback = new OptionDistribution("read-lookback=", null, "Select read seeds from the recently visited write seeds", false);
         final OptionSimple nowrap = new OptionSimple("no-wrap", "", null, "Terminate the stress test once all seeds in the range have been visited", false);
 
         public SequentialOptions(String defaultLimit)
         {
-            populate = new OptionSimple("seq=", "[0-9]+\\.\\.+[0-9]+[MBK]?",
+            populate = new OptionSimple("seq=", "[0-9]+[MBK]?\\.\\.+[0-9]+[MBK]?",
                     "1.." + defaultLimit,
                     "Generate all seeds in sequence", true);
         }
@@ -126,6 +127,26 @@ public class SettingsPopulation implements Serializable
 
     // CLI Utility Methods
 
+    public void printSettings(ResultLogger out)
+    {
+        if (distribution != null)
+        {
+            out.println("  Distribution: " +distribution.getConfigAsString());
+        }
+
+        if (sequence != null)
+        {
+            out.printf("  Sequence: %d..%d%n", sequence[0], sequence[1]);
+        }
+        if (readlookback != null)
+        {
+            out.println("  Read Look Back: " + readlookback.getConfigAsString());
+        }
+
+        out.printf("  Order: %s%n", order);
+        out.printf("  Wrap: %b%n", wrap);
+    }
+
     public static SettingsPopulation get(Map<String, String[]> clArgs, SettingsCommand command)
     {
         // set default size to number of commands requested, unless set to err convergence, then use 1M
@@ -134,6 +155,11 @@ public class SettingsPopulation implements Serializable
         String[] params = clArgs.remove("-pop");
         if (params == null)
         {
+            if (command instanceof SettingsCommandUser && ((SettingsCommandUser)command).hasInsertOnly())
+            {
+                return new SettingsPopulation(new SequentialOptions(defaultLimit));
+            }
+
             // return defaults:
             switch(command.type)
             {

@@ -22,8 +22,9 @@ import java.util.*;
 
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.UUIDGen;
+
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
 
 /**
  * {@link StreamPlan} is a helper class that builds StreamOperation of given configuration.
@@ -32,10 +33,10 @@ import org.apache.cassandra.utils.UUIDGen;
  */
 public class StreamPlan
 {
+    public static final String[] EMPTY_COLUMN_FAMILIES = new String[0];
     private final UUID planId = UUIDGen.getTimeUUID();
-    private final String description;
+    private final StreamOperation streamOperation;
     private final List<StreamEventHandler> handlers = new ArrayList<>();
-    private final long repairedAt;
     private final StreamCoordinator coordinator;
 
     private boolean flushBeforeTransfer = true;
@@ -43,23 +44,24 @@ public class StreamPlan
     /**
      * Start building stream plan.
      *
-     * @param description Stream type that describes this StreamPlan
+     * @param streamOperation Stream streamOperation that describes this StreamPlan
      */
-    public StreamPlan(String description)
+    public StreamPlan(StreamOperation streamOperation)
     {
-        this(description, ActiveRepairService.UNREPAIRED_SSTABLE, 1, false);
+        this(streamOperation, 1, false, false, NO_PENDING_REPAIR, PreviewKind.NONE);
     }
 
-    public StreamPlan(String description, boolean keepSSTableLevels)
+    public StreamPlan(StreamOperation streamOperation, boolean keepSSTableLevels, boolean connectSequentially)
     {
-        this(description, ActiveRepairService.UNREPAIRED_SSTABLE, 1, keepSSTableLevels);
+        this(streamOperation, 1, keepSSTableLevels, connectSequentially, NO_PENDING_REPAIR, PreviewKind.NONE);
     }
 
-    public StreamPlan(String description, long repairedAt, int connectionsPerHost, boolean keepSSTableLevels)
+    public StreamPlan(StreamOperation streamOperation, int connectionsPerHost, boolean keepSSTableLevels,
+                      boolean connectSequentially, UUID pendingRepair, PreviewKind previewKind)
     {
-        this.description = description;
-        this.repairedAt = repairedAt;
-        this.coordinator = new StreamCoordinator(connectionsPerHost, keepSSTableLevels, new DefaultConnectionFactory());
+        this.streamOperation = streamOperation;
+        this.coordinator = new StreamCoordinator(connectionsPerHost, keepSSTableLevels, new DefaultConnectionFactory(),
+                                                 connectSequentially, pendingRepair, previewKind);
     }
 
     /**
@@ -73,7 +75,7 @@ public class StreamPlan
      */
     public StreamPlan requestRanges(InetAddress from, InetAddress connecting, String keyspace, Collection<Range<Token>> ranges)
     {
-        return requestRanges(from, connecting, keyspace, ranges, new String[0]);
+        return requestRanges(from, connecting, keyspace, ranges, EMPTY_COLUMN_FAMILIES);
     }
 
     /**
@@ -89,7 +91,7 @@ public class StreamPlan
     public StreamPlan requestRanges(InetAddress from, InetAddress connecting, String keyspace, Collection<Range<Token>> ranges, String... columnFamilies)
     {
         StreamSession session = coordinator.getOrCreateNextSession(from, connecting);
-        session.addStreamRequest(keyspace, ranges, Arrays.asList(columnFamilies), repairedAt);
+        session.addStreamRequest(keyspace, ranges, Arrays.asList(columnFamilies));
         return this;
     }
 
@@ -114,7 +116,7 @@ public class StreamPlan
      */
     public StreamPlan transferRanges(InetAddress to, InetAddress connecting, String keyspace, Collection<Range<Token>> ranges)
     {
-        return transferRanges(to, connecting, keyspace, ranges, new String[0]);
+        return transferRanges(to, connecting, keyspace, ranges, EMPTY_COLUMN_FAMILIES);
     }
 
     /**
@@ -130,7 +132,7 @@ public class StreamPlan
     public StreamPlan transferRanges(InetAddress to, InetAddress connecting, String keyspace, Collection<Range<Token>> ranges, String... columnFamilies)
     {
         StreamSession session = coordinator.getOrCreateNextSession(to, connecting);
-        session.addTransferRanges(keyspace, ranges, Arrays.asList(columnFamilies), flushBeforeTransfer, repairedAt);
+        session.addTransferRanges(keyspace, ranges, Arrays.asList(columnFamilies), flushBeforeTransfer);
         return this;
     }
 
@@ -184,7 +186,7 @@ public class StreamPlan
      */
     public StreamResultFuture execute()
     {
-        return StreamResultFuture.init(planId, description, handlers, coordinator);
+        return StreamResultFuture.init(planId, streamOperation, handlers, coordinator);
     }
 
     /**
@@ -198,5 +200,15 @@ public class StreamPlan
     {
         this.flushBeforeTransfer = flushBeforeTransfer;
         return this;
+    }
+
+    public UUID getPendingRepair()
+    {
+        return coordinator.getPendingRepair();
+    }
+
+    public boolean getFlushBeforeTransfer()
+    {
+        return flushBeforeTransfer;
     }
 }

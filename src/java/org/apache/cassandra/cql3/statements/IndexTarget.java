@@ -17,26 +17,111 @@
  */
 package org.apache.cassandra.cql3.statements;
 
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 
 public class IndexTarget
 {
-    public final ColumnIdentifier column;
-    public final boolean isCollectionKeys;
+    public static final String TARGET_OPTION_NAME = "target";
+    public static final String CUSTOM_INDEX_OPTION_NAME = "class_name";
 
-    private IndexTarget(ColumnIdentifier column, boolean isCollectionKeys)
+    public final ColumnIdentifier column;
+    public final Type type;
+
+    public IndexTarget(ColumnIdentifier column, Type type)
     {
         this.column = column;
-        this.isCollectionKeys = isCollectionKeys;
+        this.type = type;
     }
 
-    public static IndexTarget of(ColumnIdentifier c)
+    public String asCqlString()
     {
-        return new IndexTarget(c, false);
+        return type == Type.SIMPLE
+               ? column.toCQLString()
+               : String.format("%s(%s)", type.toString(), column.toCQLString());
     }
 
-    public static IndexTarget keysOf(ColumnIdentifier c)
+    public static class Raw
     {
-        return new IndexTarget(c, true);
+        private final ColumnMetadata.Raw column;
+        private final Type type;
+
+        private Raw(ColumnMetadata.Raw column, Type type)
+        {
+            this.column = column;
+            this.type = type;
+        }
+
+        public static Raw simpleIndexOn(ColumnMetadata.Raw c)
+        {
+            return new Raw(c, Type.SIMPLE);
+        }
+
+        public static Raw valuesOf(ColumnMetadata.Raw c)
+        {
+            return new Raw(c, Type.VALUES);
+        }
+
+        public static Raw keysOf(ColumnMetadata.Raw c)
+        {
+            return new Raw(c, Type.KEYS);
+        }
+
+        public static Raw keysAndValuesOf(ColumnMetadata.Raw c)
+        {
+            return new Raw(c, Type.KEYS_AND_VALUES);
+        }
+
+        public static Raw fullCollection(ColumnMetadata.Raw c)
+        {
+            return new Raw(c, Type.FULL);
+        }
+
+        public IndexTarget prepare(TableMetadata table)
+        {
+            // Until we've prepared the target column, we can't be certain about the target type
+            // because (for backwards compatibility) an index on a collection's values uses the
+            // same syntax as an index on a regular column (i.e. the 'values' in
+            // 'CREATE INDEX on table(values(collection));' is optional). So we correct the target type
+            // when the target column is a collection & the target type is SIMPLE.
+            ColumnMetadata columnDef = column.prepare(table);
+            Type actualType = (type == Type.SIMPLE && columnDef.type.isCollection()) ? Type.VALUES : type;
+            return new IndexTarget(columnDef.name, actualType);
+        }
+    }
+
+    public enum Type
+    {
+        VALUES, KEYS, KEYS_AND_VALUES, FULL, SIMPLE;
+
+        public String toString()
+        {
+            switch (this)
+            {
+                case KEYS: return "keys";
+                case KEYS_AND_VALUES: return "entries";
+                case FULL: return "full";
+                case VALUES: return "values";
+                case SIMPLE: return "";
+                default: return "";
+            }
+        }
+
+        public static Type fromString(String s)
+        {
+            if ("".equals(s))
+                return SIMPLE;
+            else if ("values".equals(s))
+                return VALUES;
+            else if ("keys".equals(s))
+                return KEYS;
+            else if ("entries".equals(s))
+                return KEYS_AND_VALUES;
+            else if ("full".equals(s))
+                return FULL;
+
+            throw new AssertionError("Unrecognized index target type " + s);
+        }
     }
 }

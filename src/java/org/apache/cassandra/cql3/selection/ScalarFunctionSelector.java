@@ -22,26 +22,17 @@ import java.util.List;
 
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.ScalarFunction;
-import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 final class ScalarFunctionSelector extends AbstractFunctionSelector<ScalarFunction>
 {
-    public boolean isAggregate()
-    {
-        // We cannot just return true as it is possible to have a scalar function wrapping an aggregation function
-        if (argSelectors.isEmpty())
-            return false;
-
-        return argSelectors.get(0).isAggregate();
-    }
-
-    public void addInput(ResultSetBuilder rs) throws InvalidRequestException
+    public void addInput(ProtocolVersion protocolVersion, ResultSetBuilder rs) throws InvalidRequestException
     {
         for (int i = 0, m = argSelectors.size(); i < m; i++)
         {
             Selector s = argSelectors.get(i);
-            s.addInput(rs);
+            s.addInput(protocolVersion, rs);
         }
     }
 
@@ -49,15 +40,15 @@ final class ScalarFunctionSelector extends AbstractFunctionSelector<ScalarFuncti
     {
     }
 
-    public ByteBuffer getOutput() throws InvalidRequestException
+    public ByteBuffer getOutput(ProtocolVersion protocolVersion) throws InvalidRequestException
     {
         for (int i = 0, m = argSelectors.size(); i < m; i++)
         {
             Selector s = argSelectors.get(i);
-            args.set(i, s.getOutput());
+            setArg(i, s.getOutput(protocolVersion));
             s.reset();
         }
-        return fun.execute(args);
+        return fun.execute(protocolVersion, args());
     }
 
     ScalarFunctionSelector(Function fun, List<Selector> argSelectors)

@@ -20,8 +20,10 @@ package org.apache.cassandra.io.sstable.metadata;
 import java.io.IOException;
 import java.util.EnumSet;
 import java.util.Map;
+import java.util.UUID;
 
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataOutputPlus;
 
 /**
@@ -35,9 +37,10 @@ public interface IMetadataSerializer
      *
      * @param components Metadata components to serialize
      * @param out
+     * @param version
      * @throws IOException
      */
-    void serialize(Map<MetadataType, MetadataComponent> components, DataOutputPlus out) throws IOException;
+    void serialize(Map<MetadataType, MetadataComponent> components, DataOutputPlus out, Version version) throws IOException;
 
     /**
      * Deserialize specified metadata components from given descriptor.
@@ -68,7 +71,7 @@ public interface IMetadataSerializer
     void mutateLevel(Descriptor descriptor, int newLevel) throws IOException;
 
     /**
-     * Mutate repairedAt time
+     * Mutate the repairedAt time and pendingRepair ID
      */
-    void mutateRepairedAt(Descriptor descriptor, long newRepairedAt) throws IOException;
+    void mutateRepaired(Descriptor descriptor, long newRepairedAt, UUID newPendingRepair) throws IOException;
 }

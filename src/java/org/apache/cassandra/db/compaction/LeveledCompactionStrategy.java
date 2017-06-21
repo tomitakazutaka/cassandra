@@ -17,89 +17,76 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.SortedSet;
+import java.util.*;
 
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.collect.*;
 import com.google.common.primitives.Doubles;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.notifications.INotification;
-import org.apache.cassandra.notifications.INotificationConsumer;
-import org.apache.cassandra.notifications.SSTableAddedNotification;
-import org.apache.cassandra.notifications.SSTableListChangedNotification;
-import org.apache.cassandra.notifications.SSTableRepairStatusChanged;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.node.JsonNodeFactory;
+import org.codehaus.jackson.node.ObjectNode;
 
-public class LeveledCompactionStrategy extends AbstractCompactionStrategy implements INotificationConsumer
+public class LeveledCompactionStrategy extends AbstractCompactionStrategy
 {
     private static final Logger logger = LoggerFactory.getLogger(LeveledCompactionStrategy.class);
     private static final String SSTABLE_SIZE_OPTION = "sstable_size_in_mb";
+    private static final boolean tolerateSstableSize = Boolean.getBoolean(Config.PROPERTY_PREFIX + "tolerate_sstable_size");
+    private static final String LEVEL_FANOUT_SIZE_OPTION = "fanout_size";
+    public static final int DEFAULT_LEVEL_FANOUT_SIZE = 10;
 
     @VisibleForTesting
     final LeveledManifest manifest;
     private final int maxSSTableSizeInMB;
+    private final int levelFanoutSize;
 
     public LeveledCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
         int configuredMaxSSTableSize = 160;
+        int configuredLevelFanoutSize = DEFAULT_LEVEL_FANOUT_SIZE;
         SizeTieredCompactionStrategyOptions localOptions = new SizeTieredCompactionStrategyOptions(options);
         if (options != null)
-        {             
-            if (options.containsKey(SSTABLE_SIZE_OPTION))             
-            {                 
-                configuredMaxSSTableSize = Integer.parseInt(options.get(SSTABLE_SIZE_OPTION));                 
-                if (!Boolean.getBoolean("cassandra.tolerate_sstable_size"))                 
-                {                     
+        {
+            if (options.containsKey(SSTABLE_SIZE_OPTION))
+            {
+                configuredMaxSSTableSize = Integer.parseInt(options.get(SSTABLE_SIZE_OPTION));
+                if (!tolerateSstableSize)
+                {
                     if (configuredMaxSSTableSize >= 1000)
                         logger.warn("Max sstable size of {}MB is configured for {}.{}; having a unit of compaction this large is probably a bad idea",
-                                configuredMaxSSTableSize, cfs.name, cfs.getColumnFamilyName());
-                    if (configuredMaxSSTableSize < 50)  
+                                configuredMaxSSTableSize, cfs.name, cfs.getTableName());
+                    if (configuredMaxSSTableSize < 50)
                         logger.warn("Max sstable size of {}MB is configured for {}.{}.  Testing done for CASSANDRA-5727 indicates that performance improves up to 160MB",
-                                configuredMaxSSTableSize, cfs.name, cfs.getColumnFamilyName());
+                                configuredMaxSSTableSize, cfs.name, cfs.getTableName());
                 }
+            }
+
+            if (options.containsKey(LEVEL_FANOUT_SIZE_OPTION))
+            {
+                configuredLevelFanoutSize = Integer.parseInt(options.get(LEVEL_FANOUT_SIZE_OPTION));
             }
         }
         maxSSTableSizeInMB = configuredMaxSSTableSize;
+        levelFanoutSize = configuredLevelFanoutSize;
 
-        manifest = LeveledManifest.create(cfs, this.maxSSTableSizeInMB, cfs.getSSTables(), localOptions);
-        logger.debug("Created {}", manifest);
-    }
-
-    @Override
-    public void startup()
-    {
-        super.startup();
-        cfs.getDataTracker().subscribe(this);
-        logger.debug("{} subscribed to the data tracker.", this);
-    }
-
-    @Override
-    public void shutdown()
-    {
-        super.shutdown();
-        cfs.getDataTracker().unsubscribe(this);
-        logger.debug("{} unsubscribed from the data tracker.", this);
+        manifest = new LeveledManifest(cfs, this.maxSSTableSizeInMB, this.levelFanoutSize, localOptions);
+        logger.trace("Created {}", manifest);
     }
 
     public int getLevelSize(int i)
@@ -112,21 +99,19 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         return manifest.getAllLevelSize();
     }
 
+    @Override
+    public void startup()
+    {
+        manifest.calculateLastCompactedKeys();
+        super.startup();
+    }
+
     /**
      * the only difference between background and maximal in LCS is that maximal is still allowed
      * (by explicit user request) even when compaction is disabled.
      */
-    public synchronized AbstractCompactionTask getNextBackgroundTask(int gcBefore)
-    {
-        if (!isEnabled())
-            return null;
-        Collection<AbstractCompactionTask> tasks = getMaximalTask(gcBefore);
-        if (tasks == null || tasks.size() == 0)
-            return null;
-        return tasks.iterator().next();
-    }
-
-    public Collection<AbstractCompactionTask> getMaximalTask(int gcBefore)
+    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
         while (true)
         {
@@ -138,7 +123,7 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
                 SSTableReader sstable = findDroppableSSTable(gcBefore);
                 if (sstable == null)
                 {
-                    logger.debug("No compaction necessary for {}", this);
+                    logger.trace("No compaction necessary for {}", this);
                     return null;
                 }
                 candidate = new LeveledManifest.CompactionCandidate(Collections.singleton(sstable),
@@ -151,35 +136,63 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
                 op = OperationType.COMPACTION;
             }
 
-            if (cfs.getDataTracker().markCompacting(candidate.sstables))
+            LifecycleTransaction txn = cfs.getTracker().tryModify(candidate.sstables, OperationType.COMPACTION);
+            if (txn != null)
             {
-                LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, candidate.sstables, candidate.level, gcBefore, candidate.maxSSTableBytes);
+                LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, txn, candidate.level, gcBefore, candidate.maxSSTableBytes, false);
                 newTask.setCompactionType(op);
-                return Arrays.<AbstractCompactionTask>asList(newTask);
+                return newTask;
             }
         }
     }
 
-    @Override
-    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, int gcBefore)
+    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
+    public synchronized Collection<AbstractCompactionTask> getMaximalTask(int gcBefore, boolean splitOutput)
     {
-        throw new UnsupportedOperationException("LevelDB compaction strategy does not allow user-specified compactions");
+        Iterable<SSTableReader> sstables = manifest.getAllSSTables();
+
+        Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
+        if (Iterables.isEmpty(sstables))
+            return null;
+        LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);
+        if (txn == null)
+            return null;
+        return Arrays.<AbstractCompactionTask>asList(new LeveledCompactionTask(cfs, txn, 0, gcBefore, getMaxSSTableBytes(), true));
+
     }
 
     @Override
-    public AbstractCompactionTask getCompactionTask(Collection<SSTableReader> sstables, int gcBefore, long maxSSTableBytes)
+    @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
+    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, int gcBefore)
     {
-        assert sstables.size() > 0;
+
+        if (sstables.isEmpty())
+            return null;
+
+        LifecycleTransaction transaction = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
+        if (transaction == null)
+        {
+            logger.trace("Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem", sstables);
+            return null;
+        }
+        int level = sstables.size() > 1 ? 0 : sstables.iterator().next().getSSTableLevel();
+        return new LeveledCompactionTask(cfs, transaction, level, gcBefore, level == 0 ? Long.MAX_VALUE : getMaxSSTableBytes(), false);
+    }
+
+    @Override
+    public AbstractCompactionTask getCompactionTask(LifecycleTransaction txn, int gcBefore, long maxSSTableBytes)
+    {
+        assert txn.originals().size() > 0;
         int level = -1;
         // if all sstables are in the same level, we can set that level:
-        for (SSTableReader sstable : sstables)
+        for (SSTableReader sstable : txn.originals())
         {
             if (level == -1)
                 level = sstable.getSSTableLevel();
             if (level != sstable.getSSTableLevel())
                 level = 0;
         }
-        return new LeveledCompactionTask(cfs, sstables, level, gcBefore, maxSSTableBytes);
+        return new LeveledCompactionTask(cfs, txn, level, gcBefore, maxSSTableBytes, false);
     }
 
     /**
@@ -197,11 +210,13 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         for (SSTableReader sstable : ssTablesToGroup)
         {
             Integer level = sstable.getSSTableLevel();
-            if (!sstablesByLevel.containsKey(level))
+            Collection<SSTableReader> sstablesForLevel = sstablesByLevel.get(level);
+            if (sstablesForLevel == null)
             {
-                sstablesByLevel.put(level, new ArrayList<SSTableReader>());
+                sstablesForLevel = new ArrayList<SSTableReader>();
+                sstablesByLevel.put(level, sstablesForLevel);
             }
-            sstablesByLevel.get(level).add(sstable);
+            sstablesForLevel.add(sstable);
         }
 
         Collection<Collection<SSTableReader>> groupedSSTables = new ArrayList<>();
@@ -228,25 +243,9 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
 
     public int getEstimatedRemainingTasks()
     {
-        return manifest.getEstimatedTasks();
-    }
-
-    public void handleNotification(INotification notification, Object sender)
-    {
-        if (notification instanceof SSTableAddedNotification)
-        {
-            SSTableAddedNotification flushedNotification = (SSTableAddedNotification) notification;
-            manifest.add(flushedNotification.added);
-        }
-        else if (notification instanceof SSTableListChangedNotification)
-        {
-            SSTableListChangedNotification listChangedNotification = (SSTableListChangedNotification) notification;
-            manifest.replace(listChangedNotification.removed, listChangedNotification.added);
-        }
-        else if (notification instanceof SSTableRepairStatusChanged)
-        {
-            manifest.repairStatusChanged(((SSTableRepairStatusChanged) notification).sstable);
-        }
+        int n = manifest.getEstimatedTasks();
+        cfs.getCompactionStrategyManager().compactionLogger.pending(this, n);
+        return n;
     }
 
     public long getMaxSSTableBytes()
@@ -254,36 +253,55 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         return maxSSTableSizeInMB * 1024L * 1024L;
     }
 
-    public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+    public int getLevelFanoutSize()
     {
+        return levelFanoutSize;
+    }
+
+    public ScannerList getScanners(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
+    {
+        Set<SSTableReader>[] sstablesPerLevel = manifest.getSStablesPerLevelSnapshot();
+
         Multimap<Integer, SSTableReader> byLevel = ArrayListMultimap.create();
         for (SSTableReader sstable : sstables)
         {
-            if (manifest.hasRepairedData() && !sstable.isRepaired())
-                byLevel.get(0).add(sstable);
-            else
-                byLevel.get(sstable.getSSTableLevel()).add(sstable);
+            int level = sstable.getSSTableLevel();
+            // if an sstable is not on the manifest, it was recently added or removed
+            // so we add it to level -1 and create exclusive scanners for it - see below (#9935)
+            if (level >= sstablesPerLevel.length || !sstablesPerLevel[level].contains(sstable))
+            {
+                logger.warn("Live sstable {} from level {} is not on corresponding level in the leveled manifest." +
+                            " This is not a problem per se, but may indicate an orphaned sstable due to a failed" +
+                            " compaction not cleaned up properly.",
+                             sstable.getFilename(), level);
+                level = -1;
+            }
+            byLevel.get(level).add(sstable);
         }
 
-        List<ICompactionScanner> scanners = new ArrayList<ICompactionScanner>(sstables.size());
+        List<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>(sstables.size());
         try
         {
             for (Integer level : byLevel.keySet())
             {
-                // level can be -1 when sstables are added to DataTracker but not to LeveledManifest
+                // level can be -1 when sstables are added to Tracker but not to LeveledManifest
                 // since we don't know which level those sstable belong yet, we simply do the same as L0 sstables.
                 if (level <= 0)
                 {
                     // L0 makes no guarantees about overlapping-ness.  Just create a direct scanner for each
                     for (SSTableReader sstable : byLevel.get(level))
-                        scanners.add(sstable.getScanner(range, CompactionManager.instance.getRateLimiter()));
+                        scanners.add(sstable.getScanner(ranges));
                 }
                 else
                 {
                     // Create a LeveledScanner that only opens one sstable at a time, in sorted order
-                    List<SSTableReader> intersecting = LeveledScanner.intersecting(byLevel.get(level), range);
+                    Collection<SSTableReader> intersecting = LeveledScanner.intersecting(byLevel.get(level), ranges);
                     if (!intersecting.isEmpty())
-                        scanners.add(new LeveledScanner(intersecting, range));
+                    {
+                        @SuppressWarnings("resource") // The ScannerList will be in charge of closing (and we close properly on errors)
+                        ISSTableScanner scanner = new LeveledScanner(cfs.metadata(), intersecting, ranges);
+                        scanners.add(scanner);
+                    }
                 }
             }
         }
@@ -303,86 +321,126 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         return new ScannerList(scanners);
     }
 
+    @Override
+    public void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
+    {
+        manifest.replace(removed, added);
+    }
+
+    @Override
+    public void addSSTable(SSTableReader added)
+    {
+        manifest.add(added);
+    }
+
+    @Override
+    public void removeSSTable(SSTableReader sstable)
+    {
+        manifest.remove(sstable);
+    }
+
+    @Override
+    protected Set<SSTableReader> getSSTables()
+    {
+        return manifest.getSSTables();
+    }
+
     // Lazily creates SSTableBoundedScanner for sstable that are assumed to be from the
     // same level (e.g. non overlapping) - see #4142
-    private static class LeveledScanner extends AbstractIterator<OnDiskAtomIterator> implements ICompactionScanner
+    private static class LeveledScanner extends AbstractIterator<UnfilteredRowIterator> implements ISSTableScanner
     {
-        private final Range<Token> range;
+        private final TableMetadata metadata;
+        private final Collection<Range<Token>> ranges;
         private final List<SSTableReader> sstables;
         private final Iterator<SSTableReader> sstableIterator;
         private final long totalLength;
+        private final long compressedLength;
 
-        private ICompactionScanner currentScanner;
+        private ISSTableScanner currentScanner;
         private long positionOffset;
+        private long totalBytesScanned = 0;
 
-        public LeveledScanner(Collection<SSTableReader> sstables, Range<Token> range)
+        public LeveledScanner(TableMetadata metadata, Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
         {
-            this.range = range;
+            this.metadata = metadata;
+            this.ranges = ranges;
 
             // add only sstables that intersect our range, and estimate how much data that involves
             this.sstables = new ArrayList<>(sstables.size());
             long length = 0;
+            long cLength = 0;
             for (SSTableReader sstable : sstables)
             {
                 this.sstables.add(sstable);
                 long estimatedKeys = sstable.estimatedKeys();
                 double estKeysInRangeRatio = 1.0;
 
-                if (estimatedKeys > 0 && range != null)
-                    estKeysInRangeRatio = ((double) sstable.estimatedKeysForRanges(Collections.singleton(range))) / estimatedKeys;
+                if (estimatedKeys > 0 && ranges != null)
+                    estKeysInRangeRatio = ((double) sstable.estimatedKeysForRanges(ranges)) / estimatedKeys;
 
                 length += sstable.uncompressedLength() * estKeysInRangeRatio;
+                cLength += sstable.onDiskLength() * estKeysInRangeRatio;
             }
 
             totalLength = length;
+            compressedLength = cLength;
             Collections.sort(this.sstables, SSTableReader.sstableComparator);
             sstableIterator = this.sstables.iterator();
             assert sstableIterator.hasNext(); // caller should check intersecting first
-            currentScanner = sstableIterator.next().getScanner(range, CompactionManager.instance.getRateLimiter());
+            SSTableReader currentSSTable = sstableIterator.next();
+            currentScanner = currentSSTable.getScanner(ranges);
+
         }
 
-        public static List<SSTableReader> intersecting(Collection<SSTableReader> sstables, Range<Token> range)
+        public static Collection<SSTableReader> intersecting(Collection<SSTableReader> sstables, Collection<Range<Token>> ranges)
         {
-            ArrayList<SSTableReader> filtered = new ArrayList<>();
-            for (SSTableReader sstable : sstables)
+            if (ranges == null)
+                return Lists.newArrayList(sstables);
+
+            Set<SSTableReader> filtered = new HashSet<>();
+            for (Range<Token> range : ranges)
             {
-                Range<Token> sstableRange = new Range<>(sstable.first.getToken(), sstable.last.getToken(), sstable.partitioner);
-                if (range == null || sstableRange.intersects(range))
-                    filtered.add(sstable);
+                for (SSTableReader sstable : sstables)
+                {
+                    Range<Token> sstableRange = new Range<>(sstable.first.getToken(), sstable.last.getToken());
+                    if (range == null || sstableRange.intersects(range))
+                        filtered.add(sstable);
+                }
             }
             return filtered;
         }
 
-        protected OnDiskAtomIterator computeNext()
+        public TableMetadata metadata()
+        {
+            return metadata;
+        }
+
+        protected UnfilteredRowIterator computeNext()
         {
             if (currentScanner == null)
                 return endOfData();
 
-            try
+            while (true)
             {
-                while (true)
-                {
-                    if (currentScanner.hasNext())
-                        return currentScanner.next();
+                if (currentScanner.hasNext())
+                    return currentScanner.next();
 
-                    positionOffset += currentScanner.getLengthInBytes();
-                    currentScanner.close();
-                    if (!sstableIterator.hasNext())
-                    {
-                        // reset to null so getCurrentPosition does not return wrong value
-                        currentScanner = null;
-                        return endOfData();
-                    }
-                    currentScanner = sstableIterator.next().getScanner(range, CompactionManager.instance.getRateLimiter());
+                positionOffset += currentScanner.getLengthInBytes();
+                totalBytesScanned += currentScanner.getBytesScanned();
+
+                currentScanner.close();
+                if (!sstableIterator.hasNext())
+                {
+                    // reset to null so getCurrentPosition does not return wrong value
+                    currentScanner = null;
+                    return endOfData();
                 }
-            }
-            catch (IOException e)
-            {
-                throw new RuntimeException(e);
+                SSTableReader currentSSTable = sstableIterator.next();
+                currentScanner = currentSSTable.getScanner(ranges);
             }
         }
 
-        public void close() throws IOException
+        public void close()
         {
             if (currentScanner != null)
                 currentScanner.close();
@@ -396,6 +454,16 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         public long getCurrentPosition()
         {
             return positionOffset + (currentScanner == null ? 0L : currentScanner.getCurrentPosition());
+        }
+
+        public long getCompressedLengthInBytes()
+        {
+            return compressedLength;
+        }
+
+        public long getBytesScanned()
+        {
+            return currentScanner == null ? totalBytesScanned : totalBytesScanned + currentScanner.getBytesScanned();
         }
 
         public String getBackingFiles()
@@ -428,7 +496,7 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
             if (sstables.isEmpty())
                 continue;
 
-            Set<SSTableReader> compacting = cfs.getDataTracker().getCompacting();
+            Set<SSTableReader> compacting = cfs.getTracker().getCompacting();
             for (SSTableReader sstable : sstables)
             {
                 if (sstable.getEstimatedDroppableTombstoneRatio(gcBefore) <= tombstoneThreshold)
@@ -438,6 +506,26 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
             }
         }
         return null;
+    }
+
+    public CompactionLogger.Strategy strategyLogger()
+    {
+        return new CompactionLogger.Strategy()
+        {
+            public JsonNode sstable(SSTableReader sstable)
+            {
+                ObjectNode node = JsonNodeFactory.instance.objectNode();
+                node.put("level", sstable.getSSTableLevel());
+                node.put("min_token", sstable.first.getToken().toString());
+                node.put("max_token", sstable.last.getToken().toString());
+                return node;
+            }
+
+            public JsonNode options()
+            {
+                return null;
+            }
+        };
     }
 
     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
@@ -459,6 +547,23 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         }
 
         uncheckedOptions.remove(SSTABLE_SIZE_OPTION);
+
+        // Validate the fanout_size option
+        String levelFanoutSize = options.containsKey(LEVEL_FANOUT_SIZE_OPTION) ? options.get(LEVEL_FANOUT_SIZE_OPTION) : String.valueOf(DEFAULT_LEVEL_FANOUT_SIZE);
+        try
+        {
+            int fanoutSize = Integer.parseInt(levelFanoutSize);
+            if (fanoutSize < 1)
+            {
+                throw new ConfigurationException(String.format("%s must be larger than 0, but was %s", LEVEL_FANOUT_SIZE_OPTION, fanoutSize));
+            }
+        }
+        catch (NumberFormatException ex)
+        {
+            throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", size, LEVEL_FANOUT_SIZE_OPTION), ex);
+        }
+
+        uncheckedOptions.remove(LEVEL_FANOUT_SIZE_OPTION);
 
         uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
 

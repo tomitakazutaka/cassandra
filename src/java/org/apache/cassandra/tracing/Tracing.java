@@ -21,93 +21,94 @@ package org.apache.cassandra.tracing;
 
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
+import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.composites.CellName;
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.concurrent.ExecutorLocal;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.marshal.TimeUUIDType;
-import org.apache.cassandra.exceptions.OverloadedException;
-import org.apache.cassandra.exceptions.UnavailableException;
-import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.UUIDGen;
 
-import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 /**
  * A trace session context. Able to track and store trace sessions. A session is usually a user initiated query, and may
- * have multiple local and remote events before it is completed. All events and sessions are stored at keyspace.
+ * have multiple local and remote events before it is completed.
  */
-public class Tracing
+public abstract class Tracing implements ExecutorLocal<TraceState>
 {
-    public static final String TRACE_KS = "system_traces";
-    public static final String EVENTS_CF = "events";
-    public static final String SESSIONS_CF = "sessions";
     public static final String TRACE_HEADER = "TraceSession";
+    public static final String TRACE_TYPE = "TraceType";
 
-    private static final int TTL = 24 * 3600;
-
-    private static final Logger logger = LoggerFactory.getLogger(Tracing.class);
-
-    private final InetAddress localAddress = FBUtilities.getLocalAddress();
-
-    private final ThreadLocal<TraceState> state = new ThreadLocal<TraceState>();
-
-    private final ConcurrentMap<UUID, TraceState> sessions = new ConcurrentHashMap<UUID, TraceState>();
-
-    public static final Tracing instance = new Tracing();
-
-    public static void addColumn(ColumnFamily cf, CellName name, InetAddress address)
+    public enum TraceType
     {
-        addColumn(cf, name, ByteBufferUtil.bytes(address));
-    }
+        NONE,
+        QUERY,
+        REPAIR;
 
-    public static void addColumn(ColumnFamily cf, CellName name, int value)
-    {
-        addColumn(cf, name, ByteBufferUtil.bytes(value));
-    }
+        private static final TraceType[] ALL_VALUES = values();
 
-    public static void addColumn(ColumnFamily cf, CellName name, long value)
-    {
-        addColumn(cf, name, ByteBufferUtil.bytes(value));
-    }
-
-    public static void addColumn(ColumnFamily cf, CellName name, String value)
-    {
-        addColumn(cf, name, ByteBufferUtil.bytes(value));
-    }
-
-    private static void addColumn(ColumnFamily cf, CellName name, ByteBuffer value)
-    {
-        cf.addColumn(new BufferExpiringCell(name, value, System.currentTimeMillis(), TTL));
-    }
-
-    public void addParameterColumns(ColumnFamily cf, Map<String, String> rawPayload)
-    {
-        for (Map.Entry<String, String> entry : rawPayload.entrySet())
+        public static TraceType deserialize(byte b)
         {
-            cf.addColumn(new BufferExpiringCell(buildName(CFMetaData.TraceSessionsCf, "parameters", entry.getKey()),
-                                                bytes(entry.getValue()), System.currentTimeMillis(), TTL));
+            if (b < 0 || ALL_VALUES.length <= b)
+                return NONE;
+            return ALL_VALUES[b];
+        }
+
+        public static byte serialize(TraceType value)
+        {
+            return (byte) value.ordinal();
+        }
+
+        private static final int[] TTLS = { DatabaseDescriptor.getTracetypeQueryTTL(),
+                                            DatabaseDescriptor.getTracetypeQueryTTL(),
+                                            DatabaseDescriptor.getTracetypeRepairTTL() };
+
+        public int getTTL()
+        {
+            return TTLS[ordinal()];
         }
     }
 
-    public static CellName buildName(CFMetaData meta, Object... args)
+    protected static final Logger logger = LoggerFactory.getLogger(Tracing.class);
+
+    private final InetAddress localAddress = FBUtilities.getLocalAddress();
+
+    private final FastThreadLocal<TraceState> state = new FastThreadLocal<>();
+
+    protected final ConcurrentMap<UUID, TraceState> sessions = new ConcurrentHashMap<>();
+
+    public static final Tracing instance;
+
+    static
     {
-        return meta.comparator.makeCellName(args);
+        Tracing tracing = null;
+        String customTracingClass = System.getProperty("cassandra.custom_tracing_class");
+        if (null != customTracingClass)
+        {
+            try
+            {
+                tracing = FBUtilities.construct(customTracingClass, "Tracing");
+                logger.info("Using {} as tracing queries (as requested with -Dcassandra.custom_tracing_class)", customTracingClass);
+            }
+            catch (Exception e)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.error(String.format("Cannot use class %s for tracing, ignoring by defaulting to normal tracing", customTracingClass), e);
+            }
+        }
+        instance = null != tracing ? tracing : new TracingImpl();
     }
 
     public UUID getSessionId()
@@ -116,25 +117,54 @@ public class Tracing
         return state.get().sessionId;
     }
 
+    public TraceType getTraceType()
+    {
+        assert isTracing();
+        return state.get().traceType;
+    }
+
+    public int getTTL()
+    {
+        assert isTracing();
+        return state.get().ttl;
+    }
+
     /**
      * Indicates if the current thread's execution is being traced.
      */
     public static boolean isTracing()
     {
-        return instance.state.get() != null;
+        return instance.get() != null;
     }
 
-    public UUID newSession()
+    public UUID newSession(Map<String,ByteBuffer> customPayload)
     {
-        return newSession(TimeUUIDType.instance.compose(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes())));
+        return newSession(
+                TimeUUIDType.instance.compose(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes())),
+                TraceType.QUERY,
+                customPayload);
     }
 
-    public UUID newSession(UUID sessionId)
+    public UUID newSession(TraceType traceType)
     {
-        assert state.get() == null;
+        return newSession(
+                TimeUUIDType.instance.compose(ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes())),
+                traceType,
+                Collections.EMPTY_MAP);
+    }
 
-        TraceState ts = new TraceState(localAddress, sessionId);
-        state.set(ts);
+    public UUID newSession(UUID sessionId, Map<String,ByteBuffer> customPayload)
+    {
+        return newSession(sessionId, TraceType.QUERY, customPayload);
+    }
+
+    /** This method is intended to be overridden in tracing implementations that need access to the customPayload */
+    protected UUID newSession(UUID sessionId, TraceType traceType, Map<String,ByteBuffer> customPayload)
+    {
+        assert get() == null;
+
+        TraceState ts = newTraceState(localAddress, sessionId, traceType);
+        set(ts);
         sessions.put(sessionId, ts);
 
         return sessionId;
@@ -146,36 +176,28 @@ public class Tracing
             sessions.remove(state.sessionId);
     }
 
+
     /**
      * Stop the session and record its complete.  Called by coodinator when request is complete.
      */
     public void stopSession()
     {
-        TraceState state = this.state.get();
+        TraceState state = get();
         if (state == null) // inline isTracing to avoid implicit two calls to state.get()
         {
-            logger.debug("request complete");
+            logger.trace("request complete");
         }
         else
         {
-            final int elapsed = state.elapsed();
-            final ByteBuffer sessionIdBytes = state.sessionIdBytes;
+            stopSessionImpl();
 
-            StageManager.getStage(Stage.TRACING).execute(new Runnable()
-            {
-                public void run()
-                {
-                    CFMetaData cfMeta = CFMetaData.TraceSessionsCf;
-                    ColumnFamily cf = ArrayBackedSortedColumns.factory.create(cfMeta);
-                    addColumn(cf, buildName(cfMeta, "duration"), elapsed);
-                    mutateWithCatch(new Mutation(TRACE_KS, sessionIdBytes, cf));
-                }
-            });
-
+            state.stop();
             sessions.remove(state.sessionId);
-            this.state.set(null);
+            set(null);
         }
     }
+
+    protected abstract void stopSessionImpl();
 
     public TraceState get()
     {
@@ -192,60 +214,71 @@ public class Tracing
         state.set(tls);
     }
 
-    public void begin(final String request, final Map<String, String> parameters)
+    public TraceState begin(final String request, final Map<String, String> parameters)
     {
-        assert isTracing();
-
-        final long started_at = System.currentTimeMillis();
-        final ByteBuffer sessionIdBytes = state.get().sessionIdBytes;
-
-        StageManager.getStage(Stage.TRACING).execute(new Runnable()
-        {
-            public void run()
-            {
-                CFMetaData cfMeta = CFMetaData.TraceSessionsCf;
-                ColumnFamily cf = ArrayBackedSortedColumns.factory.create(cfMeta);
-                addColumn(cf, buildName(cfMeta, "coordinator"), FBUtilities.getBroadcastAddress());
-                addParameterColumns(cf, parameters);
-                addColumn(cf, buildName(cfMeta, bytes("request")), request);
-                addColumn(cf, buildName(cfMeta, bytes("started_at")), started_at);
-                addParameterColumns(cf, parameters);
-                mutateWithCatch(new Mutation(TRACE_KS, sessionIdBytes, cf));
-            }
-        });
+        return begin(request, null, parameters);
     }
+
+    public abstract TraceState begin(String request, InetAddress client, Map<String, String> parameters);
 
     /**
      * Determines the tracing context from a message.  Does NOT set the threadlocal state.
-     * 
+     *
      * @param message The internode message
      */
     public TraceState initializeFromMessage(final MessageIn<?> message)
     {
-        final byte[] sessionBytes = message.parameters.get(Tracing.TRACE_HEADER);
+        final byte[] sessionBytes = message.parameters.get(TRACE_HEADER);
 
         if (sessionBytes == null)
             return null;
 
         assert sessionBytes.length == 16;
         UUID sessionId = UUIDGen.getUUID(ByteBuffer.wrap(sessionBytes));
-        TraceState ts = sessions.get(sessionId);
+        TraceState ts = get(sessionId);
         if (ts != null && ts.acquireReference())
             return ts;
+
+        byte[] tmpBytes;
+        TraceType traceType = TraceType.QUERY;
+        if ((tmpBytes = message.parameters.get(TRACE_TYPE)) != null)
+            traceType = TraceType.deserialize(tmpBytes[0]);
 
         if (message.verb == MessagingService.Verb.REQUEST_RESPONSE)
         {
             // received a message for a session we've already closed out.  see CASSANDRA-5668
-            return new ExpiredTraceState(sessionId);
+            return new ExpiredTraceState(newTraceState(message.from, sessionId, traceType));
         }
         else
         {
-            ts = new TraceState(message.from, sessionId);
+            ts = newTraceState(message.from, sessionId, traceType);
             sessions.put(sessionId, ts);
             return ts;
         }
     }
 
+    public Map<String, byte[]> getTraceHeaders()
+    {
+        assert isTracing();
+
+        return ImmutableMap.of(
+                TRACE_HEADER, UUIDGen.decompose(Tracing.instance.getSessionId()),
+                TRACE_TYPE, new byte[] { Tracing.TraceType.serialize(Tracing.instance.getTraceType()) });
+    }
+
+    protected abstract TraceState newTraceState(InetAddress coordinator, UUID sessionId, Tracing.TraceType traceType);
+
+    // repair just gets a varargs method since it's so heavyweight anyway
+    public static void traceRepair(String format, Object... args)
+    {
+        final TraceState state = instance.get();
+        if (state == null) // inline isTracing to avoid implicit two calls to state.get()
+            return;
+
+        state.trace(format, args);
+    }
+
+    // normal traces get zero-, one-, and two-argument overloads so common case doesn't need to create varargs array
     public static void trace(String message)
     {
         final TraceState state = instance.get();
@@ -273,7 +306,7 @@ public class Tracing
         state.trace(format, arg1, arg2);
     }
 
-    public static void trace(String format, Object[] args)
+    public static void trace(String format, Object... args)
     {
         final TraceState state = instance.get();
         if (state == null) // inline isTracing to avoid implicit two calls to state.get()
@@ -282,20 +315,9 @@ public class Tracing
         state.trace(format, args);
     }
 
-    static void mutateWithCatch(Mutation mutation)
-    {
-        try
-        {
-            StorageProxy.mutate(Arrays.asList(mutation), ConsistencyLevel.ANY);
-        }
-        catch (UnavailableException | WriteTimeoutException e)
-        {
-            // should never happen; ANY does not throw UAE or WTE
-            throw new AssertionError(e);
-        }
-        catch (OverloadedException e)
-        {
-            logger.warn("Too many nodes are overloaded to save trace events");
-        }
-    }
+    /**
+     * Called from {@link org.apache.cassandra.net.OutboundTcpConnection} for non-local traces (traces
+     * that are not initiated by local node == coordinator).
+     */
+    public abstract void trace(ByteBuffer sessionId, String message, int ttl);
 }

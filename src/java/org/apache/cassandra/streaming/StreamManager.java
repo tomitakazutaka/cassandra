@@ -63,17 +63,17 @@ public class StreamManager implements StreamManagerMBean
 
     public static class StreamRateLimiter
     {
-        private static final double ONE_MEGA_BIT = (1024 * 1024) / 8; // from bits
+        private static final double BYTES_PER_MEGABIT = (1024 * 1024) / 8; // from bits
         private static final RateLimiter limiter = RateLimiter.create(Double.MAX_VALUE);
         private static final RateLimiter interDCLimiter = RateLimiter.create(Double.MAX_VALUE);
         private final boolean isLocalDC;
 
         public StreamRateLimiter(InetAddress peer)
         {
-            double throughput = ((double) DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec()) * ONE_MEGA_BIT;
+            double throughput = DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() * BYTES_PER_MEGABIT;
             mayUpdateThroughput(throughput, limiter);
 
-            double interDCThroughput = ((double) DatabaseDescriptor.getInterDCStreamThroughputOutboundMegabitsPerSec()) * ONE_MEGA_BIT;
+            double interDCThroughput = DatabaseDescriptor.getInterDCStreamThroughputOutboundMegabitsPerSec() * BYTES_PER_MEGABIT;
             mayUpdateThroughput(interDCThroughput, interDCLimiter);
 
             if (DatabaseDescriptor.getLocalDataCenter() != null && DatabaseDescriptor.getEndpointSnitch() != null)
@@ -131,7 +131,7 @@ public class StreamManager implements StreamManagerMBean
             {
                 initiatedStreams.remove(result.planId);
             }
-        }, MoreExecutors.sameThreadExecutor());
+        }, MoreExecutors.directExecutor());
 
         initiatedStreams.put(result.planId, result);
     }
@@ -146,7 +146,7 @@ public class StreamManager implements StreamManagerMBean
             {
                 receivingStreams.remove(result.planId);
             }
-        }, MoreExecutors.sameThreadExecutor());
+        }, MoreExecutors.directExecutor());
 
         receivingStreams.put(result.planId, result);
     }

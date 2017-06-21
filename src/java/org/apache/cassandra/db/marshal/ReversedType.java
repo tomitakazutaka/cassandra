@@ -23,9 +23,12 @@ import java.util.Map;
 import java.util.List;
 
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 public class ReversedType<T> extends AbstractType<T>
 {
@@ -55,22 +58,24 @@ public class ReversedType<T> extends AbstractType<T>
 
     private ReversedType(AbstractType<T> baseType)
     {
+        super(ComparisonType.CUSTOM);
         this.baseType = baseType;
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        // An empty byte buffer is always smaller
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        return baseType.isEmptyValueMeaningless();
+    }
 
+    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    {
         return baseType.compare(o2, o1);
+    }
+
+    @Override
+    public int compareForCQL(ByteBuffer v1, ByteBuffer v2)
+    {
+        return baseType.compare(v1, v2);
     }
 
     public String getString(ByteBuffer bytes)
@@ -81,6 +86,18 @@ public class ReversedType<T> extends AbstractType<T>
     public ByteBuffer fromString(String source)
     {
         return baseType.fromString(source);
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        return baseType.fromJSONObject(parsed);
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return baseType.toJSONString(buffer, protocolVersion);
     }
 
     @Override
@@ -107,6 +124,23 @@ public class ReversedType<T> extends AbstractType<T>
     public TypeSerializer<T> getSerializer()
     {
         return baseType.getSerializer();
+    }
+
+    public boolean referencesUserType(String userTypeName)
+    {
+        return baseType.referencesUserType(userTypeName);
+    }
+
+    @Override
+    public int valueLengthIfFixed()
+    {
+        return baseType.valueLengthIfFixed();
+    }
+
+    @Override
+    public boolean isReversed()
+    {
+        return true;
     }
 
     @Override

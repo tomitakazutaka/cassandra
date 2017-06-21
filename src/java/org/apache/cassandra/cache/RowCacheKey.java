@@ -19,35 +19,43 @@ package org.apache.cassandra.cache;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.UUID;
+import java.util.Objects;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
 
-public class RowCacheKey implements CacheKey, Comparable<RowCacheKey>
+public final class RowCacheKey extends CacheKey
 {
-    public final UUID cfId;
     public final byte[] key;
 
-    private static final long EMPTY_SIZE = ObjectSizes.measure(new RowCacheKey(null, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new RowCacheKey(null, null, new byte[0]));
 
-    public RowCacheKey(UUID cfId, DecoratedKey key)
+    public RowCacheKey(TableId tableId, String indexName, byte[] key)
     {
-        this(cfId, key.getKey());
+        super(tableId, indexName);
+        this.key = key;
     }
 
-    public RowCacheKey(UUID cfId, ByteBuffer key)
+    public RowCacheKey(TableMetadata metadata, DecoratedKey key)
     {
-        this.cfId = cfId;
-        this.key = ByteBufferUtil.getArray(key);
+        super(metadata);
+        this.key = ByteBufferUtil.getArray(key.getKey());
         assert this.key != null;
     }
 
-    public UUID getCFId()
+    @VisibleForTesting
+    public RowCacheKey(TableId tableId, String indexName, ByteBuffer key)
     {
-        return cfId;
+        super(tableId, indexName);
+        this.key = ByteBufferUtil.getArray(key);
+        assert this.key != null;
     }
 
     public long unsharedHeapSize()
@@ -63,25 +71,24 @@ public class RowCacheKey implements CacheKey, Comparable<RowCacheKey>
 
         RowCacheKey that = (RowCacheKey) o;
 
-        return cfId.equals(that.cfId) && Arrays.equals(key, that.key);
+        return tableId.equals(that.tableId)
+               && Objects.equals(indexName, that.indexName)
+               && Arrays.equals(key, that.key);
     }
 
     @Override
     public int hashCode()
     {
-        int result = cfId.hashCode();
+        int result = tableId.hashCode();
+        result = 31 * result + Objects.hashCode(indexName);
         result = 31 * result + (key != null ? Arrays.hashCode(key) : 0);
         return result;
-    }
-
-    public int compareTo(RowCacheKey otherKey)
-    {
-        return (cfId.compareTo(otherKey.cfId) < 0) ? -1 : ((cfId.equals(otherKey.cfId)) ?  FBUtilities.compareUnsigned(key, otherKey.key, 0, 0, key.length, otherKey.key.length) : 1);
     }
 
     @Override
     public String toString()
     {
-        return String.format("RowCacheKey(cfId:%s, key:%s)", cfId, Arrays.toString(key));
+        TableMetadataRef tableRef = Schema.instance.getTableMetadataRef(tableId);
+        return String.format("RowCacheKey(%s, %s, key:%s)", tableRef, indexName, Arrays.toString(key));
     }
 }

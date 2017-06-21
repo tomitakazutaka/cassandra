@@ -47,7 +47,7 @@ Function BuildClassPath
     }
 
     # Add build/classes/main so it works in development
-    $cp = $cp + ";" + """$env:CASSANDRA_HOME\build\classes\main"";""$env:CASSANDRA_HOME\build\classes\thrift"""
+    $cp = $cp + ";" + """$env:CASSANDRA_HOME\build\classes\main"""
     $env:CLASSPATH=$cp
 }
 
@@ -132,16 +132,17 @@ Function CalculateHeapSizes
     {
         return
     }
-    if (($env:MAX_HEAP_SIZE -and !$env:HEAP_NEWSIZE) -or (!$env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE))
+
+    if ((($env:MAX_HEAP_SIZE -and !$env:HEAP_NEWSIZE) -or (!$env:MAX_HEAP_SIZE -and $env:HEAP_NEWSIZE)) -and ($using_cms -eq $true))
     {
-        echo "please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs"
+        echo "Please set or unset MAX_HEAP_SIZE and HEAP_NEWSIZE in pairs.  Aborting startup."
         exit 1
     }
 
     $memObject = Get-WMIObject -class win32_physicalmemory
     if ($memObject -eq $null)
     {
-        echo "WARNING!  Could not determine system memory.  Defaulting to 2G heap, 512M newgen.  Manually override in conf/cassandra-env.ps1 for different heap values."
+        echo "WARNING!  Could not determine system memory.  Defaulting to 2G heap, 512M newgen.  Manually override in conf\jvm.options for different heap values."
         $env:MAX_HEAP_SIZE = "2048M"
         $env:HEAP_NEWSIZE = "512M"
         return
@@ -205,12 +206,27 @@ Function ParseJVMInfo
     $pinfo.RedirectStandardError = $true
     $pinfo.RedirectStandardOutput = $true
     $pinfo.UseShellExecute = $false
-    $pinfo.Arguments = "-version"
+    $pinfo.Arguments = "-d64 -version"
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $pinfo
     $p.Start() | Out-Null
     $p.WaitForExit()
     $stderr = $p.StandardError.ReadToEnd()
+
+    $env:JVM_ARCH = "64-bit"
+
+    if ($stderr.Contains("Error"))
+    {
+        # 32-bit JVM. re-run w/out -d64
+        echo "Failed 64-bit check. Re-running to get version from 32-bit"
+        $pinfo.Arguments = "-version"
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $pinfo
+        $p.Start() | Out-Null
+        $p.WaitForExit()
+        $stderr = $p.StandardError.ReadToEnd()
+        $env:JVM_ARCH = "32-bit"
+    }
 
     $sa = $stderr.Split("""")
     $env:JVM_VERSION = $sa[1]
@@ -229,30 +245,19 @@ Function ParseJVMInfo
     }
 
     $pa = $sa[1].Split("_")
-    $env:JVM_PATCH_VERSION=$pa[1]
-
-    # get 64-bit vs. 32-bit
-    $pinfo.Arguments = "-d64 -version"
-    $pArch = New-Object System.Diagnostics.Process
-    $p.StartInfo = $pinfo
-    $p.Start() | Out-Null
-    $p.WaitForExit()
-    $stderr = $p.StandardError.ReadToEnd()
-
-    if ($stderr.Contains("Error"))
+    $subVersion = $pa[1]
+    # Deal with -b (build) versions
+    if ($subVersion -contains '-')
     {
-        $env:JVM_ARCH = "32-bit"
+        $patchAndBuild = $subVersion.Split("-")
+        $subVersion = $patchAndBuild[0]
     }
-    else
-    {
-        $env:JVM_ARCH = "64-bit"
-    }
+    $env:JVM_PATCH_VERSION = $subVersion
 }
 
 #-----------------------------------------------------------------------------
 Function SetCassandraEnvironment
 {
-    echo "Setting up Cassandra environment"
     if (Test-Path Env:\JAVA_HOME)
     {
         $env:JAVA_BIN = "$env:JAVA_HOME\bin\java.exe"
@@ -280,7 +285,7 @@ Function SetCassandraEnvironment
     # Override these to set the amount of memory to allocate to the JVM at
     # start-up. For production use you may wish to adjust this for your
     # environment. MAX_HEAP_SIZE is the total amount of memory dedicated
-    # to the Java heap; HEAP_NEWSIZE refers to the size of the young
+    # to the Java heap. HEAP_NEWSIZE refers to the size of the young
     # generation. Both MAX_HEAP_SIZE and HEAP_NEWSIZE should be either set
     # or not (if you set one, set the other).
     #
@@ -292,24 +297,107 @@ Function SetCassandraEnvironment
     # times. If in doubt, and if you do not particularly want to tweak, go
     # 100 MB per physical CPU core.
 
+    #GC log path has to be defined here since it needs to find CASSANDRA_HOME
+    $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:""$env:CASSANDRA_HOME/logs/gc.log"""
+
+    # Read user-defined JVM options from jvm.options file
+    $content = Get-Content "$env:CASSANDRA_CONF\jvm.options"
+    for ($i = 0; $i -lt $content.Count; $i++)
+    {
+        $line = $content[$i]
+        if ($line.StartsWith("-"))
+        {
+            $env:JVM_OPTS = "$env:JVM_OPTS $line"
+        }
+    }
+
+    $defined_xmn = $env:JVM_OPTS -like '*Xmn*'
+    $defined_xmx = $env:JVM_OPTS -like '*Xmx*'
+    $defined_xms = $env:JVM_OPTS -like '*Xms*'
+    $using_cms = $env:JVM_OPTS -like '*UseConcMarkSweepGC*'
+
     #$env:MAX_HEAP_SIZE="4096M"
     #$env:HEAP_NEWSIZE="800M"
     CalculateHeapSizes
 
     ParseJVMInfo
+
+    # We only set -Xms and -Xmx if they were not defined on jvm.options file
+    # If defined, both Xmx and Xms should be defined together.
+    if (($defined_xmx -eq $false) -and ($defined_xms -eq $false))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -Xms$env:MAX_HEAP_SIZE"
+        $env:JVM_OPTS="$env:JVM_OPTS -Xmx$env:MAX_HEAP_SIZE"
+    }
+    elseif (($defined_xmx -eq $false) -or ($defined_xms -eq $false))
+    {
+        echo "Please set or unset -Xmx and -Xms flags in pairs on jvm.options file."
+        exit
+    }
+
+    # We only set -Xmn flag if it was not defined in jvm.options file
+    # and if the CMS GC is being used
+    # If defined, both Xmn and Xmx should be defined together.
+    if (($defined_xmn -eq $true) -and ($defined_xmx -eq $false))
+    {
+        echo "Please set or unset -Xmx and -Xmn flags in pairs on jvm.options file."
+        exit
+    }
+    elseif (($defined_xmn -eq $false) -and ($using_cms -eq $true))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -Xmn$env:HEAP_NEWSIZE"
+    }
+
+    if (($env:JVM_ARCH -eq "64-Bit") -and ($using_cms -eq $true))
+    {
+        $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseCondCardMark"
+    }
+
     # Add sigar env - see Cassandra-7838
-    $env:JVM_OPTS = "$env:JVM_OPTS -Djava.library.path=$env:CASSANDRA_HOME\lib\sigar-bin"
+    $env:JVM_OPTS = "$env:JVM_OPTS -Djava.library.path=""$env:CASSANDRA_HOME\lib\sigar-bin"""
+
+    # Confirm we're on high performance power plan, warn if not
+    # Change to $true to suppress this warning
+    $suppressPowerWarning = $false
+    if (!$suppressPowerWarning)
+    {
+        $currentProfile = powercfg /GETACTIVESCHEME
+        if (!$currentProfile.Contains("High performance"))
+        {
+            echo "*---------------------------------------------------------------------*"
+            echo "*---------------------------------------------------------------------*"
+            echo ""
+            echo "    WARNING! Detected a power profile other than High Performance."
+            echo "    Performance of this node will suffer."
+            echo "    Modify conf\cassandra.env.ps1 to suppress this warning."
+            echo ""
+            echo "*---------------------------------------------------------------------*"
+            echo "*---------------------------------------------------------------------*"
+        }
+    }
+
+    # provides hints to the JIT compiler
+    $env:JVM_OPTS = "$env:JVM_OPTS -XX:CompileCommandFile=$env:CASSANDRA_CONF\hotspot_compiler"
 
     # add the jamm javaagent
     if (($env:JVM_VENDOR -ne "OpenJDK") -or ($env:JVM_VERSION.CompareTo("1.6.0") -eq 1) -or
         (($env:JVM_VERSION -eq "1.6.0") -and ($env:JVM_PATCH_VERSION.CompareTo("22") -eq 1)))
     {
-        $env:JVM_OPTS = "$env:JVM_OPTS -javaagent:""$env:CASSANDRA_HOME\lib\jamm-0.2.6.jar"""
+        $env:JVM_OPTS = "$env:JVM_OPTS -javaagent:""$env:CASSANDRA_HOME\lib\jamm-0.3.0.jar"""
     }
 
-    # enable assertions.  disabling this in production will give a modest
-    # performance benefit (around 5%).
-    $env:JVM_OPTS = "$env:JVM_OPTS -ea"
+    # set jvm HeapDumpPath with CASSANDRA_HEAPDUMP_DIR
+    if ($env:CASSANDRA_HEAPDUMP_DIR)
+    {
+        $unixTimestamp = [int64](([datetime]::UtcNow)-(get-date "1/1/1970")).TotalSeconds
+        $env:JVM_OPTS="$env:JVM_OPTS -XX:HeapDumpPath=$env:CASSANDRA_HEAPDUMP_DIR\cassandra-$unixTimestamp-pid$pid.hprof"
+    }
+
+    if ($env:JVM_VERSION.CompareTo("1.8.0") -eq -1 -or [convert]::ToInt32($env:JVM_PATCH_VERSION) -lt 40)
+    {
+        echo "Cassandra 3.0 and later require Java 8u40 or later."
+        exit
+    }
 
     # Specifies the default port over which Cassandra will be available for
     # JMX connections.
@@ -318,81 +406,10 @@ Function SetCassandraEnvironment
     # store in env to check if it's avail in verification
     $env:JMX_PORT=$JMX_PORT
 
-    $env:JVM_OPTS = "$env:JVM_OPTS -Dlog4j.defaultInitOverride=true"
-
-    # some JVMs will fill up their heap when accessed via JMX, see CASSANDRA-6541
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+CMSClassUnloadingEnabled"
-
-    # enable thread priorities, primarily so we can give periodic tasks
-    # a lower priority to avoid interfering with client workload
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseThreadPriorities"
-    # allows lowering thread priority without being root.  see
-    # http://tech.stolsvik.com/2010/01/linux-java-thread-priorities-workar
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:ThreadPriorityPolicy=42"
-
-    # min and max heap sizes should be set to the same value to avoid
-    # stop-the-world GC pauses during resize, and so that we can lock the
-    # heap in memory on startup to prevent any of it from being swapped
-    # out.
-    $env:JVM_OPTS="$env:JVM_OPTS -Xms$env:MAX_HEAP_SIZE"
-    $env:JVM_OPTS="$env:JVM_OPTS -Xmx$env:MAX_HEAP_SIZE"
-    $env:JVM_OPTS="$env:JVM_OPTS -Xmn$env:HEAP_NEWSIZE"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+HeapDumpOnOutOfMemoryError"
-
-    # Per-thread stack size.
-    $env:JVM_OPTS="$env:JVM_OPTS -Xss256k"
-
-    # Larger interned string table, for gossip's benefit (CASSANDRA-6410)
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:StringTableSize=1000003"
-
-    # GC tuning options
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseParNewGC"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseConcMarkSweepGC"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+CMSParallelRemarkEnabled"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:SurvivorRatio=8"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:MaxTenuringThreshold=1"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:CMSInitiatingOccupancyFraction=75"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseCMSInitiatingOccupancyOnly"
-    $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseTLAB"
-    if (($env:JVM_VERSION.CompareTo("1.7") -eq 1) -and ($env:JVM_ARCH -eq "64-Bit"))
-    {
-        $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseCondCardMark"
-    }
-    if ( (($env:JVM_VERSION.CompareTo("1.7") -ge 0) -and ($env:JVM_PATCH_VERSION.CompareTo("60") -ge 0)) -or
-         ($env:JVM_VERSION.CompareTo("1.8") -ge 0))
-    {
-        $env:JVM_OPTS="$env:JVM_OPTS -XX:+CMSParallelInitialMarkEnabled -XX:+CMSEdenChunksRecordAlways"
-    }
-
-    # GC logging options -- uncomment to enable
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCDetails"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCDateStamps"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintHeapAtGC"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintTenuringDistribution"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintGCApplicationStoppedTime"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+PrintPromotionFailure"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:PrintFLSStatistics=1"
-    # $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:/var/log/cassandra/gc-`date +%s`.log"
-
-    # If you are using JDK 6u34 7u2 or later you can enable GC log rotation
-    # don't stick the date in the log name if rotation is on.
-    # $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:/var/log/cassandra/gc.log"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:+UseGCLogFileRotation"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:NumberOfGCLogFiles=10"
-    # $env:JVM_OPTS="$env:JVM_OPTS -XX:GCLogFileSize=10M"
-
     # Configure the following for JEMallocAllocator and if jemalloc is not available in the system
-    # library path (Example: /usr/local/lib/). Usually "make install" will do the right thing.
+    # library path.
     # set LD_LIBRARY_PATH=<JEMALLOC_HOME>/lib/
     # $env:JVM_OPTS="$env:JVM_OPTS -Djava.library.path=<JEMALLOC_HOME>/lib/"
-
-    # uncomment to have Cassandra JVM listen for remote debuggers/profilers on port 1414
-    # $env:JVM_OPTS="$env:JVM_OPTS -Xdebug -Xnoagent -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=1414"
-
-    # Prefer binding to IPv4 network intefaces (when net.ipv6.bindv6only=1). See
-    # http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6342561 (short version:
-    # comment out this entry to enable IPv6 support).
-    $env:JVM_OPTS="$env:JVM_OPTS -Djava.net.preferIPv4Stack=true"
 
     # jmx: metrics and administration interface
     #
@@ -403,13 +420,43 @@ Function SetCassandraEnvironment
     # https://blogs.oracle.com/jmxetc/entry/troubleshooting_connection_problems_in_jconsole
     # for more on configuring JMX through firewalls, etc. (Short version:
     # get it working with no firewall first.)
-    $env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.port=$JMX_PORT"
-    $env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl=false"
-    $env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=false"
-    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.password.file=/etc/cassandra/jmxremote.password"
-    $env:JVM_OPTS="$env:JVM_OPTS $JVM_EXTRA_OPTS"
+    #
+    # Due to potential security exploits, Cassandra ships with JMX accessible
+    # *only* from localhost.  To enable remote JMX connections, uncomment lines below
+    # with authentication and ssl enabled. See https://wiki.apache.org/cassandra/JmxSecurity
+    #
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.port=$JMX_PORT"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.rmi.port=$JMX_PORT"
+    #
+    # JMX SSL options
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl=true"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.need.client.auth=true"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.protocols=<enabled-protocols>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.ssl.enabled.cipher.suites=<enabled-cipher-suites>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.keyStore=C:/keystore"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.keyStorePassword=<keystore-password>"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.trustStore=C:/truststore"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djavax.net.ssl.trustStorePassword=<truststore-password>"
+    #
+    # JMX auth options
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.authenticate=true"
+    ## Basic file based authn & authz
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.password.file=C:/jmxremote.password"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcom.sun.management.jmxremote.access.file=C:/jmxremote.access"
 
-    $env:JVM_OPTS = "$env:JVM_OPTS -Dlog4j.configuration=log4j-server.properties"
+    ## Custom auth settings which can be used as alternatives to JMX's out of the box auth utilities.
+    ## JAAS login modules can be used for authentication by uncommenting these two properties.
+    ## Cassandra ships with a LoginModule implementation - org.apache.cassandra.auth.CassandraLoginModule -
+    ## which delegates to the IAuthenticator configured in cassandra.yaml
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.remote.login.config=CassandraLogin"
+    #$env:JVM_OPTS="$env:JVM_OPTS -Djava.security.auth.login.config=C:/cassandra-jaas.config"
+
+    ## Cassandra also ships with a helper for delegating JMX authz calls to the configured IAuthorizer,
+    ## uncomment this to use it. Requires one of the two authentication options to be enabled
+    #$env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.authorizer=org.apache.cassandra.auth.jmx.AuthorizationProxy"
+
+    # Default JMX setup, bound to local loopback address only
+    $env:JVM_OPTS="$env:JVM_OPTS -Dcassandra.jmx.local.port=$JMX_PORT"
+
+    $env:JVM_OPTS="$env:JVM_OPTS $env:JVM_EXTRA_OPTS"
 }
-
-

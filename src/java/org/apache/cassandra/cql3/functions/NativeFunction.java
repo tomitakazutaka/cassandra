@@ -28,18 +28,7 @@ public abstract class NativeFunction extends AbstractFunction
 {
     protected NativeFunction(String name, AbstractType<?> returnType, AbstractType<?>... argTypes)
     {
-        this(new FunctionName(name), returnType, argTypes);
-    }
-
-    protected NativeFunction(FunctionName name, AbstractType<?> returnType, AbstractType<?>... argTypes)
-    {
-        super(name, Arrays.asList(argTypes), returnType);
-    }
-
-    // Most of our functions are pure, the other ones should override this
-    public boolean isPure()
-    {
-        return true;
+        super(FunctionName.nativeFunction(name), Arrays.asList(argTypes), returnType);
     }
 
     public boolean isNative()
@@ -47,4 +36,3 @@ public abstract class NativeFunction extends AbstractFunction
         return true;
     }
 }
-

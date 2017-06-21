@@ -20,6 +20,7 @@ package org.apache.cassandra.service;
 import java.net.InetAddress;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -33,12 +34,11 @@ import org.apache.cassandra.db.WriteType;
 /**
  * This class blocks for a quorum of responses _in all datacenters_ (CL.EACH_QUORUM).
  */
-public class DatacenterSyncWriteResponseHandler extends AbstractWriteResponseHandler
+public class DatacenterSyncWriteResponseHandler<T> extends AbstractWriteResponseHandler<T>
 {
     private static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
 
-    private final NetworkTopologyStrategy strategy;
-    private final HashMap<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
+    private final Map<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
     private final AtomicInteger acks = new AtomicInteger(0);
 
     public DatacenterSyncWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
@@ -46,13 +46,14 @@ public class DatacenterSyncWriteResponseHandler extends AbstractWriteResponseHan
                                               ConsistencyLevel consistencyLevel,
                                               Keyspace keyspace,
                                               Runnable callback,
-                                              WriteType writeType)
+                                              WriteType writeType,
+                                              long queryStartNanoTime)
     {
         // Response is been managed by the map so make it 1 for the superclass.
-        super(keyspace, naturalEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
+        super(keyspace, naturalEndpoints, pendingEndpoints, consistencyLevel, callback, writeType, queryStartNanoTime);
         assert consistencyLevel == ConsistencyLevel.EACH_QUORUM;
 
-        strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();
+        NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();
 
         for (String dc : strategy.getDatacenters())
         {
@@ -68,23 +69,31 @@ public class DatacenterSyncWriteResponseHandler extends AbstractWriteResponseHan
         }
     }
 
-    public void response(MessageIn message)
+    public void response(MessageIn<T> message)
     {
-        String dataCenter = message == null
-                            ? DatabaseDescriptor.getLocalDataCenter()
-                            : snitch.getDatacenter(message.from);
-
-        responses.get(dataCenter).getAndDecrement();
-        acks.incrementAndGet();
-
-        for (AtomicInteger i : responses.values())
+        try
         {
-            if (i.get() > 0)
-                return;
-        }
+            String dataCenter = message == null
+                                ? DatabaseDescriptor.getLocalDataCenter()
+                                : snitch.getDatacenter(message.from);
 
-        // all the quorum conditions are met
-        signal();
+            responses.get(dataCenter).getAndDecrement();
+            acks.incrementAndGet();
+
+            for (AtomicInteger i : responses.values())
+            {
+                if (i.get() > 0)
+                    return;
+            }
+
+            // all the quorum conditions are met
+            signal();
+        }
+        finally
+        {
+            //Must be last after all subclass processing
+            logResponseToIdealCLDelegate(message);
+        }
     }
 
     protected int ackCount()

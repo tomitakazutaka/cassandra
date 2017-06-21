@@ -19,69 +19,137 @@ package org.apache.cassandra.cql3.selection;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.ColumnSpecification;
-import org.apache.cassandra.cql3.selection.Selection.ResultSetBuilder;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.ColumnFilter.Builder;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 public final class SimpleSelector extends Selector
 {
-    private final String columnName;
-    private final int idx;
-    private final AbstractType<?> type;
-    private ByteBuffer current;
-
-    public static Factory newFactory(final String columnName, final int idx, final AbstractType<?> type)
+    /**
+     * The Factory for {@code SimpleSelector}.
+     */
+    public static final class SimpleSelectorFactory extends Factory
     {
-        return new Factory()
+        private final int idx;
+
+        private final ColumnMetadata column;
+
+        private SimpleSelectorFactory(int idx, ColumnMetadata def)
         {
-            public ColumnSpecification getColumnSpecification(CFMetaData cfm)
-            {
-                return new ColumnSpecification(cfm.ksName,
-                                               cfm.cfName,
-                                               new ColumnIdentifier(columnName, true),
-                                               type);
-            }
+            this.idx = idx;
+            this.column = def;
+        }
 
-            public Selector newInstance()
-            {
-                return new SimpleSelector(columnName, idx, type);
-            }
-        };
+        @Override
+        protected String getColumnName()
+        {
+            return column.name.toString();
+        }
+
+        @Override
+        protected AbstractType<?> getReturnType()
+        {
+            return column.type;
+        }
+
+        protected void addColumnMapping(SelectionColumnMapping mapping, ColumnSpecification resultColumn)
+        {
+           mapping.addMapping(resultColumn, column);
+        }
+
+        @Override
+        public Selector newInstance(QueryOptions options)
+        {
+            return new SimpleSelector(column, idx);
+        }
+
+        @Override
+        public boolean isSimpleSelectorFactory()
+        {
+            return true;
+        }
+
+        @Override
+        public boolean isSimpleSelectorFactoryFor(int index)
+        {
+            return index == idx;
+        }
+
+        public boolean areAllFetchedColumnsKnown()
+        {
+            return true;
+        }
+
+        public void addFetchedColumns(ColumnFilter.Builder builder)
+        {
+            builder.add(column);
+        }
+
+        public ColumnMetadata getColumn()
+        {
+            return column;
+        }
     }
 
-    public void addInput(ResultSetBuilder rs) throws InvalidRequestException
+    public final ColumnMetadata column;
+    private final int idx;
+    private ByteBuffer current;
+    private boolean isSet;
+
+    public static Factory newFactory(final ColumnMetadata def, final int idx)
     {
-        current = rs.current.get(idx);
+        return new SimpleSelectorFactory(idx, def);
     }
 
-    public ByteBuffer getOutput() throws InvalidRequestException
+    @Override
+    public void addFetchedColumns(Builder builder)
+    {
+        builder.add(column);
+    }
+
+    @Override
+    public void addInput(ProtocolVersion protocolVersion, ResultSetBuilder rs) throws InvalidRequestException
+    {
+        if (!isSet)
+        {
+            isSet = true;
+            current = rs.current.get(idx);
+        }
+    }
+
+    @Override
+    public ByteBuffer getOutput(ProtocolVersion protocolVersion) throws InvalidRequestException
     {
         return current;
     }
 
+    @Override
     public void reset()
     {
+        isSet = false;
         current = null;
     }
 
+    @Override
     public AbstractType<?> getType()
     {
-        return type;
+        return column.type;
     }
 
     @Override
     public String toString()
     {
-        return columnName;
+        return column.name.toString();
     }
 
-    private SimpleSelector(String columnName, int idx, AbstractType<?> type)
+    private SimpleSelector(ColumnMetadata column, int idx)
     {
-        this.columnName = columnName;
+        this.column = column;
         this.idx = idx;
-        this.type = type;
     }
 }

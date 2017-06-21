@@ -24,34 +24,45 @@ package org.apache.cassandra.stress.operations.userdefined;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.Statement;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.stress.generate.Distribution;
-import org.apache.cassandra.stress.generate.Partition;
-import org.apache.cassandra.stress.generate.PartitionGenerator;
-import org.apache.cassandra.stress.generate.RatioDistribution;
-import org.apache.cassandra.stress.generate.Row;
+import org.apache.cassandra.io.sstable.StressCQLSSTableWriter;
+import org.apache.cassandra.stress.WorkManager;
+import org.apache.cassandra.stress.generate.*;
+import org.apache.cassandra.stress.report.Timer;
 import org.apache.cassandra.stress.settings.StressSettings;
-import org.apache.cassandra.stress.settings.ValidationType;
 import org.apache.cassandra.stress.util.JavaDriverClient;
-import org.apache.cassandra.stress.util.ThriftClient;
-import org.apache.cassandra.stress.util.Timer;
 
 public class SchemaInsert extends SchemaStatement
 {
 
+    private final String tableSchema;
+    private final String insertStatement;
     private final BatchStatement.Type batchType;
-    private final RatioDistribution selectChance;
 
-    public SchemaInsert(Timer timer, PartitionGenerator generator, StressSettings settings, Distribution batchSize, RatioDistribution selectChance, Integer thriftId, PreparedStatement statement, ConsistencyLevel cl, BatchStatement.Type batchType)
+    public SchemaInsert(Timer timer, StressSettings settings, PartitionGenerator generator, SeedManager seedManager, Distribution batchSize, RatioDistribution useRatio, RatioDistribution rowPopulation, PreparedStatement statement, ConsistencyLevel cl, BatchStatement.Type batchType)
     {
-        super(timer, generator, settings, batchSize, statement, thriftId, cl, ValidationType.NOT_FAIL);
+        super(timer, settings, new DataSpec(generator, seedManager, batchSize, useRatio, rowPopulation), statement, statement.getVariables().asList().stream().map(d -> d.getName()).collect(Collectors.toList()), cl);
         this.batchType = batchType;
-        this.selectChance = selectChance;
+        this.insertStatement = null;
+        this.tableSchema = null;
+    }
+
+    /**
+     * Special constructor for offline use
+     */
+    public SchemaInsert(Timer timer, StressSettings settings, PartitionGenerator generator, SeedManager seedManager, RatioDistribution useRatio, RatioDistribution rowPopulation, String statement, String tableSchema)
+    {
+        super(timer, settings, new DataSpec(generator, seedManager, new DistributionFixed(1), useRatio, rowPopulation), null, generator.getColumnNames(), ConsistencyLevel.ONE);
+        this.batchType = BatchStatement.Type.UNLOGGED;
+        this.insertStatement = statement;
+        this.tableSchema = tableSchema;
     }
 
     private class JavaDriverRun extends Runner
@@ -65,20 +76,13 @@ public class SchemaInsert extends SchemaStatement
 
         public boolean run() throws Exception
         {
-            Partition.RowIterator[] iterators = new Partition.RowIterator[partitions.size()];
-            for (int i = 0 ; i < iterators.length ; i++)
-                iterators[i] = partitions.get(i).iterator(selectChance.next(), true);
             List<BoundStatement> stmts = new ArrayList<>();
             partitionCount = partitions.size();
 
-            for (Partition.RowIterator iterator : iterators)
-            {
-                if (iterator.done())
-                    continue;
+            for (PartitionIterator iterator : partitions)
+                while (iterator.hasNext())
+                    stmts.add(bindRow(iterator.next()));
 
-                for (Row row : iterator.next())
-                    stmts.add(bindRow(row));
-            }
             rowCount += stmts.size();
 
             // 65535 is max number of stmts per batch, so if we have more, we need to manually batch them
@@ -98,53 +102,32 @@ public class SchemaInsert extends SchemaStatement
                     stmt = batch;
                 }
 
-                try
-                {
-                    validate(client.getSession().execute(stmt));
-                }
-                catch (ClassCastException e)
-                {
-                    e.printStackTrace();
-                }
+                client.getSession().execute(stmt);
             }
-
-            for (Partition.RowIterator iterator : iterators)
-                iterator.markWriteFinished();
-
             return true;
         }
     }
 
-    private class ThriftRun extends Runner
+    private class OfflineRun extends Runner
     {
-        final ThriftClient client;
+        final StressCQLSSTableWriter writer;
 
-        private ThriftRun(ThriftClient client)
+        OfflineRun(StressCQLSSTableWriter writer)
         {
-            this.client = client;
+            this.writer = writer;
         }
 
         public boolean run() throws Exception
         {
-            Partition.RowIterator[] iterators = new Partition.RowIterator[partitions.size()];
-            for (int i = 0 ; i < iterators.length ; i++)
-                iterators[i] = partitions.get(i).iterator(selectChance.next(), true);
-            partitionCount = partitions.size();
-
-            for (Partition.RowIterator iterator : iterators)
+            for (PartitionIterator iterator : partitions)
             {
-                if (iterator.done())
-                    continue;
-
-                for (Row row : iterator.next())
+                while (iterator.hasNext())
                 {
-                    validate(client.execute_prepared_cql3_query(thriftId, iterator.partition().getToken(), thriftRowArgs(row), settings.command.consistencyLevel));
+                    Row row = iterator.next();
+                    writer.rawAddRow(rowArgs(row));
                     rowCount += 1;
                 }
             }
-
-            for (Partition.RowIterator iterator : iterators)
-                iterator.markWriteFinished();
 
             return true;
         }
@@ -161,10 +144,27 @@ public class SchemaInsert extends SchemaStatement
         return true;
     }
 
-    @Override
-    public void run(ThriftClient client) throws IOException
+    public StressCQLSSTableWriter createWriter(ColumnFamilyStore cfs, int bufferSize, boolean makeRangeAware)
     {
-        timeWithRetry(new ThriftRun(client));
+        return StressCQLSSTableWriter.builder()
+                               .withCfs(cfs)
+                               .withBufferSizeInMB(bufferSize)
+                               .forTable(tableSchema)
+                               .using(insertStatement)
+                               .rangeAware(makeRangeAware)
+                               .build();
     }
 
+    public void runOffline(StressCQLSSTableWriter writer, WorkManager workManager) throws Exception
+    {
+        OfflineRun offline = new OfflineRun(writer);
+
+        while (true)
+        {
+            if (ready(workManager) == 0)
+                break;
+
+            offline.run();
+        }
+    }
 }

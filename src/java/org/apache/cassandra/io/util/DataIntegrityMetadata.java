@@ -17,22 +17,16 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.BufferedWriter;
 import java.io.Closeable;
-import java.io.DataOutput;
 import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.util.zip.Adler32;
+import java.util.zip.CheckedInputStream;
 import java.util.zip.Checksum;
 
-import com.google.common.base.Charsets;
-
-import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.utils.PureJavaCrc32;
+import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.Throwables;
 
 public class DataIntegrityMetadata
 {
@@ -43,16 +37,23 @@ public class DataIntegrityMetadata
 
     public static class ChecksumValidator implements Closeable
     {
-        private final Checksum checksum;
+        private final ChecksumType checksumType;
         private final RandomAccessReader reader;
-        private final Descriptor descriptor;
         public final int chunkSize;
+        private final String dataFilename;
 
         public ChecksumValidator(Descriptor descriptor) throws IOException
         {
-            this.descriptor = descriptor;
-            checksum = descriptor.version.hasAllAdlerChecksums() ? new Adler32() : new PureJavaCrc32();
-            reader = RandomAccessReader.open(new File(descriptor.filenameFor(Component.CRC)));
+            this(ChecksumType.CRC32,
+                 RandomAccessReader.open(new File(descriptor.filenameFor(Component.CRC))),
+                 descriptor.filenameFor(Component.DATA));
+        }
+
+        public ChecksumValidator(ChecksumType checksumType, RandomAccessReader reader, String dataFilename) throws IOException
+        {
+            this.checksumType = checksumType;
+            this.reader = reader;
+            this.dataFilename = dataFilename;
             chunkSize = reader.readInt();
         }
 
@@ -70,12 +71,10 @@ public class DataIntegrityMetadata
 
         public void validate(byte[] bytes, int start, int end) throws IOException
         {
-            checksum.update(bytes, start, end);
-            int current = (int) checksum.getValue();
-            checksum.reset();
+            int current = (int) checksumType.of(bytes, start, end);
             int actual = reader.readInt();
             if (current != actual)
-                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
+                throw new IOException("Corrupted File : " + dataFilename);
         }
 
         public void close()
@@ -84,62 +83,55 @@ public class DataIntegrityMetadata
         }
     }
 
-    public static class ChecksumWriter
+    public static FileDigestValidator fileDigestValidator(Descriptor desc) throws IOException
     {
-        private final Checksum incrementalChecksum = new Adler32();
-        private final DataOutput incrementalOut;
-        private final Checksum fullChecksum = new Adler32();
+        return new FileDigestValidator(desc);
+    }
 
-        public ChecksumWriter(DataOutput incrementalOut)
-        {
-            this.incrementalOut = incrementalOut;
-        }
+    public static class FileDigestValidator implements Closeable
+    {
+        private final Checksum checksum;
+        private final RandomAccessReader digestReader;
+        private final RandomAccessReader dataReader;
+        private final Descriptor descriptor;
+        private long storedDigestValue;
 
-        public void writeChunkSize(int length)
+        public FileDigestValidator(Descriptor descriptor) throws IOException
         {
+            this.descriptor = descriptor;
+            checksum = ChecksumType.CRC32.newInstance();
+            digestReader = RandomAccessReader.open(new File(descriptor.filenameFor(Component.DIGEST)));
+            dataReader = RandomAccessReader.open(new File(descriptor.filenameFor(Component.DATA)));
             try
             {
-                incrementalOut.writeInt(length);
+                storedDigestValue = Long.parseLong(digestReader.readLine());
             }
-            catch (IOException e)
+            catch (Exception e)
             {
-                throw new IOError(e);
-            }
-        }
-
-        public void append(byte[] buffer, int start, int end)
-        {
-            try
-            {
-                incrementalChecksum.update(buffer, start, end);
-                incrementalOut.writeInt((int) incrementalChecksum.getValue());
-                incrementalChecksum.reset();
-
-                fullChecksum.update(buffer, start, end);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
+                close();
+                // Attempting to create a FileDigestValidator without a DIGEST file will fail
+                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
             }
         }
 
-        public void writeFullChecksum(Descriptor descriptor)
+        // Validate the entire file
+        public void validate() throws IOException
         {
-            File outFile = new File(descriptor.filenameFor(Component.DIGEST));
-            BufferedWriter out = null;
-            try
+            CheckedInputStream checkedInputStream = new CheckedInputStream(dataReader, checksum);
+            byte[] chunk = new byte[64 * 1024];
+
+            while( checkedInputStream.read(chunk) > 0 ) { }
+            long calculatedDigestValue = checkedInputStream.getChecksum().getValue();
+            if (storedDigestValue != calculatedDigestValue)
             {
-                out = Files.newBufferedWriter(outFile.toPath(), Charsets.UTF_8);
-                out.write(String.valueOf(fullChecksum.getValue()));
+                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
             }
-            catch (IOException e)
-            {
-                throw new FSWriteError(e, outFile);
-            }
-            finally
-            {
-                FileUtils.closeQuietly(out);
-            }
+        }
+
+        public void close()
+        {
+            Throwables.perform(digestReader::close,
+                               dataReader::close);
         }
     }
 }

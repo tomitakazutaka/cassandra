@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,38 +15,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.stress;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 
-import org.apache.cassandra.stress.generate.Distribution;
-import org.apache.cassandra.stress.generate.Partition;
-import org.apache.cassandra.stress.generate.PartitionGenerator;
-import org.apache.cassandra.stress.settings.*;
+import org.apache.cassandra.stress.report.Timer;
+import org.apache.cassandra.stress.settings.SettingsLog;
+import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.stress.util.JavaDriverClient;
-import org.apache.cassandra.stress.util.ThriftClient;
-import org.apache.cassandra.stress.util.Timer;
-import org.apache.cassandra.thrift.InvalidRequestException;
 import org.apache.cassandra.transport.SimpleClient;
 
 public abstract class Operation
 {
     public final StressSettings settings;
-    public final Timer timer;
-    public final PartitionGenerator generator;
-    public final Distribution partitionCount;
+    private final Timer timer;
 
-    protected List<Partition> partitions;
-
-    public Operation(Timer timer, PartitionGenerator generator, StressSettings settings, Distribution partitionCount)
+    public Operation(Timer timer, StressSettings settings)
     {
-        this.generator = generator;
         this.timer = timer;
         this.settings = settings;
-        this.partitionCount = partitionCount;
     }
 
     public static interface RunOp
@@ -56,32 +44,24 @@ public abstract class Operation
         public int rowCount();
     }
 
-    protected void setPartitions(List<Partition> partitions)
-    {
-        this.partitions = partitions;
-    }
+    public abstract int ready(WorkManager permits);
 
     public boolean isWrite()
     {
         return false;
     }
 
-    /**
-     * Run operation
-     * @param client Cassandra Thrift client connection
-     * @throws IOException on any I/O error.
-     */
-    public abstract void run(ThriftClient client) throws IOException;
-
-    public void run(SimpleClient client) throws IOException {
+    public void run(SimpleClient client) throws IOException
+    {
         throw new UnsupportedOperationException();
     }
 
-    public void run(JavaDriverClient client) throws IOException {
+    public void run(JavaDriverClient client) throws IOException
+    {
         throw new UnsupportedOperationException();
     }
 
-    public void timeWithRetry(RunOp run) throws IOException
+    public final void timeWithRetry(RunOp run) throws IOException
     {
         timer.start();
 
@@ -118,7 +98,7 @@ public abstract class Operation
             }
         }
 
-        timer.stop(run.partitionCount(), run.rowCount());
+        timer.stop(run.partitionCount(), run.rowCount(), !success);
 
         if (!success)
         {
@@ -132,18 +112,12 @@ public abstract class Operation
 
     }
 
-    private String key()
-    {
-        List<String> keys = new ArrayList<>();
-        for (Partition partition : partitions)
-            keys.add(partition.getKeyAsString());
-        return keys.toString();
-    }
+    public abstract String key();
 
     protected String getExceptionMessage(Exception e)
     {
         String className = e.getClass().getSimpleName();
-        String message = (e instanceof InvalidRequestException) ? ((InvalidRequestException) e).getWhy() : e.getMessage();
+        String message = e.getMessage();
         return (message == null) ? "(" + className + ")" : String.format("(%s): %s", className, message);
     }
 
@@ -155,4 +129,8 @@ public abstract class Operation
             System.err.println(message);
     }
 
+    public void intendedStartNs(long intendedTime)
+    {
+        timer.intendedTimeNs(intendedTime);
+    }
 }

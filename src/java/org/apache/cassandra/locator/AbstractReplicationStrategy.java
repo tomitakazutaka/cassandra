@@ -18,6 +18,7 @@
 package org.apache.cassandra.locator;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
 import java.util.*;
 
@@ -27,6 +28,7 @@ import com.google.common.collect.Multimap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.WriteType;
@@ -39,6 +41,7 @@ import org.apache.cassandra.service.DatacenterSyncWriteResponseHandler;
 import org.apache.cassandra.service.DatacenterWriteResponseHandler;
 import org.apache.cassandra.service.WriteResponseHandler;
 import org.apache.cassandra.utils.FBUtilities;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 /**
@@ -59,7 +62,7 @@ public abstract class AbstractReplicationStrategy
 
     public IEndpointSnitch snitch;
 
-    AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+    protected AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
         assert keyspaceName != null;
         assert snitch != null;
@@ -83,7 +86,7 @@ public abstract class AbstractReplicationStrategy
             {
                 if (lastVersion > lastInvalidatedVersion)
                 {
-                    logger.debug("clearing cached endpoints");
+                    logger.trace("clearing cached endpoints");
                     cachedEndpoints.clear();
                     lastInvalidatedVersion = lastVersion;
                 }
@@ -127,18 +130,64 @@ public abstract class AbstractReplicationStrategy
      */
     public abstract List<InetAddress> calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata);
 
-    public AbstractWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> naturalEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistency_level, Runnable callback, WriteType writeType)
+    public <T> AbstractWriteResponseHandler<T> getWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
+                                                                       Collection<InetAddress> pendingEndpoints,
+                                                                       ConsistencyLevel consistency_level,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime)
     {
+        return getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, callback, writeType, queryStartNanoTime, DatabaseDescriptor.getIdealConsistencyLevel());
+    }
+
+    public <T> AbstractWriteResponseHandler<T> getWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
+                                                                       Collection<InetAddress> pendingEndpoints,
+                                                                       ConsistencyLevel consistency_level,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime,
+                                                                       ConsistencyLevel idealConsistencyLevel)
+    {
+        AbstractWriteResponseHandler resultResponseHandler;
         if (consistency_level.isDatacenterLocal())
         {
             // block for in this context will be localnodes block.
-            return new DatacenterWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+            resultResponseHandler = new DatacenterWriteResponseHandler<T>(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);
         }
         else if (consistency_level == ConsistencyLevel.EACH_QUORUM && (this instanceof NetworkTopologyStrategy))
         {
-            return new DatacenterSyncWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+            resultResponseHandler = new DatacenterSyncWriteResponseHandler<T>(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);
         }
-        return new WriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+        else
+        {
+            resultResponseHandler = new WriteResponseHandler<T>(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);
+        }
+
+        //Check if tracking the ideal consistency level is configured
+        if (idealConsistencyLevel != null)
+        {
+            //If ideal and requested are the same just use this handler to track the ideal consistency level
+            //This is also used so that the ideal consistency level handler when constructed knows it is the ideal
+            //one for tracking purposes
+            if (idealConsistencyLevel == consistency_level)
+            {
+                resultResponseHandler.setIdealCLResponseHandler(resultResponseHandler);
+            }
+            else
+            {
+                //Construct a delegate response handler to use to track the ideal consistency level
+                AbstractWriteResponseHandler idealHandler = getWriteResponseHandler(naturalEndpoints,
+                                                                                    pendingEndpoints,
+                                                                                    idealConsistencyLevel,
+                                                                                    callback,
+                                                                                    writeType,
+                                                                                    queryStartNanoTime,
+                                                                                    idealConsistencyLevel);
+                resultResponseHandler.setIdealCLResponseHandler(idealHandler);
+            }
+        }
+
+        return resultResponseHandler;
     }
 
     private Keyspace getKeyspace()
@@ -238,6 +287,11 @@ public abstract class AbstractReplicationStrategy
             Constructor<? extends AbstractReplicationStrategy> constructor = strategyClass.getConstructor(parameterTypes);
             strategy = constructor.newInstance(keyspaceName, tokenMetadata, snitch, strategyOptions);
         }
+        catch (InvocationTargetException e)
+        {
+            Throwable targetException = e.getTargetException();
+            throw new ConfigurationException(targetException.getMessage(), targetException);
+        }
         catch (Exception e)
         {
             throw new ConfigurationException("Error constructing replication strategy class", e);
@@ -251,28 +305,20 @@ public abstract class AbstractReplicationStrategy
                                                                         IEndpointSnitch snitch,
                                                                         Map<String, String> strategyOptions)
     {
+        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
+
+        // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
         try
         {
-            AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
-
-            // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
-            try
-            {
-                strategy.validateExpectedOptions();
-            }
-            catch (ConfigurationException e)
-            {
-                logger.warn("Ignoring {}", e.getMessage());
-            }
-
-            strategy.validateOptions();
-            return strategy;
+            strategy.validateExpectedOptions();
         }
         catch (ConfigurationException e)
         {
-            // If that happens at this point, there is nothing we can do about it.
-            throw new RuntimeException(e);
+            logger.warn("Ignoring {}", e.getMessage());
         }
+
+        strategy.validateOptions();
+        return strategy;
     }
 
     public static void validateReplicationStrategy(String keyspaceName,
@@ -297,6 +343,11 @@ public abstract class AbstractReplicationStrategy
         return strategyClass;
     }
 
+    public boolean hasSameSettings(AbstractReplicationStrategy other)
+    {
+        return getClass().equals(other.getClass()) && getReplicationFactor() == other.getReplicationFactor();
+    }
+
     protected void validateReplicationFactor(String rf) throws ConfigurationException
     {
         try
@@ -312,7 +363,7 @@ public abstract class AbstractReplicationStrategy
         }
     }
 
-    private void validateExpectedOptions() throws ConfigurationException
+    protected void validateExpectedOptions() throws ConfigurationException
     {
         Collection expectedOptions = recognizedOptions();
         if (expectedOptions == null)

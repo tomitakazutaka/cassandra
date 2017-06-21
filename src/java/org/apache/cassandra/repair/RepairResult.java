@@ -19,6 +19,9 @@ package org.apache.cassandra.repair;
 
 import java.util.List;
 
+/**
+ * RepairJob's result
+ */
 public class RepairResult
 {
     public final RepairJobDesc desc;

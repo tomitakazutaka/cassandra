@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
  *
  * <p>The typical usage is something like:
  * <pre>
+ * {@code
      public final class ExampleShared
      {
         final OpOrder order = new OpOrder();
@@ -73,6 +74,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
             }
         }
     }
+ * }
  * </pre>
  */
 public class OpOrder
@@ -420,7 +422,7 @@ public class OpOrder
         }
 
         /**
-         * returns the Group we are waiting on - any Group with .compareTo(getSyncPoint()) <= 0
+         * returns the Group we are waiting on - any Group with {@code .compareTo(getSyncPoint()) <= 0}
          * must complete before await() returns
          */
         public Group getSyncPoint()

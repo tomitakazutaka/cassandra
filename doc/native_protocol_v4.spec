@@ -37,8 +37,8 @@ Table of Contents
       4.2.7. AUTH_CHALLENGE
       4.2.8. AUTH_SUCCESS
   5. Compression
-  6. Collection types
-  7. User Defined and tuple types
+  6. Data Type Serialization Formats
+  7. User Defined Type Serialization
   8. Result paging
   9. Error codes
   10. Changes from v3
@@ -65,20 +65,19 @@ Table of Contents
   Each frame contains a fixed size header (9 bytes) followed by a variable size
   body. The header is described in Section 2. The content of the body depends
   on the header opcode value (the body can in particular be empty for some
-  opcode values). The list of allowed opcode is defined Section 2.3 and the
-  details of each corresponding message is described Section 4.
+  opcode values). The list of allowed opcodes is defined in Section 2.4 and the
+  details of each corresponding message are described Section 4.
 
-  The protocol distinguishes 2 types of frames: requests and responses. Requests
-  are those frame sent by the clients to the server, response are the ones sent
-  by the server. Note however that the protocol supports server pushes (events)
-  so responses does not necessarily come right after a client request.
+  The protocol distinguishes two types of frames: requests and responses. Requests
+  are those frames sent by the client to the server. Responses are those frames sent
+  by the server to the client. Note, however, that the protocol supports server pushes
+  (events) so a response does not necessarily come right after a client request.
 
-  Note to client implementors: clients library should always assume that the
+  Note to client implementors: client libraries should always assume that the
   body of a given frame may contain more data than what is described in this
-  document. It will however always be safe to ignore the remaining of the frame
-  body in such cases. The reason is that this may allow to sometimes extend the
-  protocol with optional features without needing to change the protocol
-  version.
+  document. It will however always be safe to ignore the remainder of the frame
+  body in such cases. The reason is that this may enable extending the protocol
+  with optional features without needing to change the protocol version.
 
 
 
@@ -86,46 +85,58 @@ Table of Contents
 
 2.1. version
 
-  The version is a single byte that indicate both the direction of the message
-  (request or response) and the version of the protocol in use. The up-most bit
-  of version is used to define the direction of the message: 0 indicates a
-  request, 1 indicates a responses. This can be useful for protocol analyzers to
-  distinguish the nature of the packet from the direction which it is moving.
-  The rest of that byte is the protocol version (4 for the protocol defined in
-  this document). In other words, for this version of the protocol, version will
-  have one of:
+  The version is a single byte that indicates both the direction of the message
+  (request or response) and the version of the protocol in use. The most
+  significant bit of version is used to define the direction of the message:
+  0 indicates a request, 1 indicates a response. This can be useful for protocol
+  analyzers to distinguish the nature of the packet from the direction in which
+  it is moving. The rest of that byte is the protocol version (4 for the protocol
+  defined in this document). In other words, for this version of the protocol,
+  version will be one of:
     0x04    Request frame for this protocol version
     0x84    Response frame for this protocol version
 
-  Please note that the while every message ship with the version, only one version
+  Please note that while every message ships with the version, only one version
   of messages is accepted on a given connection. In other words, the first message
   exchanged (STARTUP) sets the version for the connection for the lifetime of this
   connection.
 
-  This document describe the version 3 of the protocol. For the changes made since
+  This document describes version 4 of the protocol. For the changes made since
   version 3, see Section 10.
 
 
 2.2. flags
 
   Flags applying to this frame. The flags have the following meaning (described
-  by the mask that allow to select them):
+  by the mask that allows selecting them):
     0x01: Compression flag. If set, the frame body is compressed. The actual
           compression to use should have been set up beforehand through the
           Startup message (which thus cannot be compressed; Section 4.1.1).
-    0x02: Tracing flag. For a request frame, this indicate the client requires
-          tracing of the request. Note that not all requests support tracing.
-          Currently, only QUERY, PREPARE and EXECUTE queries support tracing.
-          Other requests will simply ignore the tracing flag if set. If a
-          request support tracing and the tracing flag was set, the response to
-          this request will have the tracing flag set and contain tracing
+    0x02: Tracing flag. For a request frame, this indicates the client requires
+          tracing of the request. Note that only QUERY, PREPARE and EXECUTE queries
+          support tracing. Other requests will simply ignore the tracing flag if 
+          set. If a request supports tracing and the tracing flag is set, the response
+          to this request will have the tracing flag set and contain tracing
           information.
           If a response frame has the tracing flag set, its body contains
           a tracing ID. The tracing ID is a [uuid] and is the first thing in
           the frame body. The rest of the body will then be the usual body
           corresponding to the response opcode.
+    0x04: Custom payload flag. For a request or response frame, this indicates
+          that a generic key-value custom payload for a custom QueryHandler
+          implementation is present in the frame. Such a custom payload is simply
+          ignored by the default QueryHandler implementation.
+          Currently, only QUERY, PREPARE, EXECUTE and BATCH requests support
+          payload.
+          Type of custom payload is [bytes map] (see below).
+    0x08: Warning flag. The response contains warnings which were generated by the
+          server to go along with this response.
+          If a response frame has the warning flag set, its body will contain the
+          text of the warnings. The warnings are a [string list] and will be the
+          first value in the frame body if the tracing flag is not set, or directly
+          after the tracing ID if it is.
 
-  The rest of the flags is currently unused and ignored.
+  The rest of flags is currently unused and ignored.
 
 2.3. stream
 
@@ -136,24 +147,23 @@ Table of Contents
   with the stream id X, it is guaranteed that the stream id of the response to
   that message will be X.
 
-  This allow to deal with the asynchronous nature of the protocol. If a client
+  This helps to enable the asynchronous nature of the protocol. If a client
   sends multiple messages simultaneously (without waiting for responses), there
   is no guarantee on the order of the responses. For instance, if the client
   writes REQ_1, REQ_2, REQ_3 on the wire (in that order), the server might
-  respond to REQ_3 (or REQ_2) first. Assigning different stream id to these 3
-  requests allows the client to distinguish to which request an received answer
-  respond to. As there can only be 32768 different simultaneous streams, it is up
+  respond to REQ_3 (or REQ_2) first. Assigning different stream ids to these 3
+  requests allows the client to distinguish to which request a received answer
+  responds to. As there can only be 32768 different simultaneous streams, it is up
   to the client to reuse stream id.
 
   Note that clients are free to use the protocol synchronously (i.e. wait for
   the response to REQ_N before sending REQ_N+1). In that case, the stream id
   can be safely set to 0. Clients should also feel free to use only a subset of
-  the 32768 maximum possible stream ids if it is simpler for those
-  implementation.
+  the 32768 maximum possible stream ids if it is simpler for its implementation.
 
 2.4. opcode
 
-  An integer byte that distinguish the actual message:
+  An integer byte that distinguishes the actual message:
     0x00    ERROR
     0x01    STARTUP
     0x02    READY
@@ -197,6 +207,11 @@ Table of Contents
     [string list]  A [short] n, followed by n [string].
     [bytes]        A [int] n, followed by n bytes if n >= 0. If n < 0,
                    no byte should follow and the value represented is `null`.
+    [value]        A [int] n, followed by n bytes if n >= 0.
+                   If n == -1 no byte should follow and the value represented is `null`.
+                   If n == -2 no byte should follow and the value represented is
+                   `not set` not resulting in any change to the existing value.
+                   n < -2 is an invalid value and results in an error.
     [short bytes]  A [short] n, followed by n bytes if n >= 0.
 
     [option]       A pair of <id><value> where <id> is a [short] representing
@@ -228,6 +243,8 @@ Table of Contents
                       are [string].
     [string multimap] A [short] n, followed by n pair <k><v> where <k> is a
                       [string] and <v> is a [string list].
+    [bytes map]       A [short] n, followed by n pair <k><v> where <k> is a
+                      [string] and <v> is a [bytes].
 
 
 4. Messages
@@ -246,14 +263,14 @@ Table of Contents
   This must be the first message of the connection, except for OPTIONS that can
   be sent before to find out the options supported by the server. Once the
   connection has been initialized, a client should not send any more STARTUP
-  message.
+  messages.
 
   The body is a [string map] of options. Possible options are:
     - "CQL_VERSION": the version of CQL to use. This option is mandatory and
-      currenty, the only version supported is "3.0.0". Note that this is
+      currently the only version supported is "3.0.0". Note that this is
       different from the protocol version.
     - "COMPRESSION": the compression algorithm to use for frames (See section 5).
-      This is optional, if not specified no compression will be used.
+      This is optional; if not specified no compression will be used.
 
 
 4.1.2. AUTH_RESPONSE
@@ -261,10 +278,10 @@ Table of Contents
   Answers a server authentication challenge.
 
   Authentication in the protocol is SASL based. The server sends authentication
-  challenges (a bytes token) to which the client answer with this message. Those
+  challenges (a bytes token) to which the client answers with this message. Those
   exchanges continue until the server accepts the authentication by sending a
-  AUTH_SUCCESS message after a client AUTH_RESPONSE. It is however that client that
-  initiate the exchange by sending an initial AUTH_RESPONSE in response to a
+  AUTH_SUCCESS message after a client AUTH_RESPONSE. Note that the exchange
+  begins with the client sending an initial AUTH_RESPONSE in response to a
   server AUTHENTICATE request.
 
   The body of this message is a single [bytes] token. The details of what this
@@ -277,7 +294,7 @@ Table of Contents
 
 4.1.3. OPTIONS
 
-  Asks the server to return what STARTUP options are supported. The body of an
+  Asks the server to return which STARTUP options are supported. The body of an
   OPTIONS message should be empty and the server will respond with a SUPPORTED
   message.
 
@@ -294,34 +311,33 @@ Table of Contents
     - <flags> is a [byte] whose bits define the options for this query and
       in particular influence what the remainder of the message contains.
       A flag is set if the bit corresponding to its `mask` is set. Supported
-      flags are, given there mask:
-        0x01: Values. In that case, a [short] <n> followed by <n> [bytes]
-              values are provided. Those value are used for bound variables in
+      flags are, given their mask:
+        0x01: Values. If set, a [short] <n> followed by <n> [value]
+              values are provided. Those values are used for bound variables in
               the query. Optionally, if the 0x40 flag is present, each value
               will be preceded by a [string] name, representing the name of
-              the marker the value must be binded to. This is optional, and
-              if not present, values will be binded by position.
-        0x02: Skip_metadata. If present, the Result Set returned as a response
-              to that query (if any) will have the NO_METADATA flag (see
+              the marker the value must be bound to.
+        0x02: Skip_metadata. If set, the Result Set returned as a response
+              to the query (if any) will have the NO_METADATA flag (see
               Section 4.2.5.2).
-        0x04: Page_size. In that case, <result_page_size> is an [int]
+        0x04: Page_size. If set, <result_page_size> is an [int]
               controlling the desired page size of the result (in CQL3 rows).
               See the section on paging (Section 8) for more details.
-        0x08: With_paging_state. If present, <paging_state> should be present.
+        0x08: With_paging_state. If set, <paging_state> should be present.
               <paging_state> is a [bytes] value that should have been returned
-              in a result set (Section 4.2.5.2). If provided, the query will be
-              executed but starting from a given paging state. This also to
-              continue paging on a different node from the one it has been
+              in a result set (Section 4.2.5.2). The query will be
+              executed but starting from a given paging state. This is also to
+              continue paging on a different node than the one where it
               started (See Section 8 for more details).
-        0x10: With serial consistency. If present, <serial_consistency> should be
+        0x10: With serial consistency. If set, <serial_consistency> should be
               present. <serial_consistency> is the [consistency] level for the
               serial phase of conditional updates. That consitency can only be
               either SERIAL or LOCAL_SERIAL and if not present, it defaults to
-              SERIAL. This option will be ignored for anything else that a
+              SERIAL. This option will be ignored for anything else other than a
               conditional update/insert.
-        0x20: With default timestamp. If present, <timestamp> should be present.
+        0x20: With default timestamp. If set, <timestamp> should be present.
               <timestamp> is a [long] representing the default timestamp for the query
-              in microseconds (negative values are forbidden). If provided, this will
+              in microseconds (negative values are forbidden). This will
               replace the server side assigned timestamp as default timestamp.
               Note that a timestamp in the query itself will still override
               this timestamp. This is entirely optional.
@@ -355,7 +371,7 @@ Table of Contents
     <id><query_parameters>
   where <id> is the prepared query ID. It's the [short bytes] returned as a
   response to a PREPARE message. As for <query_parameters>, it has the exact
-  same definition than in QUERY (see Section 4.1.4).
+  same definition as in QUERY (see Section 4.1.4).
 
   The response from the server will be a RESULT message.
 
@@ -374,25 +390,29 @@ Table of Contents
         - If <type> == 2, the batch will be a "counter" batch (and non-counter
           statements will be rejected).
     - <flags> is a [byte] whose bits define the options for this query and
-      in particular influence the remainder of the message contains. It is similar
+      in particular influence what the remainder of the message contains. It is similar
       to the <flags> from QUERY and EXECUTE methods, except that the 4 rightmost
-      bits must always be 0 as their corresponding option do not make sense for
+      bits must always be 0 as their corresponding options do not make sense for
       Batch. A flag is set if the bit corresponding to its `mask` is set. Supported
-      flags are, given there mask:
-        0x10: With serial consistency. If present, <serial_consistency> should be
+      flags are, given their mask:
+        0x10: With serial consistency. If set, <serial_consistency> should be
               present. <serial_consistency> is the [consistency] level for the
-              serial phase of conditional updates. That consitency can only be
+              serial phase of conditional updates. That consistency can only be
               either SERIAL or LOCAL_SERIAL and if not present, it defaults to
-              SERIAL. This option will be ignored for anything else that a
+              SERIAL. This option will be ignored for anything else other than a
               conditional update/insert.
-        0x20: With default timestamp. If present, <timestamp> should be present.
+        0x20: With default timestamp. If set, <timestamp> should be present.
               <timestamp> is a [long] representing the default timestamp for the query
-              in microseconds. If provided, this will replace the server side assigned
+              in microseconds. This will replace the server side assigned
               timestamp as default timestamp. Note that a timestamp in the query itself
               will still override this timestamp. This is entirely optional.
         0x40: With names for values. If set, then all values for all <query_i> must be
               preceded by a [string] <name_i> that have the same meaning as in QUERY
-              requests.
+              requests [IMPORTANT NOTE: this feature does not work and should not be
+              used. It is specified in a way that makes it impossible for the server
+              to implement. This will be fixed in a future version of the native
+              protocol. See https://issues.apache.org/jira/browse/CASSANDRA-10246 for
+              more details].
     - <n> is a [short] indicating the number of following queries.
     - <query_1>...<query_n> are the queries to execute. A <query_i> must be of the
       form:
@@ -407,22 +427,22 @@ Table of Contents
        - <n> is a [short] indicating the number (possibly 0) of following values.
        - <name_i> is the optional name of the following <value_i>. It must be present
          if and only if the 0x40 flag is provided for the batch.
-       - <value_i> is the [bytes] to use for bound variable i (of bound variable <name_i>
+       - <value_i> is the [value] to use for bound variable i (of bound variable <name_i>
          if the 0x40 flag is used).
     - <consistency> is the [consistency] level for the operation.
     - <serial_consistency> is only present if the 0x10 flag is set. In that case,
       <serial_consistency> is the [consistency] level for the serial phase of
       conditional updates. That consitency can only be either SERIAL or
       LOCAL_SERIAL and if not present will defaults to SERIAL. This option will
-      be ignored for anything else that a conditional update/insert.
+      be ignored for anything else other than a conditional update/insert.
 
   The server will respond with a RESULT message.
 
 
 4.1.8. REGISTER
 
-  Register this connection to receive some type of events. The body of the
-  message is a [string list] representing the event types to register to. See
+  Register this connection to receive some types of events. The body of the
+  message is a [string list] representing the event types to register for. See
   section 4.2.6 for the list of valid event types.
 
   The response to a REGISTER message will be a READY message.
@@ -453,21 +473,22 @@ Table of Contents
 
   Indicates that the server is ready to process queries. This message will be
   sent by the server either after a STARTUP message if no authentication is
-  required, or after a successful CREDENTIALS message.
+  required (if authentication is required, the server indicates readiness by
+  sending a AUTH_RESPONSE message).
 
   The body of a READY message is empty.
 
 
 4.2.3. AUTHENTICATE
 
-  Indicates that the server require authentication, and which authentication
+  Indicates that the server requires authentication, and which authentication
   mechanism to use.
 
-  The authentication is SASL based and thus consists on a number of server
+  The authentication is SASL based and thus consists of a number of server
   challenges (AUTH_CHALLENGE, Section 4.2.7) followed by client responses
-  (AUTH_RESPONSE, Section 4.1.2). The Initial exchange is however boostrapped
+  (AUTH_RESPONSE, Section 4.1.2). The initial exchange is however boostrapped
   by an initial client response. The details of that exchange (including how
-  much challenge-response pair are required) are specific to the authenticator
+  many challenge-response pairs are required) are specific to the authenticator
   in use. The exchange ends when the server sends an AUTH_SUCCESS message or
   an ERROR message.
 
@@ -511,52 +532,52 @@ Table of Contents
 
 4.2.5.2. Rows
 
-  Indicates a set of rows. The rest of body of a Rows result is:
+  Indicates a set of rows. The rest of the body of a Rows result is:
     <metadata><rows_count><rows_content>
   where:
     - <metadata> is composed of:
         <flags><columns_count>[<paging_state>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
       where:
         - <flags> is an [int]. The bits of <flags> provides information on the
-          formatting of the remaining informations. A flag is set if the bit
-          corresponding to its `mask` is set. Supported flags are, given there
+          formatting of the remaining information. A flag is set if the bit
+          corresponding to its `mask` is set. Supported flags are, given their
           mask:
             0x0001    Global_tables_spec: if set, only one table spec (keyspace
                       and table name) is provided as <global_table_spec>. If not
                       set, <global_table_spec> is not present.
             0x0002    Has_more_pages: indicates whether this is not the last
-                      page of results and more should be retrieve. If set, the
+                      page of results and more should be retrieved. If set, the
                       <paging_state> will be present. The <paging_state> is a
                       [bytes] value that should be used in QUERY/EXECUTE to
-                      continue paging and retrieve the remained of the result for
+                      continue paging and retrieve the remainder of the result for
                       this query (See Section 8 for more details).
             0x0004    No_metadata: if set, the <metadata> is only composed of
                       these <flags>, the <column_count> and optionally the
-                      <paging_state> (depending on the Has_more_pages flage) but
+                      <paging_state> (depending on the Has_more_pages flag) but
                       no other information (so no <global_table_spec> nor <col_spec_i>).
                       This will only ever be the case if this was requested
                       during the query (see QUERY and RESULT messages).
         - <columns_count> is an [int] representing the number of columns selected
-          by the query this result is of. It defines the number of <col_spec_i>
-          elements in and the number of element for each row in <rows_content>.
+          by the query that produced this result. It defines the number of <col_spec_i>
+          elements in and the number of elements for each row in <rows_content>.
         - <global_table_spec> is present if the Global_tables_spec is set in
-          <flags>. If present, it is composed of two [string] representing the
-          (unique) keyspace name and table name the columns return are of.
-        - <col_spec_i> specifies the columns returned in the query. There is
+          <flags>. It is composed of two [string] representing the
+          (unique) keyspace name and table name the columns belong to.
+        - <col_spec_i> specifies the columns returned in the query. There are
           <column_count> such column specifications that are composed of:
             (<ksname><tablename>)?<name><type>
-          The initial <ksname> and <tablename> are two [string] are only present
+          The initial <ksname> and <tablename> are two [string] and are only present
           if the Global_tables_spec flag is not set. The <column_name> is a
-          [string] and <type> is an [option] that correspond to the description
+          [string] and <type> is an [option] that corresponds to the description
           (what this description is depends a bit on the context: in results to
           selects, this will be either the user chosen alias or the selection used
           (often a colum name, but it can be a function call too). In results to
-          a PREPARE, this will be either the name of the bind variable corresponding
+          a PREPARE, this will be either the name of the corresponding bind variable
           or the column name for the variable if it is "anonymous") and type of
           the corresponding result. The option for <type> is either a native
           type (see below), in which case the option has no value, or a
           'custom' type, in which case the value is a [string] representing
-          the full qualified class name of the type represented. Valid option
+          the fully qualified class name of the type represented. Valid option
           ids are:
             0x0000    Custom: the value is a [string], see above.
             0x0001    Ascii
@@ -574,6 +595,10 @@ Table of Contents
             0x000E    Varint
             0x000F    Timeuuid
             0x0010    Inet
+            0x0011    Date
+            0x0012    Time
+            0x0013    Smallint
+            0x0014    Tinyint
             0x0020    List: the value is an [option], representing the type
                             of the elements of the list.
             0x0021    Map: the value is two [option], representing the types of the
@@ -585,15 +610,15 @@ Table of Contents
                               - <ks> is a [string] representing the keyspace name this
                                 UDT is part of.
                               - <udt_name> is a [string] representing the UDT name.
-                              - <n> is a [short] reprensenting the number of fields of
-                                the UDT, and thus the number of <name_i><type_i> pair
+                              - <n> is a [short] representing the number of fields of
+                                the UDT, and thus the number of <name_i><type_i> pairs
                                 following
                               - <name_i> is a [string] representing the name of the
                                 i_th field of the UDT.
                               - <type_i> is an [option] representing the type of the
                                 i_th field of the UDT.
             0x0031    Tuple: the value is <n><type_1>...<type_n> where <n> is a [short]
-                             representing the number of value in the type, and <type_i>
+                             representing the number of values in the type, and <type_i>
                              are [option] representing the type of the i_th component
                              of the tuple
 
@@ -614,26 +639,69 @@ Table of Contents
 
 4.2.5.4. Prepared
 
-  The result to a PREPARE message. The rest of the body of a Prepared result is:
+  The result to a PREPARE message. The body of a Prepared result is:
     <id><metadata><result_metadata>
   where:
     - <id> is [short bytes] representing the prepared query ID.
-    - <metadata> is defined exactly as for a Rows RESULT (See section 4.2.5.2; you
-      can however assume that the Has_more_pages flag is always off) and
-      is the specification for the variable bound in this prepare statement.
-    - <result_metadata> is defined exactly as <metadata> but correspond to the
-      metadata for the resultSet that execute this query will yield. Note that
-      <result_metadata> may be empty (have the No_metadata flag and 0 columns, See
-      section 4.2.5.2) and will be for any query that is not a Select. There is
-      in fact never a guarantee that this will non-empty so client should protect
-      themselves accordingly. The presence of this information is an
-      optimization that allows to later execute the statement that has been
-      prepared without requesting the metadata (Skip_metadata flag in EXECUTE).
-      Clients can safely discard this metadata if they do not want to take
-      advantage of that optimization.
+    - <metadata> is composed of:
+        <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
+      where:
+        - <flags> is an [int]. The bits of <flags> provides information on the
+          formatting of the remaining information. A flag is set if the bit
+          corresponding to its `mask` is set. Supported masks and their flags
+          are:
+            0x0001    Global_tables_spec: if set, only one table spec (keyspace
+                      and table name) is provided as <global_table_spec>. If not
+                      set, <global_table_spec> is not present.
+        - <columns_count> is an [int] representing the number of bind markers
+          in the prepared statement.  It defines the number of <col_spec_i>
+          elements.
+        - <pk_count> is an [int] representing the number of <pk_index_i>
+          elements to follow. If this value is zero, at least one of the
+          partition key columns in the table that the statement acts on
+          did not have a corresponding bind marker (or the bind marker
+          was wrapped in a function call).
+        - <pk_index_i> is a short that represents the index of the bind marker
+          that corresponds to the partition key column in position i.
+          For example, a <pk_index> sequence of [2, 0, 1] indicates that the
+          table has three partition key columns; the full partition key
+          can be constructed by creating a composite of the values for
+          the bind markers at index 2, at index 0, and at index 1.
+          This allows implementations with token-aware routing to correctly
+          construct the partition key without needing to inspect table
+          metadata.
+        - <global_table_spec> is present if the Global_tables_spec is set in
+          <flags>. If present, it is composed of two [string]s. The first
+          [string] is the name of the keyspace that the statement acts on.
+          The second [string] is the name of the table that the columns
+          represented by the bind markers belong to.
+        - <col_spec_i> specifies the bind markers in the prepared statement.
+          There are <column_count> such column specifications, each with the
+          following format:
+            (<ksname><tablename>)?<name><type>
+          The initial <ksname> and <tablename> are two [string] that are only
+          present if the Global_tables_spec flag is not set. The <name> field
+          is a [string] that holds the name of the bind marker (if named),
+          or the name of the column, field, or expression that the bind marker
+          corresponds to (if the bind marker is "anonymous").  The <type>
+          field is an [option] that represents the expected type of values for
+          the bind marker.  See the Rows documentation (section 4.2.5.2) for
+          full details on the <type> field.
 
-  Note that prepared query ID return is global to the node on which the query
-  has been prepared. It can be used on any connection to that node and this
+    - <result_metadata> is defined exactly the same as <metadata> in the Rows
+      documentation (section 4.2.5.2).  This describes the metadata for the
+      result set that will be returned when this prepared statement is executed.
+      Note that <result_metadata> may be empty (have the No_metadata flag and
+      0 columns, See section 4.2.5.2) and will be for any query that is not a
+      Select. In fact, there is never a guarantee that this will be non-empty, so
+      implementations should protect themselves accordingly. This result metadata
+      is an optimization that allows implementations to later execute the
+      prepared statement without requesting the metadata (see the Skip_metadata
+      flag in EXECUTE).  Clients can safely discard this metadata if they do not
+      want to take advantage of that optimization.
+
+  Note that the prepared query ID returned is global to the node on which the query
+  has been prepared. It can be used on any connection to that node
   until the node is restarted (after which the query must be reprepared).
 
 4.2.5.5. Schema_change
@@ -642,16 +710,16 @@ Table of Contents
   keyspace/table/index). The body (after the kind [int]) is the same
   as the body for a "SCHEMA_CHANGE" event, so 3 strings:
     <change_type><target><options>
-  Please refer to the section 4.2.6 below for the meaning of those fields.
+  Please refer to section 4.2.6 below for the meaning of those fields.
 
-  Note that queries to create and drop an index are considered as change
-  updating the table the index is on.
+  Note that a query to create or drop an index is considered to be a change
+  to the table the index is on.
 
 
 4.2.6. EVENT
 
-  And event pushed by the server. A client will only receive events for the
-  type it has REGISTER to. The body of an EVENT message will start by a
+  An event pushed by the server. A client will only receive events for the
+  types it has REGISTERed to. The body of an EVENT message will start with a
   [string] representing the event type. The rest of the message depends on the
   event type. The valid event types are:
     - "TOPOLOGY_CHANGE": events related to change in the cluster topology.
@@ -669,23 +737,30 @@ Table of Contents
       the rest of the message will be <change_type><target><options> where:
         - <change_type> is a [string] representing the type of changed involved.
           It will be one of "CREATED", "UPDATED" or "DROPPED".
-        - <target> is a [string] that can be one of "KEYSPACE", "TABLE" or "TYPE"
-          and describes what has been modified ("TYPE" stands for modifications
-          related to user types).
-        - <options> depends on the preceding <target>. If <target> is
-          "KEYSPACE", then <options> will be a single [string] representing the
-          keyspace changed. Otherwise, if <target> is "TABLE" or "TYPE", then
-          <options> will be 2 [string]: the first one will be the keyspace
-          containing the affected object, and the second one will be the name
-          of said affected object (so either the table name or the user type
-          name).
+        - <target> is a [string] that can be one of "KEYSPACE", "TABLE", "TYPE",
+          "FUNCTION" or "AGGREGATE" and describes what has been modified
+          ("TYPE" stands for modifications related to user types, "FUNCTION"
+          for modifications related to user defined functions, "AGGREGATE"
+          for modifications related to user defined aggregates).
+        - <options> depends on the preceding <target>:
+          - If <target> is "KEYSPACE", then <options> will be a single [string]
+            representing the keyspace changed.
+          - If <target> is "TABLE" or "TYPE", then
+            <options> will be 2 [string]: the first one will be the keyspace
+            containing the affected object, and the second one will be the name
+            of said affected object (either the table, user type, function, or
+            aggregate name).
+          - If <target> is "FUNCTION" or "AGGREGATE", multiple arguments follow:
+            - [string] keyspace containing the user defined function / aggregate
+            - [string] the function/aggregate name
+            - [string list] one string for each argument type (as CQL type)
 
-  All EVENT message have a streamId of -1 (Section 2.3).
+  All EVENT messages have a streamId of -1 (Section 2.3).
 
   Please note that "NEW_NODE" and "UP" events are sent based on internal Gossip
   communication and as such may be sent a short delay before the binary
   protocol server on the newly up node is fully started. Clients are thus
-  advise to wait a short time before trying to connect to the node (1 seconds
+  advised to wait a short time before trying to connect to the node (1 second
   should be enough), otherwise they may experience a connection refusal at
   first.
 
@@ -698,12 +773,12 @@ Table of Contents
   token contains (and when it can be null/empty, if ever) depends on the actual
   authenticator used.
 
-  Clients are expected to answer the server challenge by an AUTH_RESPONSE
+  Clients are expected to answer the server challenge with an AUTH_RESPONSE
   message.
 
-4.2.7. AUTH_SUCCESS
+4.2.8. AUTH_SUCCESS
 
-  Indicate the success of the authentication phase. See Section 4.2.3 for more
+  Indicates the success of the authentication phase. See Section 4.2.3 for more
   details.
 
   The body of this message is a single [bytes] token holding final information
@@ -720,52 +795,180 @@ Table of Contents
   Before being used, client and server must agree on a compression algorithm to
   use, which is done in the STARTUP message. As a consequence, a STARTUP message
   must never be compressed.  However, once the STARTUP frame has been received
-  by the server can be compressed (including the response to the STARTUP
-  request). Frame do not have to be compressed however, even if compression has
-  been agreed upon (a server may only compress frame above a certain size at its
+  by the server, messages can be compressed (including the response to the STARTUP
+  request). Frames do not have to be compressed, however, even if compression has
+  been agreed upon (a server may only compress frames above a certain size at its
   discretion). A frame body should be compressed if and only if the compressed
   flag (see Section 2.2) is set.
 
-  As of this version 2 of the protocol, the following compressions are available:
-    - lz4 (https://code.google.com/p/lz4/). In that, note that the 4 first bytes
+  As of version 2 of the protocol, the following compressions are available:
+    - lz4 (https://code.google.com/p/lz4/). In that, note that the first four bytes
       of the body will be the uncompressed length (followed by the compressed
       bytes).
     - snappy (https://code.google.com/p/snappy/). This compression might not be
       available as it depends on a native lib (server-side) that might not be
-      avaivable on some installation.
+      avaivable on some installations.
 
 
-6. Collection types
+6. Data Type Serialization Formats
 
-  This section describe the serialization format for the collection types:
-  list, map and set. This serialization format is both useful to decode values
-  returned in RESULT messages but also to encode values for EXECUTE ones.
+  This sections describes the serialization formats for all CQL data types
+  supported by Cassandra through the native protocol.  These serialization
+  formats should be used by client drivers to encode values for EXECUTE
+  messages.  Cassandra will use these formats when returning values in
+  RESULT messages.
 
-  The serialization formats are:
-     List: a [int] n indicating the size of the list, followed by n elements.
-           Each element is [bytes] representing the serialized element
-           value.
-     Map: a [int] n indicating the size of the map, followed by n entries.
-          Each entry is composed of two [bytes] representing the key and
-          the value of the entry map.
-     Set: a [int] n indicating the size of the set, followed by n elements.
-          Each element is [bytes] representing the serialized element
-          value.
+  All values are represented as [bytes] in EXECUTE and RESULT messages.
+  The [bytes] format includes an int prefix denoting the length of the value.
+  For that reason, the serialization formats described here will not include
+  a length component.
+
+  For legacy compatibility reasons, note that most non-string types support
+  "empty" values (i.e. a value with zero length).  An empty value is distinct
+  from NULL, which is encoded with a negative length.
+
+  As with the rest of the native protocol, all encodings are big-endian.
+
+6.1. ascii
+
+  A sequence of bytes in the ASCII range [0, 127].  Bytes with values outside of
+  this range will result in a validation error.
+
+6.2 bigint
+
+  An eight-byte two's complement integer.
+
+6.3 blob
+
+  Any sequence of bytes.
+
+6.4 boolean
+
+  A single byte.  A value of 0 denotes "false"; any other value denotes "true".
+  (However, it is recommended that a value of 1 be used to represent "true".)
+
+6.5 date
+
+  An unsigned integer representing days with epoch centered at 2^31.
+  (unix epoch January 1st, 1970).
+  A few examples:
+    0:    -5877641-06-23
+    2^31: 1970-1-1
+    2^32: 5881580-07-11
+
+6.6 decimal
+
+  The decimal format represents an arbitrary-precision number.  It contains an
+  [int] "scale" component followed by a varint encoding (see section 6.17)
+  of the unscaled value.  The encoded value represents "<unscaled>E<-scale>".
+  In other words, "<unscaled> * 10 ^ (-1 * <scale>)".
+
+6.7 double
+
+  An 8 byte floating point number in the IEEE 754 binary64 format.
+
+6.8 float
+
+  A 4 byte floating point number in the IEEE 754 binary32 format.
+
+6.9 inet
+
+  A 4 byte or 16 byte sequence denoting an IPv4 or IPv6 address, respectively.
+
+6.10 int
+
+  A 4 byte two's complement integer.
+
+6.11 list
+
+  A [int] n indicating the number of elements in the list, followed by n
+  elements.  Each element is [bytes] representing the serialized value.
+
+6.12 map
+
+  A [int] n indicating the number of key/value pairs in the map, followed by
+  n entries.  Each entry is composed of two [bytes] representing the key
+  and value.
+
+6.13 set
+
+  A [int] n indicating the number of elements in the set, followed by n
+  elements.  Each element is [bytes] representing the serialized value.
+
+6.14 smallint
+
+  A 2 byte two's complement integer.
+
+6.15 text
+
+  A sequence of bytes conforming to the UTF-8 specifications.
+
+6.16 time
+
+  An 8 byte two's complement long representing nanoseconds since midnight.
+  Valid values are in the range 0 to 86399999999999
+
+6.17 timestamp
+
+  An 8 byte two's complement integer representing a millisecond-precision
+  offset from the unix epoch (00:00:00, January 1st, 1970).  Negative values
+  represent a negative offset from the epoch.
+
+6.18 timeuuid
+
+  A 16 byte sequence representing a version 1 UUID as defined by RFC 4122.
+
+6.19 tinyint
+
+  A 1 byte two's complement integer.
+
+6.20 tuple
+
+  A sequence of [bytes] values representing the items in a tuple.  The encoding
+  of each element depends on the data type for that position in the tuple.
+  Null values may be represented by using length -1 for the [bytes]
+  representation of an element.
+
+6.21 uuid
+
+  A 16 byte sequence representing any valid UUID as defined by RFC 4122.
+
+6.22 varchar
+
+  An alias of the "text" type.
+
+6.23 varint
+
+  A variable-length two's complement encoding of a signed integer.
+
+  The following examples may help implementors of this spec:
+
+  Value | Encoding
+  ------|---------
+      0 |     0x00
+      1 |     0x01
+    127 |     0x7F
+    128 |   0x0080
+    129 |   0x0081
+     -1 |     0xFF
+   -128 |     0x80
+   -129 |   0xFF7F
+
+  Note that positive numbers must use a most-significant byte with a value
+  less than 0x80, because a most-significant bit of 1 indicates a negative
+  value.  Implementors should pad positive values that have a MSB >= 0x80
+  with a leading 0x00 byte.
 
 
-7. User defined and tuple types
+7. User Defined Types
 
-  This section describes the serialization format for User defined types (UDT) and
-  tuple values. UDT (resp. tuple) values are the values of the User Defined Types
-  (resp. tuple type) as defined in section 4.2.5.2.
+  This section describes the serialization format for User defined types (UDT),
+  as described in section 4.2.5.2.
 
   A UDT value is composed of successive [bytes] values, one for each field of the UDT
   value (in the order defined by the type). A UDT value will generally have one value
   for each field of the type it represents, but it is allowed to have less values than
   the type has fields.
-
-  A tuple value has the exact same serialization format, i.e. a succession of
-  [bytes] values representing the components of the tuple.
 
 
 8. Result paging
@@ -776,12 +979,12 @@ Table of Contents
 
   If a positive value is provided for <result_page_size>, the result set of the
   RESULT message returned for the query will contain at most the
-  <result_page_size> first rows of the query result. If that first page of result
+  <result_page_size> first rows of the query result. If that first page of results
   contains the full result set for the query, the RESULT message (of kind `Rows`)
   will have the Has_more_pages flag *not* set. However, if some results are not
   part of the first response, the Has_more_pages flag will be set and the result
   will contain a <paging_state> value. In that case, the <paging_state> value
-  should be used in a QUERY or EXECUTE message (that has the *same* query than
+  should be used in a QUERY or EXECUTE message (that has the *same* query as
   the original one or the behavior is undefined) to retrieve the next page of
   results.
 
@@ -794,34 +997,40 @@ Table of Contents
     to performance to pick a value too low. A value below 100 is probably too
     low for most use cases.
   - Clients should not rely on the actual size of the result set returned to
-    decide if there is more result to fetch or not. Instead, they should always
-    check the Has_more_pages flag (unless they did not enabled paging for the query
+    decide if there are more results to fetch or not. Instead, they should always
+    check the Has_more_pages flag (unless they did not enable paging for the query
     obviously). Clients should also not assert that no result will have more than
-    <result_page_size> results. While the current implementation always respect
-    the exact value of <result_page_size>, we reserve ourselves the right to return
+    <result_page_size> results. While the current implementation always respects
+    the exact value of <result_page_size>, we reserve the right to return
     slightly smaller or bigger pages in the future for performance reasons.
+  - The <paging_state> is specific to a protocol version and drivers should not
+    send a <paging_state> returned by a node using the protocol v3 to query a node
+    using the protocol v4 for instance.
 
 
 9. Error codes
 
-  The supported error codes are described below:
+  Let us recall that an ERROR message is composed of <code><message>[...]
+  (see 4.2.1 for details). The supported error codes, as well as any additional
+  information the message may contain after the <message> are described below:
     0x0000    Server error: something unexpected happened. This indicates a
               server-side bug.
     0x000A    Protocol error: some client message triggered a protocol
               violation (for instance a QUERY message is sent before a STARTUP
               one has been sent)
-    0x0100    Bad credentials: CREDENTIALS request failed because Cassandra
-              did not accept the provided credentials.
-
+    0x0100    Authentication error: authentication was required and failed. The
+              possible reason for failing depends on the authenticator in use,
+              which may or may not include more detail in the accompanying
+              error message.
     0x1000    Unavailable exception. The rest of the ERROR message body will be
                 <cl><required><alive>
               where:
-                <cl> is the [consistency] level of the query having triggered
+                <cl> is the [consistency] level of the query that triggered
                      the exception.
-                <required> is an [int] representing the number of node that
+                <required> is an [int] representing the number of nodes that
                            should be alive to respect <cl>
-                <alive> is an [int] representing the number of replica that
-                        were known to be alive when the request has been
+                <alive> is an [int] representing the number of replicas that
+                        were known to be alive when the request had been
                         processed (since an unavailable exception has been
                         triggered, there will be <alive> < <required>)
     0x1001    Overloaded: the request cannot be processed because the
@@ -837,22 +1046,22 @@ Table of Contents
                      the exception.
                 <received> is an [int] representing the number of nodes having
                            acknowledged the request.
-                <blockfor> is the number of replica whose acknowledgement is
-                           required to achieve <cl>.
+                <blockfor> is an [int] representing the number of replicas whose
+                           acknowledgement is required to achieve <cl>.
                 <writeType> is a [string] that describe the type of the write
-                            that timeouted. The value of that string can be one
+                            that timed out. The value of that string can be one
                             of:
                              - "SIMPLE": the write was a non-batched
                                non-counter write.
                              - "BATCH": the write was a (logged) batch write.
                                If this type is received, it means the batch log
                                has been successfully written (otherwise a
-                               "BATCH_LOG" type would have been send instead).
+                               "BATCH_LOG" type would have been sent instead).
                              - "UNLOGGED_BATCH": the write was an unlogged
-                               batch. Not batch log write has been attempted.
+                               batch. No batch log write has been attempted.
                              - "COUNTER": the write was a counter write
                                (batched or not).
-                             - "BATCH_LOG": the timeout occured during the
+                             - "BATCH_LOG": the timeout occurred during the
                                write to the batch log when a (logged) batch
                                write was requested.
     0x1200    Read_timeout: Timeout exception during a read request. The rest
@@ -863,16 +1072,65 @@ Table of Contents
                      the exception.
                 <received> is an [int] representing the number of nodes having
                            answered the request.
-                <blockfor> is the number of replica whose response is
-                           required to achieve <cl>. Please note that it is
-                           possible to have <received> >= <blockfor> if
-                           <data_present> is false. And also in the (unlikely)
-                           case were <cl> is achieved but the coordinator node
-                           timeout while waiting for read-repair
-                           acknowledgement.
+                <blockfor> is an [int] representing the number of replicas whose
+                           response is required to achieve <cl>. Please note that
+                           it is possible to have <received> >= <blockfor> if
+                           <data_present> is false. Also in the (unlikely)
+                           case where <cl> is achieved but the coordinator node
+                           times out while waiting for read-repair acknowledgement.
                 <data_present> is a single byte. If its value is 0, it means
                                the replica that was asked for data has not
                                responded. Otherwise, the value is != 0.
+    0x1300    Read_failure: A non-timeout exception during a read request. The rest
+              of the ERROR message body will be
+                <cl><received><blockfor><numfailures><data_present>
+              where:
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
+                <received> is an [int] representing the number of nodes having
+                           answered the request.
+                <blockfor> is an [int] representing the number of replicas whose
+                           acknowledgement is required to achieve <cl>.
+                <numfailures> is an [int] representing the number of nodes that
+                              experience a failure while executing the request.
+                <data_present> is a single byte. If its value is 0, it means
+                               the replica that was asked for data had not
+                               responded. Otherwise, the value is != 0.
+    0x1400    Function_failure: A (user defined) function failed during execution.
+              The rest of the ERROR message body will be
+                <keyspace><function><arg_types>
+              where:
+                <keyspace> is the keyspace [string] of the failed function
+                <function> is the name [string] of the failed function
+                <arg_types> [string list] one string for each argument type (as CQL type) of the failed function
+    0x1500    Write_failure: A non-timeout exception during a write request. The rest
+              of the ERROR message body will be
+                <cl><received><blockfor><numfailures><write_type>
+              where:
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
+                <received> is an [int] representing the number of nodes having
+                           answered the request.
+                <blockfor> is an [int] representing the number of replicas whose
+                           acknowledgement is required to achieve <cl>.
+                <numfailures> is an [int] representing the number of nodes that
+                              experience a failure while executing the request.
+                <writeType> is a [string] that describes the type of the write
+                            that failed. The value of that string can be one
+                            of:
+                             - "SIMPLE": the write was a non-batched
+                               non-counter write.
+                             - "BATCH": the write was a (logged) batch write.
+                               If this type is received, it means the batch log
+                               has been successfully written (otherwise a
+                               "BATCH_LOG" type would have been sent instead).
+                             - "UNLOGGED_BATCH": the write was an unlogged
+                               batch. No batch log write has been attempted.
+                             - "COUNTER": the write was a counter write
+                               (batched or not).
+                             - "BATCH_LOG": the failure occured during the
+                               write to the batch log when a (logged) batch
+                               write was requested.
 
     0x2000    Syntax_error: The submitted query has a syntax error.
     0x2100    Unauthorized: The logged user doesn't have the right to perform
@@ -890,10 +1148,24 @@ Table of Contents
                         keyspace, <table> will be present but will be the empty
                         string.
     0x2500    Unprepared: Can be thrown while a prepared statement tries to be
-              executed if the provide prepared statement ID is not known by
+              executed if the provided prepared statement ID is not known by
               this host. The rest of the ERROR message body will be [short
               bytes] representing the unknown ID.
 
 10. Changes from v3
 
-
+  * Prepared responses (Section 4.2.5.4) now include partition-key bind indexes
+  * The format of "SCHEMA_CHANGE" events (Section 4.2.6) (and implicitly
+    "Schema_change" results (Section 4.2.5.5)) has been modified, and now includes
+    changes related to user defined functions and user defined aggregates.
+  * Read_failure error code was added.
+  * Function_failure error code was added.
+  * Add custom payload to frames for custom QueryHandler implementations (ignored by
+    Cassandra's standard QueryHandler)
+  * Add warnings to frames for responses for which the server generated a warning
+    during processing, which the client needs to address.
+  * Add the date and time data types
+  * Add the tinyint and smallint data types
+  * The <paging_state> returned in the v4 protocol is not compatible with the v3
+    protocol. In other words, a <paging_state> returned by a node using protocol v4
+    should not be used to query a node using protocol v3 (and vice-versa).

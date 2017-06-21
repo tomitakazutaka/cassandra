@@ -21,13 +21,12 @@ package org.apache.cassandra.stress.settings;
  */
 
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.PrintStream;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+
+import org.apache.cassandra.stress.util.ResultLogger;
 
 public class SettingsErrors implements Serializable
 {
@@ -56,6 +55,12 @@ public class SettingsErrors implements Serializable
     }
 
     // CLI Utility Methods
+    public void printSettings(ResultLogger out)
+    {
+        out.printf("  Ignore: %b%n", ignore);
+        out.printf("  Tries: %d%n", tries);
+    }
+
 
     public static SettingsErrors get(Map<String, String[]> clArgs)
     {

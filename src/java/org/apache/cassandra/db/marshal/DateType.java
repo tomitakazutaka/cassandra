@@ -20,6 +20,8 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.Date;
 
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Term;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,22 +29,25 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.TimestampSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+/**
+ * This is the old version of TimestampType, but has been replaced as it wasn't comparing pre-epoch timestamps
+ * correctly. This is kept for backward compatibility but shouldn't be used in new code.
+ */
+@Deprecated
 public class DateType extends AbstractType<Date>
 {
     private static final Logger logger = LoggerFactory.getLogger(DateType.class);
 
     public static final DateType instance = new DateType();
 
-    DateType() {} // singleton
+    DateType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
-
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return true;
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -52,6 +57,30 @@ public class DateType extends AbstractType<Date>
           return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
       return ByteBufferUtil.bytes(TimestampSerializer.dateStringToTimestamp(source));
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        if (parsed instanceof Long)
+            return new Constants.Value(ByteBufferUtil.bytes((Long) parsed));
+
+        try
+        {
+            return new Constants.Value(TimestampType.instance.fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a long or a datestring representation of a date value, but got a %s: %s",
+                    parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + TimestampSerializer.getJsonDateFormatter().format(TimestampSerializer.instance.deserialize(buffer)) + '"';
     }
 
     @Override
@@ -72,11 +101,6 @@ public class DateType extends AbstractType<Date>
         return false;
     }
 
-    public boolean isByteOrderComparable()
-    {
-        return true;
-    }
-
     @Override
     public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
@@ -92,5 +116,11 @@ public class DateType extends AbstractType<Date>
     public TypeSerializer<Date> getSerializer()
     {
         return TimestampSerializer.instance;
+    }
+
+    @Override
+    public int valueLengthIfFixed()
+    {
+        return 8;
     }
 }

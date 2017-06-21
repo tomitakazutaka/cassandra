@@ -20,25 +20,28 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.db.context.CounterContext;
-import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.CounterSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class CounterColumnType extends AbstractType<Long>
+public class CounterColumnType extends NumberType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
 
-    CounterColumnType() {} // singleton
+    CounterColumnType() {super(ComparisonType.NOT_COMPARABLE);} // singleton
 
-    public boolean isCounter()
+    public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public boolean isByteOrderComparable()
+    public boolean isCounter()
     {
-        throw new AssertionError();
+        return true;
     }
 
     @Override
@@ -53,9 +56,10 @@ public class CounterColumnType extends AbstractType<Long>
         return ByteBufferUtil.bytes(value);
     }
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public void validateCellValue(ByteBuffer cellValue) throws MarshalException
     {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        CounterContext.instance().validateContext(cellValue);
     }
 
     public String getString(ByteBuffer bytes)
@@ -68,6 +72,18 @@ public class CounterColumnType extends AbstractType<Long>
         return ByteBufferUtil.hexToBytes(source);
     }
 
+    @Override
+    public Term fromJSONObject(Object parsed)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return CounterSerializer.instance.deserialize(buffer).toString();
+    }
+
     public CQL3Type asCQL3Type()
     {
         return CQL3Type.Native.COUNTER;
@@ -76,5 +92,41 @@ public class CounterColumnType extends AbstractType<Long>
     public TypeSerializer<Long> getSerializer()
     {
         return CounterSerializer.instance;
+    }
+
+    @Override
+    protected long toLong(ByteBuffer value)
+    {
+        return ByteBufferUtil.toLong(value);
+    }
+
+    public ByteBuffer add(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) + rightType.toLong(right));
+    }
+
+    public ByteBuffer substract(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) - rightType.toLong(right));
+    }
+
+    public ByteBuffer multiply(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) * rightType.toLong(right));
+    }
+
+    public ByteBuffer divide(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) / rightType.toLong(right));
+    }
+
+    public ByteBuffer mod(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) % rightType.toLong(right));
+    }
+
+    public ByteBuffer negate(ByteBuffer input)
+    {
+        return ByteBufferUtil.bytes(-toLong(input));
     }
 }

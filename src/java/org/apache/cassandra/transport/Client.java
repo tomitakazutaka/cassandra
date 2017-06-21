@@ -22,16 +22,12 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import com.google.common.base.Splitter;
 
-import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.PasswordAuthenticator;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -45,9 +41,12 @@ import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOpti
 
 public class Client extends SimpleClient
 {
-    public Client(String host, int port, ClientEncryptionOptions encryptionOptions)
+    private final SimpleEventHandler eventHandler = new SimpleEventHandler();
+
+    public Client(String host, int port, ProtocolVersion version, ClientEncryptionOptions encryptionOptions)
     {
-        super(host, port, encryptionOptions);
+        super(host, port, version, encryptionOptions);
+        setEventHandler(eventHandler);
     }
 
     public void run() throws IOException
@@ -61,10 +60,17 @@ public class Client extends SimpleClient
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         for (;;)
         {
+            Event event;
+            while ((event = eventHandler.queue.poll()) != null)
+            {
+                System.out.println("<< " + event);
+            }
+
             System.out.print(">> ");
             System.out.flush();
             String line = in.readLine();
-            if (line == null) {
+            if (line == null)
+            {
                 break;
             }
             Message.Request req = parseLine(line.trim());
@@ -130,12 +136,12 @@ public class Client extends SimpleClient
                     return null;
                 }
             }
-            return new QueryMessage(query, QueryOptions.create(ConsistencyLevel.ONE, Collections.<ByteBuffer>emptyList(), false, pageSize, null, null));
+            return new QueryMessage(query, QueryOptions.create(ConsistencyLevel.ONE, Collections.<ByteBuffer>emptyList(), false, pageSize, null, null, version, null));
         }
         else if (msgType.equals("PREPARE"))
         {
             String query = line.substring(8);
-            return new PrepareMessage(query);
+            return new PrepareMessage(query, null);
         }
         else if (msgType.equals("EXECUTE"))
         {
@@ -179,7 +185,7 @@ public class Client extends SimpleClient
         else if (msgType.equals("AUTHENTICATE"))
         {
             Map<String, String> credentials = readCredentials(iter);
-            if(!credentials.containsKey(IAuthenticator.USERNAME_KEY) || !credentials.containsKey(IAuthenticator.PASSWORD_KEY))
+            if(!credentials.containsKey(PasswordAuthenticator.USERNAME_KEY) || !credentials.containsKey(PasswordAuthenticator.PASSWORD_KEY))
             {
                 System.err.println("[ERROR] Authentication requires both 'username' and 'password'");
                 return null;
@@ -221,8 +227,8 @@ public class Client extends SimpleClient
 
     private byte[] encodeCredentialsForSasl(Map<String, String> credentials)
     {
-        byte[] username = credentials.get(IAuthenticator.USERNAME_KEY).getBytes(StandardCharsets.UTF_8);
-        byte[] password = credentials.get(IAuthenticator.PASSWORD_KEY).getBytes(StandardCharsets.UTF_8);
+        byte[] username = credentials.get(PasswordAuthenticator.USERNAME_KEY).getBytes(StandardCharsets.UTF_8);
+        byte[] password = credentials.get(PasswordAuthenticator.PASSWORD_KEY).getBytes(StandardCharsets.UTF_8);
         byte[] initialResponse = new byte[username.length + password.length + 2];
         initialResponse[0] = 0;
         System.arraycopy(username, 0, initialResponse, 1, username.length);
@@ -233,21 +239,24 @@ public class Client extends SimpleClient
 
     public static void main(String[] args) throws Exception
     {
+        DatabaseDescriptor.clientInitialization();
+
         // Print usage if no argument is specified.
-        if (args.length != 2)
+        if (args.length < 2 || args.length > 3)
         {
-            System.err.println("Usage: " + Client.class.getSimpleName() + " <host> <port>");
+            System.err.println("Usage: " + Client.class.getSimpleName() + " <host> <port> [<version>]");
             return;
         }
 
         // Parse options.
         String host = args[0];
         int port = Integer.parseInt(args[1]);
+        ProtocolVersion version = args.length == 3 ? ProtocolVersion.decode(Integer.parseInt(args[2])) : ProtocolVersion.CURRENT;
 
         ClientEncryptionOptions encryptionOptions = new ClientEncryptionOptions();
-        System.out.println("CQL binary protocol console " + host + "@" + port);
+        System.out.println("CQL binary protocol console " + host + "@" + port + " using native protocol version " + version);
 
-        new Client(host, port, encryptionOptions).run();
+        new Client(host, port, version, encryptionOptions).run();
         System.exit(0);
     }
 }

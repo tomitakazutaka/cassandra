@@ -17,11 +17,13 @@
  */
 package org.apache.cassandra.service;
 
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Represents the state related to a given query.
@@ -29,7 +31,6 @@ import org.apache.cassandra.utils.FBUtilities;
 public class QueryState
 {
     private final ClientState clientState;
-    private volatile long clock;
     private volatile UUID preparedTracingSession;
 
     public QueryState(ClientState clientState)
@@ -56,9 +57,7 @@ public class QueryState
      */
     public long getTimestamp()
     {
-        long current = System.currentTimeMillis() * 1000;
-        clock = clock >= current ? clock + 1 : current;
-        return clock;
+        return clientState.getTimestamp();
     }
 
     public boolean traceNextQuery()
@@ -77,17 +76,24 @@ public class QueryState
         this.preparedTracingSession = sessionId;
     }
 
-    public void createTracingSession()
+    public void createTracingSession(Map<String,ByteBuffer> customPayload)
     {
-        if (this.preparedTracingSession == null)
+        UUID session = this.preparedTracingSession;
+        if (session == null)
         {
-            Tracing.instance.newSession();
+            Tracing.instance.newSession(customPayload);
         }
         else
         {
-            UUID session = this.preparedTracingSession;
+            Tracing.instance.newSession(session, customPayload);
             this.preparedTracingSession = null;
-            Tracing.instance.newSession(session);
         }
+    }
+
+    public InetAddress getClientAddress()
+    {
+        return clientState.isInternal
+             ? null
+             : clientState.getRemoteAddress().getAddress();
     }
 }

@@ -18,89 +18,35 @@
 */
 package org.apache.cassandra.config;
 
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Enumeration;
+
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import org.apache.cassandra.OrderedJUnit4ClassRunner;
-import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.locator.SimpleStrategy;
-import org.apache.cassandra.service.MigrationManager;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class DatabaseDescriptorTest
 {
-    @Test
-    public void testCFMetaDataSerialization() throws ConfigurationException, InvalidRequestException
+    @BeforeClass
+    public static void setupDatabaseDescriptor()
     {
-        // test serialization of all defined test CFs.
-        for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
-        {
-            for (CFMetaData cfm : Schema.instance.getKeyspaceMetaData(keyspaceName).values())
-            {
-                CFMetaData cfmDupe = CFMetaData.fromThrift(cfm.toThrift());
-                assertNotNull(cfmDupe);
-                assertEquals(cfm, cfmDupe);
-            }
-        }
-    }
-
-    @Test
-    public void testKSMetaDataSerialization() throws ConfigurationException
-    {
-        for (KSMetaData ksm : Schema.instance.getKeyspaceDefinitions())
-        {
-            // Not testing round-trip on the KsDef via serDe() because maps
-            KSMetaData ksmDupe = KSMetaData.fromThrift(ksm.toThrift());
-            assertNotNull(ksmDupe);
-            assertEquals(ksm, ksmDupe);
-        }
+        DatabaseDescriptor.daemonInitialization();
     }
 
     // this came as a result of CASSANDRA-995
-    @Test
-    public void testTransKsMigration() throws ConfigurationException
-    {
-        SchemaLoader.cleanupAndLeaveDirs();
-        DatabaseDescriptor.loadSchemas();
-        assertEquals(0, Schema.instance.getNonSystemKeyspaces().size());
-
-        Gossiper.instance.start((int)(System.currentTimeMillis() / 1000));
-        Keyspace.setInitialized();
-
-        try
-        {
-            // add a few.
-            MigrationManager.announceNewKeyspace(KSMetaData.testMetadata("ks0", SimpleStrategy.class, KSMetaData.optsWithRF(3)));
-            MigrationManager.announceNewKeyspace(KSMetaData.testMetadata("ks1", SimpleStrategy.class, KSMetaData.optsWithRF(3)));
-
-            assertNotNull(Schema.instance.getKSMetaData("ks0"));
-            assertNotNull(Schema.instance.getKSMetaData("ks1"));
-
-            Schema.instance.clearKeyspaceDefinition(Schema.instance.getKSMetaData("ks0"));
-            Schema.instance.clearKeyspaceDefinition(Schema.instance.getKSMetaData("ks1"));
-
-            assertNull(Schema.instance.getKSMetaData("ks0"));
-            assertNull(Schema.instance.getKSMetaData("ks1"));
-
-            DatabaseDescriptor.loadSchemas();
-
-            assertNotNull(Schema.instance.getKSMetaData("ks0"));
-            assertNotNull(Schema.instance.getKSMetaData("ks1"));
-        }
-        finally
-        {
-            Gossiper.instance.stop();
-        }
-    }
-
     @Test
     public void testConfigurationLoader() throws Exception
     {
@@ -122,8 +68,146 @@ public class DatabaseDescriptorTest
         public Config loadConfig() throws ConfigurationException
         {
             Config testConfig = new Config();
-            testConfig.cluster_name = "ConfigurationLoader Test";;
+            testConfig.cluster_name = "ConfigurationLoader Test";
             return testConfig;
         }
+    }
+
+    static NetworkInterface suitableInterface = null;
+    static boolean hasIPv4andIPv6 = false;
+
+    /*
+     * Server only accepts interfaces by name if they have a single address
+     * OS X seems to always have an ipv4 and ipv6 address on all interfaces which means some tests fail
+     * if not checked for and skipped
+     */
+    @BeforeClass
+    public static void selectSuitableInterface() throws Exception {
+        Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+        while(interfaces.hasMoreElements()) {
+            NetworkInterface intf = interfaces.nextElement();
+
+            System.out.println("Evaluating " + intf.getName());
+
+            if (intf.isLoopback()) {
+                suitableInterface = intf;
+
+                boolean hasIPv4 = false;
+                boolean hasIPv6 = false;
+                Enumeration<InetAddress> addresses = suitableInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    if (addresses.nextElement() instanceof Inet6Address)
+                        hasIPv6 = true;
+                    else
+                        hasIPv4 = true;
+                }
+                hasIPv4andIPv6 = hasIPv4 && hasIPv6;
+                return;
+            }
+        }
+    }
+
+    @Test
+    public void testRpcInterface() throws Exception
+    {
+        Config testConfig = DatabaseDescriptor.loadConfig();
+        testConfig.rpc_interface = suitableInterface.getName();
+        testConfig.rpc_address = null;
+        DatabaseDescriptor.applyAddressConfig(testConfig);
+
+        /*
+         * Confirm ability to select between IPv4 and IPv6
+         */
+        if (hasIPv4andIPv6)
+        {
+            testConfig = DatabaseDescriptor.loadConfig();
+            testConfig.rpc_interface = suitableInterface.getName();
+            testConfig.rpc_address = null;
+            testConfig.rpc_interface_prefer_ipv6 = true;
+            DatabaseDescriptor.applyAddressConfig(testConfig);
+
+            assertEquals(DatabaseDescriptor.getRpcAddress().getClass(), Inet6Address.class);
+
+            testConfig = DatabaseDescriptor.loadConfig();
+            testConfig.rpc_interface = suitableInterface.getName();
+            testConfig.rpc_address = null;
+            testConfig.rpc_interface_prefer_ipv6 = false;
+            DatabaseDescriptor.applyAddressConfig(testConfig);
+
+            assertEquals(DatabaseDescriptor.getRpcAddress().getClass(), Inet4Address.class);
+        }
+        else
+        {
+            /*
+             * Confirm first address of interface is selected
+             */
+            assertEquals(DatabaseDescriptor.getRpcAddress(), suitableInterface.getInetAddresses().nextElement());
+        }
+    }
+
+    @Test
+    public void testListenInterface() throws Exception
+    {
+        Config testConfig = DatabaseDescriptor.loadConfig();
+        testConfig.listen_interface = suitableInterface.getName();
+        testConfig.listen_address = null;
+        DatabaseDescriptor.applyAddressConfig(testConfig);
+
+        /*
+         * Confirm ability to select between IPv4 and IPv6
+         */
+        if (hasIPv4andIPv6)
+        {
+            testConfig = DatabaseDescriptor.loadConfig();
+            testConfig.listen_interface = suitableInterface.getName();
+            testConfig.listen_address = null;
+            testConfig.listen_interface_prefer_ipv6 = true;
+            DatabaseDescriptor.applyAddressConfig(testConfig);
+
+            assertEquals(DatabaseDescriptor.getListenAddress().getClass(), Inet6Address.class);
+
+            testConfig = DatabaseDescriptor.loadConfig();
+            testConfig.listen_interface = suitableInterface.getName();
+            testConfig.listen_address = null;
+            testConfig.listen_interface_prefer_ipv6 = false;
+            DatabaseDescriptor.applyAddressConfig(testConfig);
+
+            assertEquals(DatabaseDescriptor.getListenAddress().getClass(), Inet4Address.class);
+        }
+        else
+        {
+            /*
+             * Confirm first address of interface is selected
+             */
+            assertEquals(DatabaseDescriptor.getRpcAddress(), suitableInterface.getInetAddresses().nextElement());
+        }
+    }
+
+    @Test
+    public void testListenAddress() throws Exception
+    {
+        Config testConfig = DatabaseDescriptor.loadConfig();
+        testConfig.listen_address = suitableInterface.getInterfaceAddresses().get(0).getAddress().getHostAddress();
+        testConfig.listen_interface = null;
+        DatabaseDescriptor.applyAddressConfig(testConfig);
+    }
+
+    @Test
+    public void testRpcAddress() throws Exception
+    {
+        Config testConfig = DatabaseDescriptor.loadConfig();
+        testConfig.rpc_address = suitableInterface.getInterfaceAddresses().get(0).getAddress().getHostAddress();
+        testConfig.rpc_interface = null;
+        DatabaseDescriptor.applyAddressConfig(testConfig);
+
+    }
+    
+    @Test
+    public void testTokensFromString()
+    {
+        assertTrue(DatabaseDescriptor.tokensFromString(null).isEmpty());
+        Collection<String> tokens = DatabaseDescriptor.tokensFromString(" a,b ,c , d, f,g,h");
+        assertEquals(7, tokens.size());
+        assertTrue(tokens.containsAll(Arrays.asList(new String[]{"a", "b", "c", "d", "f", "g", "h"})));
     }
 }

@@ -17,12 +17,30 @@
  */
 package org.apache.cassandra.cache;
 
-import java.util.UUID;
+import java.util.Objects;
 
-public interface CacheKey extends IMeasurableMemory
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+
+public abstract class CacheKey implements IMeasurableMemory
 {
-    /**
-     * @return The cf id of the cache key.
-     */
-    public UUID getCFId();
+    public final TableId tableId;
+    public final String indexName;
+
+    protected CacheKey(TableId tableId, String indexName)
+    {
+        this.tableId = tableId;
+        this.indexName = indexName;
+    }
+
+    public CacheKey(TableMetadata metadata)
+    {
+        this(metadata.id, metadata.indexName().orElse(null));
+    }
+
+    public boolean sameTable(TableMetadata tableMetadata)
+    {
+        return tableId.equals(tableMetadata.id)
+               && Objects.equals(indexName, tableMetadata.indexName().orElse(null));
+    }
 }

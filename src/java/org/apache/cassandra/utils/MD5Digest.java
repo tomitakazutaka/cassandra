@@ -17,7 +17,10 @@
  */
 package org.apache.cassandra.utils;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+
 
 /**
  * The result of the computation of an MD5 digest.
@@ -30,10 +33,12 @@ import java.util.Arrays;
 public class MD5Digest
 {
     public final byte[] bytes;
+    private final int hashCode;
 
     private MD5Digest(byte[] bytes)
     {
         this.bytes = bytes;
+        hashCode = Arrays.hashCode(bytes);
     }
 
     public static MD5Digest wrap(byte[] digest)
@@ -48,13 +53,18 @@ public class MD5Digest
 
     public static MD5Digest compute(String toHash)
     {
-        return compute(toHash.getBytes());
+        return compute(toHash.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public ByteBuffer byteBuffer()
+    {
+        return ByteBuffer.wrap(bytes);
     }
 
     @Override
     public final int hashCode()
     {
-        return Arrays.hashCode(bytes);
+        return hashCode;
     }
 
     @Override

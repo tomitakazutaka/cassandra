@@ -18,7 +18,10 @@
 package org.apache.cassandra.repair;
 
 import java.net.InetAddress;
+import java.util.UUID;
+import java.util.Collections;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,10 +29,12 @@ import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.repair.messages.SyncComplete;
 import org.apache.cassandra.repair.messages.SyncRequest;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.streaming.StreamEvent;
 import org.apache.cassandra.streaming.StreamEventHandler;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.streaming.StreamOperation;
 
 /**
  * StreamingRepairTask performs data streaming between two remote replica which neither is not repair coordinator.
@@ -41,27 +46,33 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
 
     private final RepairJobDesc desc;
     private final SyncRequest request;
-    private final long repairedAt;
+    private final UUID pendingRepair;
+    private final PreviewKind previewKind;
 
-    public StreamingRepairTask(RepairJobDesc desc, SyncRequest request, long repairedAt)
+    public StreamingRepairTask(RepairJobDesc desc, SyncRequest request, UUID pendingRepair, PreviewKind previewKind)
     {
         this.desc = desc;
         this.request = request;
-        this.repairedAt = repairedAt;
+        this.pendingRepair = pendingRepair;
+        this.previewKind = previewKind;
     }
 
     public void run()
     {
         InetAddress dest = request.dst;
         InetAddress preferred = SystemKeyspace.getPreferredIP(dest);
-        logger.info(String.format("[streaming task #%s] Performing streaming repair of %d ranges with %s", desc.sessionId, request.ranges.size(), request.dst));
-        new StreamPlan("Repair", repairedAt, 1, false).listeners(this)
-                                            .flushBeforeTransfer(true)
-                                            // request ranges from the remote node
-                                            .requestRanges(dest, preferred, desc.keyspace, request.ranges, desc.columnFamily)
-                                            // send ranges to the remote node
-                                            .transferRanges(dest, preferred, desc.keyspace, request.ranges, desc.columnFamily)
-                                            .execute();
+        logger.info("[streaming task #{}] Performing streaming repair of {} ranges with {}", desc.sessionId, request.ranges.size(), request.dst);
+        createStreamPlan(dest, preferred).execute();
+    }
+
+    @VisibleForTesting
+    StreamPlan createStreamPlan(InetAddress dest, InetAddress preferred)
+    {
+        return new StreamPlan(StreamOperation.REPAIR, 1, false, false, pendingRepair, previewKind)
+               .listeners(this)
+               .flushBeforeTransfer(pendingRepair == null) // sstables are isolated at the beginning of an incremental repair session, so flushing isn't neccessary
+               .requestRanges(dest, preferred, desc.keyspace, request.ranges, desc.columnFamily) // request ranges from the remote node
+               .transferRanges(dest, preferred, desc.keyspace, request.ranges, desc.columnFamily); // send ranges to the remote node
     }
 
     public void handleStreamEvent(StreamEvent event)
@@ -75,8 +86,8 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
      */
     public void onSuccess(StreamState state)
     {
-        logger.info(String.format("[repair #%s] streaming task succeed, returning response to %s", desc.sessionId, request.initiator));
-        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, true).createMessage(), request.initiator);
+        logger.info("{} streaming task succeed, returning response to {}", previewKind.logPrefix(desc.sessionId), request.initiator);
+        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, true, state.createSummaries()).createMessage(), request.initiator);
     }
 
     /**
@@ -84,6 +95,6 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
      */
     public void onFailure(Throwable t)
     {
-        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, false).createMessage(), request.initiator);
+        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, false, Collections.emptyList()).createMessage(), request.initiator);
     }
 }
