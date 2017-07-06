@@ -17,17 +17,21 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
+import io.airlift.airline.Arguments;
 import io.airlift.airline.Command;
-
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
 
-@Command(name = "getinterdcstreamthroughput", description = "Print the Mb/s throughput cap for inter-datacenter streaming in the system")
-public class GetInterDCStreamThroughput extends NodeToolCmd
+@Command(name = "setbatchlogreplaythrottle", description = "Set batchlog replay throttle in KB per second, or 0 to disable throttling. " +
+                                                           "This will be reduced proportionally to the number of nodes in the cluster.")
+public class SetBatchlogReplayThrottle extends NodeToolCmd
 {
+    @Arguments(title = "batchlog_replay_throttle", usage = "<value_in_kb_per_sec>", description = "Value in KB per second, 0 to disable throttling", required = true)
+    private Integer batchlogReplayThrottle = null;
+
     @Override
     public void execute(NodeProbe probe)
     {
-        System.out.println("Current inter-datacenter stream throughput: " + probe.getInterDCStreamThroughput() + " Mb/s");
+        probe.setBatchlogReplayThrottle(batchlogReplayThrottle);
     }
 }

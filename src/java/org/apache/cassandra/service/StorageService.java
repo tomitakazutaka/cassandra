@@ -1355,6 +1355,17 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         CompactionManager.instance.setRate(value);
     }
 
+    public int getBatchlogReplayThrottleInKB()
+    {
+        return DatabaseDescriptor.getBatchlogReplayThrottleInKB();
+    }
+
+    public void setBatchlogReplayThrottleInKB(int throttleInKB)
+    {
+        DatabaseDescriptor.setBatchlogReplayThrottleInKB(throttleInKB);
+        BatchlogManager.instance.setRate(throttleInKB);
+    }
+
     public int getConcurrentCompactors()
     {
         return DatabaseDescriptor.getConcurrentCompactors();
@@ -3347,6 +3358,15 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public void forceTerminateAllRepairSessions()
     {
         ActiveRepairService.instance.terminateSessions();
+    }
+
+
+    @Nullable
+    public List<String> getParentRepairStatus(int cmd)
+    {
+        Pair<ActiveRepairService.ParentRepairStatus, List<String>> pair = ActiveRepairService.instance.getRepairStatus(cmd);
+        return pair == null ? null :
+               ImmutableList.<String>builder().add(pair.left.name()).addAll(pair.right).build();
     }
 
     /* End of MBean interface methods */
