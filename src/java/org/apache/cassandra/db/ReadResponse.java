@@ -19,9 +19,9 @@ package org.apache.cassandra.db;
 
 import java.io.*;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.hash.Hasher;
 
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.partitions.*;
@@ -33,7 +33,7 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 
 public abstract class ReadResponse
 {
@@ -65,11 +65,33 @@ public abstract class ReadResponse
 
     public abstract boolean isDigestResponse();
 
+    /**
+     * Creates a string of the requested partition in this read response suitable for debugging.
+     */
+    public String toDebugString(ReadCommand command, DecoratedKey key)
+    {
+        if (isDigestResponse())
+            return "Digest:0x" + ByteBufferUtil.bytesToHex(digest(command));
+
+        try (UnfilteredPartitionIterator iter = makeIterator(command))
+        {
+            while (iter.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iter.next())
+                {
+                    if (partition.partitionKey().equals(key))
+                        return ImmutableBTreePartition.create(partition).toString();
+                }
+            }
+        }
+        return "<key " + key + " not found>";
+    }
+
     protected static ByteBuffer makeDigest(UnfilteredPartitionIterator iterator, ReadCommand command)
     {
-        MessageDigest digest = FBUtilities.threadLocalMD5Digest();
-        UnfilteredPartitionIterators.digest(iterator, digest, command.digestVersion());
-        return ByteBuffer.wrap(digest.digest());
+        Hasher hasher = HashingUtils.CURRENT_HASH_FUNCTION.newHasher();
+        UnfilteredPartitionIterators.digest(iterator, hasher, command.digestVersion());
+        return ByteBuffer.wrap(hasher.hash().asBytes());
     }
 
     private static class DigestResponse extends ReadResponse

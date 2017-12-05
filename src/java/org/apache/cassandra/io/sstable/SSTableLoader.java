@@ -25,6 +25,7 @@ import java.util.*;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 
+import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -138,8 +139,9 @@ public class SSTableLoader implements StreamEventHandler
                                               // to conserve heap space when bulk loading
                                               sstable.releaseSummary();
                                           }
-                                          catch (IOException e)
+                                          catch (FSError e)
                                           {
+                                              // todo: should we really continue if we can't open all sstables?
                                               outputHandler.output(String.format("Skipping file %s, error opening it: %s", name, e.getMessage()));
                                           }
                                           return false;
@@ -169,7 +171,7 @@ public class SSTableLoader implements StreamEventHandler
             return plan.execute();
         }
 
-        outputHandler.output(String.format("Streaming relevant part of %sto %s", names(sstables), endpointToRanges.keySet()));
+        outputHandler.output(String.format("Streaming relevant part of %s to %s", names(sstables), endpointToRanges.keySet()));
 
         for (Map.Entry<InetAddress, Collection<Range<Token>>> entry : endpointToRanges.entrySet())
         {
@@ -208,7 +210,7 @@ public class SSTableLoader implements StreamEventHandler
         for (SSTableReader sstable : sstables)
         {
             sstable.selfRef().release();
-            assert sstable.selfRef().globalCount() == 0;
+            assert sstable.selfRef().globalCount() == 0 : String.format("for sstable = %s, ref count = %d", sstable, sstable.selfRef().globalCount());
         }
     }
 

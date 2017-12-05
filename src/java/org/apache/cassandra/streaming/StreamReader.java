@@ -18,8 +18,6 @@
 package org.apache.cassandra.streaming;
 
 import java.io.*;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
 import java.util.Collection;
 import java.util.UUID;
 
@@ -30,8 +28,7 @@ import com.google.common.collect.UnmodifiableIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.ning.compress.lzf.LZFInputStream;
-
+import org.apache.cassandra.io.util.TrackedDataInputPlus;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
@@ -42,9 +39,10 @@ import org.apache.cassandra.io.sstable.format.RangeAwareSSTableWriter;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.streaming.compress.StreamCompressionInputStream;
 import org.apache.cassandra.streaming.messages.FileMessageHeader;
+import org.apache.cassandra.streaming.messages.StreamMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.io.util.TrackedInputStream;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
@@ -88,12 +86,12 @@ public class StreamReader
     }
 
     /**
-     * @param channel where this reads data from
+     * @param inputPlus where this reads data from
      * @return SSTable transferred
      * @throws IOException if reading the remote sstable fails. Will throw an RTE if local write fails.
      */
-    @SuppressWarnings("resource") // channel needs to remain open, streams on top of it can't be closed
-    public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
+    @SuppressWarnings("resource") // input needs to remain open, streams on top of it can't be closed
+    public SSTableMultiWriter read(DataInputPlus inputPlus) throws IOException
     {
         long totalSize = totalSize();
 
@@ -108,11 +106,12 @@ public class StreamReader
                      session.planId(), fileSeqNum, session.peer, repairedAt, totalSize, cfs.keyspace.getName(),
                      cfs.getTableName(), pendingRepair);
 
-        TrackedInputStream in = new TrackedInputStream(new LZFInputStream(Channels.newInputStream(channel)));
-        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata(), in, inputVersion, getHeader(cfs.metadata()));
+        StreamDeserializer deserializer = null;
         SSTableMultiWriter writer = null;
-        try
+        try (StreamCompressionInputStream streamCompressionInputStream = new StreamCompressionInputStream(inputPlus, StreamMessage.CURRENT_VERSION))
         {
+            TrackedDataInputPlus in = new TrackedDataInputPlus(streamCompressionInputStream);
+            deserializer = new StreamDeserializer(cfs.metadata(), in, inputVersion, getHeader(cfs.metadata()));
             writer = createWriter(cfs, totalSize, repairedAt, pendingRepair, format);
             while (in.getBytesRead() < totalSize)
             {
@@ -126,8 +125,9 @@ public class StreamReader
         }
         catch (Throwable e)
         {
+            Object partitionKey = deserializer != null ? deserializer.partitionKey() : "";
             logger.warn("[Stream {}] Error while reading partition {} from stream on ks='{}' and table='{}'.",
-                        session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getTableName(), e);
+                        session.planId(), partitionKey, cfs.keyspace.getName(), cfs.getTableName(), e);
             if (writer != null)
             {
                 writer.abort(e);
@@ -179,10 +179,10 @@ public class StreamReader
         private Row staticRow;
         private IOException exception;
 
-        public StreamDeserializer(TableMetadata metadata, InputStream in, Version version, SerializationHeader header) throws IOException
+        public StreamDeserializer(TableMetadata metadata, DataInputPlus in, Version version, SerializationHeader header) throws IOException
         {
             this.metadata = metadata;
-            this.in = new DataInputPlus.DataInputStreamPlus(in);
+            this.in = in;
             this.helper = new SerializationHelper(metadata, version.correspondingMessagingVersion(), SerializationHelper.Flag.PRESERVE_SIZE);
             this.header = header;
         }
@@ -256,8 +256,8 @@ public class StreamReader
             // to what we do in hasNext)
             Unfiltered unfiltered = iterator.next();
             return metadata.isCounter() && unfiltered.kind() == Unfiltered.Kind.ROW
-                 ? maybeMarkLocalToBeCleared((Row) unfiltered)
-                 : unfiltered;
+                   ? maybeMarkLocalToBeCleared((Row) unfiltered)
+                   : unfiltered;
         }
 
         private Row maybeMarkLocalToBeCleared(Row row)

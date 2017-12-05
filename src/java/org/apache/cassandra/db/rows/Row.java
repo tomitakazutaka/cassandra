@@ -18,17 +18,17 @@
 package org.apache.cassandra.db.rows;
 
 import java.util.*;
-import java.security.MessageDigest;
 import java.util.function.Consumer;
 
 import com.google.common.base.Predicate;
+import com.google.common.hash.Hasher;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.paxos.Commit;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 import org.apache.cassandra.utils.MergeIterator;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
@@ -106,8 +106,13 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
     /**
      * Whether the row has some live information (i.e. it's not just deletion informations).
+     * 
+     * @param nowInSec the current time to decide what is deleted and what isn't
+     * @param enforceStrictLiveness whether the row should be purged if there is no PK liveness info,
+     *                              normally retrieved from {@link CFMetaData#enforceStrictLiveness()}
+     * @return true if there is some live information
      */
-    public boolean hasLiveData(int nowInSec);
+    public boolean hasLiveData(int nowInSec, boolean enforceStrictLiveness);
 
     /**
      * Returns a cell for a simple column.
@@ -203,10 +208,20 @@ public interface Row extends Unfiltered, Collection<ColumnData>
      *
      * @param purger the {@code DeletionPurger} to use to decide what can be purged.
      * @param nowInSec the current time to decide what is deleted and what isn't (in the case of expired cells).
+     * @param enforceStrictLiveness whether the row should be purged if there is no PK liveness info,
+     *                              normally retrieved from {@link TableMetadata#enforceStrictLiveness()}
+     *
+     *        When enforceStrictLiveness is set, rows with empty PK liveness info
+     *        and no row deletion are purged.
+     *
+     *        Currently this is only used by views with normal base column as PK column
+     *        so updates to other base columns do not make the row live when the PK column
+     *        is not live. See CASSANDRA-11500.
+     *
      * @return this row but without any deletion info purged by {@code purger}. If the purged row is empty, returns
-     * {@code null}.
+     *         {@code null}.
      */
-    public Row purge(DeletionPurger purger, int nowInSec);
+    public Row purge(DeletionPurger purger, int nowInSec, boolean enforceStrictLiveness);
 
     /**
      * Returns a copy of this row which only include the data queried by {@code filter}, excluding anything _fetched_ for
@@ -298,6 +313,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
             return time.isLive() ? LIVE : new Deletion(time, false);
         }
 
+        @Deprecated
         public static Deletion shadowable(DeletionTime time)
         {
             return new Deletion(time, true);
@@ -360,10 +376,10 @@ public interface Row extends Unfiltered, Collection<ColumnData>
             return time.deletes(cell);
         }
 
-        public void digest(MessageDigest digest)
+        public void digest(Hasher hasher)
         {
-            time.digest(digest);
-            FBUtilities.updateWithBoolean(digest, isShadowable);
+            time.digest(hasher);
+            HashingUtils.updateWithBoolean(hasher, isShadowable);
         }
 
         public int dataSize()
@@ -721,8 +737,23 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
             public void reduce(int idx, ColumnData data)
             {
-                column = data.column();
+                if (useColumnMetadata(data.column()))
+                    column = data.column();
+
                 versions.add(data);
+            }
+
+            /**
+             * Determines it the {@code ColumnMetadata} is the one that should be used.
+             * @param dataColumn the {@code ColumnMetadata} to use.
+             * @return {@code true} if the {@code ColumnMetadata} is the one that should be used, {@code false} otherwise.
+             */
+            private boolean useColumnMetadata(ColumnMetadata dataColumn)
+            {
+                if (column == null)
+                    return true;
+
+                return AbstractTypeVersionComparator.INSTANCE.compare(column.type, dataColumn.type) < 0;
             }
 
             protected ColumnData getReduced()
@@ -774,6 +805,7 @@ public interface Row extends Unfiltered, Collection<ColumnData>
 
             protected void onKeyChange()
             {
+                column = null;
                 versions.clear();
             }
         }

@@ -53,6 +53,7 @@ import org.apache.cassandra.service.paxos.Commit;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.triggers.TriggerExecutor;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -65,6 +66,8 @@ import static org.apache.cassandra.cql3.statements.RequestValidations.checkNull;
 public abstract class ModificationStatement implements CQLStatement
 {
     protected static final Logger logger = LoggerFactory.getLogger(ModificationStatement.class);
+
+    private final static MD5Digest EMPTY_HASH = MD5Digest.wrap(new byte[] {});
 
     public static final String CUSTOM_EXPRESSIONS_NOT_ALLOWED =
         "Custom index expressions cannot be used in WHERE clauses for UPDATE or DELETE statements";
@@ -416,6 +419,13 @@ public abstract class ModificationStatement implements CQLStatement
         return !conditions.isEmpty();
     }
 
+    public boolean hasSlices()
+    {
+        return type.allowClusteringColumnSlices()
+               && getRestrictions().hasClusteringColumnsRestrictions()
+               && getRestrictions().isColumnRange();
+    }
+
     public ResultMessage execute(QueryState queryState, QueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
@@ -490,6 +500,19 @@ public abstract class ModificationStatement implements CQLStatement
         conditions.addConditionsTo(request, clustering, options);
     }
 
+    private static ResultSet.ResultMetadata buildCASSuccessMetadata(String ksName, String cfName)
+    {
+        List<ColumnSpecification> specs = new ArrayList<>();
+        specs.add(casResultColumnSpecification(ksName, cfName));
+
+        return new ResultSet.ResultMetadata(EMPTY_HASH, specs);
+    }
+
+    private static ColumnSpecification casResultColumnSpecification(String ksName, String cfName)
+    {
+        return new ColumnSpecification(ksName, cfName, CAS_RESULT_COLUMN, BooleanType.instance);
+    }
+
     private ResultSet buildCasResultSet(RowIterator partition, QueryOptions options) throws InvalidRequestException
     {
         return buildCasResultSet(keyspace(), columnFamily(), partition, getColumnsWithConditions(), false, options);
@@ -500,8 +523,7 @@ public abstract class ModificationStatement implements CQLStatement
     {
         boolean success = partition == null;
 
-        ColumnSpecification spec = new ColumnSpecification(ksName, tableName, CAS_RESULT_COLUMN, BooleanType.instance);
-        ResultSet.ResultMetadata metadata = new ResultSet.ResultMetadata(Collections.singletonList(spec));
+        ResultSet.ResultMetadata metadata = buildCASSuccessMetadata(ksName, tableName);
         List<List<ByteBuffer>> rows = Collections.singletonList(Collections.singletonList(BooleanType.instance.decompose(success)));
 
         ResultSet rs = new ResultSet(metadata, rows);
@@ -528,7 +550,7 @@ public abstract class ModificationStatement implements CQLStatement
             row.addAll(right.rows.get(i));
             rows.add(row);
         }
-        return new ResultSet(new ResultSet.ResultMetadata(specs), rows);
+        return new ResultSet(new ResultSet.ResultMetadata(EMPTY_HASH, specs), rows);
     }
 
     private static ResultSet buildCasFailureResultSet(RowIterator partition, Iterable<ColumnMetadata> columnsWithConditions, boolean isBatch, QueryOptions options)
@@ -636,11 +658,9 @@ public abstract class ModificationStatement implements CQLStatement
     {
         List<ByteBuffer> keys = buildPartitionKeyNames(options);
 
-        if (type.allowClusteringColumnSlices()
-                && restrictions.hasClusteringColumnsRestrictions()
-                && restrictions.isColumnRange())
+        if (hasSlices())
         {
-            Slices slices = createSlice(options);
+            Slices slices = createSlices(options);
 
             // If all the ranges were invalid we do not need to do anything.
             if (slices.isEmpty())
@@ -704,7 +724,7 @@ public abstract class ModificationStatement implements CQLStatement
         }
     }
 
-    private Slices createSlice(QueryOptions options)
+    Slices createSlices(QueryOptions options)
     {
         SortedSet<ClusteringBound> startBounds = restrictions.getClusteringColumnsBounds(Bound.START, options);
         SortedSet<ClusteringBound> endBounds = restrictions.getClusteringColumnsBounds(Bound.END, options);

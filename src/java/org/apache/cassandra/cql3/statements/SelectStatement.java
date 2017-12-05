@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.Maps;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -569,18 +570,10 @@ public class SelectStatement implements CQLStatement
         if (keyBounds == null)
             return ReadQuery.EMPTY;
 
-        PartitionRangeReadCommand command = new PartitionRangeReadCommand(table,
-                                                                          nowInSec,
-                                                                          columnFilter,
-                                                                          rowFilter,
-                                                                          limit,
-                                                                          new DataRange(keyBounds, clusteringIndexFilter),
-                                                                          Optional.empty());
-        // If there's a secondary index that the command can use, have it validate
-        // the request parameters. Note that as a side effect, if a viable Index is
-        // identified by the CFS's index manager, it will be cached in the command
-        // and serialized during distribution to replicas in order to avoid performing
-        // further lookups.
+        PartitionRangeReadCommand command =
+            PartitionRangeReadCommand.create(table, nowInSec, columnFilter, rowFilter, limit, new DataRange(keyBounds, clusteringIndexFilter));
+
+        // If there's a secondary index that the command can use, have it validate the request parameters.
         command.maybeValidateIndex();
 
         return command;
@@ -989,7 +982,7 @@ public class SelectStatement implements CQLStatement
                 assert !forView;
                 verifyOrderingIsAllowed(restrictions);
                 orderingComparator = getOrderingComparator(table, selection, restrictions, orderingColumns);
-                isReversed = isReversed(table, orderingColumns);
+                isReversed = isReversed(table, orderingColumns, restrictions);
                 if (isReversed)
                     orderingComparator = Collections.reverseOrder(orderingComparator);
             }
@@ -1116,7 +1109,7 @@ public class SelectStatement implements CQLStatement
          * @param metadata the table metadata
          * @param selection the selection
          * @param restrictions the restrictions
-         * @param isDistinct <code>true</code> if the query is a DISTINCT one. 
+         * @param isDistinct <code>true</code> if the query is a DISTINCT one.
          * @return the <code>AggregationSpecification</code>s used to make the aggregates
          */
         private AggregationSpecification getAggregationSpecification(TableMetadata metadata,
@@ -1178,8 +1171,8 @@ public class SelectStatement implements CQLStatement
 
             Map<ColumnIdentifier, Integer> orderingIndexes = getOrderingIndex(metadata, selection, orderingColumns);
 
-            List<Integer> idToSort = new ArrayList<Integer>();
-            List<Comparator<ByteBuffer>> sorters = new ArrayList<Comparator<ByteBuffer>>();
+            List<Integer> idToSort = new ArrayList<Integer>(orderingColumns.size());
+            List<Comparator<ByteBuffer>> sorters = new ArrayList<Comparator<ByteBuffer>>(orderingColumns.size());
 
             for (ColumnMetadata orderingColumn : orderingColumns.keySet())
             {
@@ -1194,7 +1187,7 @@ public class SelectStatement implements CQLStatement
                                                                 Selection selection,
                                                                 Map<ColumnMetadata, Boolean> orderingColumns)
         {
-            Map<ColumnIdentifier, Integer> orderingIndexes = new HashMap<>();
+            Map<ColumnIdentifier, Integer> orderingIndexes = Maps.newHashMapWithExpectedSize(orderingColumns.size());
             for (ColumnMetadata def : orderingColumns.keySet())
             {
                 int index = selection.getResultSetIndex(def);
@@ -1203,7 +1196,7 @@ public class SelectStatement implements CQLStatement
             return orderingIndexes;
         }
 
-        private boolean isReversed(TableMetadata table, Map<ColumnMetadata, Boolean> orderingColumns) throws InvalidRequestException
+        private boolean isReversed(TableMetadata table, Map<ColumnMetadata, Boolean> orderingColumns, StatementRestrictions restrictions) throws InvalidRequestException
         {
             Boolean[] reversedMap = new Boolean[table.clusteringColumns().size()];
             int i = 0;
@@ -1215,9 +1208,12 @@ public class SelectStatement implements CQLStatement
                 checkTrue(def.isClusteringColumn(),
                           "Order by is currently only supported on the clustered columns of the PRIMARY KEY, got %s", def.name);
 
-                checkTrue(i++ == def.position(),
-                          "Order by currently only support the ordering of columns following their declared order in the PRIMARY KEY");
-
+                while (i != def.position())
+                {
+                    checkTrue(restrictions.isColumnRestrictedByEq(table.clusteringColumns().get(i++)),
+                              "Order by currently only supports the ordering of columns following their declared order in the PRIMARY KEY");
+                }
+                i++;
                 reversedMap[def.position()] = (reversed != def.isReversedType());
             }
 

@@ -25,11 +25,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.BiFunction;
-
+import java.util.function.BiPredicate;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
 
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -552,7 +552,7 @@ public class Directories
 
         public long getAvailableSpace()
         {
-            long availableSpace = location.getUsableSpace() - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
+            long availableSpace = FileUtils.getUsableSpace(location) - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();
             return availableSpace > 0 ? availableSpace : 0;
         }
 
@@ -565,7 +565,6 @@ public class Directories
             DataDirectory that = (DataDirectory) o;
 
             return location.equals(that.location);
-
         }
 
         @Override
@@ -734,7 +733,7 @@ public class Directories
             filtered = true;
         }
 
-        private BiFunction<File, FileType, Boolean> getFilter()
+        private BiPredicate<File, FileType> getFilter()
         {
             // This function always return false since it adds to the components map
             return (file, type) ->
@@ -780,8 +779,9 @@ public class Directories
      */
     public Map<String, Pair<Long, Long>> getSnapshotDetails()
     {
-        final Map<String, Pair<Long, Long>> snapshotSpaceMap = new HashMap<>();
-        for (File snapshot : listSnapshots())
+        List<File> snapshots = listSnapshots();
+        final Map<String, Pair<Long, Long>> snapshotSpaceMap = Maps.newHashMapWithExpectedSize(snapshots.size());
+        for (File snapshot : snapshots)
         {
             final long sizeOnDisk = FileUtils.folderSize(snapshot);
             final long trueSize = getTrueAllocatedSizeIn(snapshot);
@@ -928,7 +928,7 @@ public class Directories
         }
         catch (IOException e)
         {
-            logger.error("Could not calculate the size of {}. {}", input, e);
+            logger.error("Could not calculate the size of {}. {}", input, e.getMessage());
         }
 
         return visitor.getAllocatedSize();

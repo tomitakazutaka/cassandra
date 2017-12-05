@@ -34,7 +34,7 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.exceptions.CDCWriteException;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
@@ -104,9 +104,20 @@ public class CommitLog implements CommitLogMBean
         this.archiver = archiver;
         metrics = new CommitLogMetrics();
 
-        executor = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch
-                ? new BatchCommitLogService(this)
-                : new PeriodicCommitLogService(this);
+        switch (DatabaseDescriptor.getCommitLogSync())
+        {
+            case periodic:
+                executor = new PeriodicCommitLogService(this);
+                break;
+            case batch:
+                executor = new BatchCommitLogService(this);
+                break;
+            case group:
+                executor = new GroupCommitLogService(this);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown commitlog service type: " + DatabaseDescriptor.getCommitLogSync());
+        }
 
         segmentManager = DatabaseDescriptor.isCDCEnabled()
                          ? new CommitLogSegmentManagerCDC(this, DatabaseDescriptor.getCommitLogLocation())
@@ -135,7 +146,7 @@ public class CommitLog implements CommitLogMBean
 
         // submit all files for this segment manager for archiving prior to recovery - CASSANDRA-6904
         // The files may have already been archived by normal CommitLog operation. This may cause errors in this
-        // archiving pass, which we should not treat as serious. 
+        // archiving pass, which we should not treat as serious.
         for (File file : new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter))
         {
             archiver.maybeArchive(file.getPath(), file.getName());
@@ -239,9 +250,9 @@ public class CommitLog implements CommitLogMBean
      * Add a Mutation to the commit log. If CDC is enabled, this can fail.
      *
      * @param mutation the Mutation to add to the log
-     * @throws WriteTimeoutException
+     * @throws CDCWriteException
      */
-    public CommitLogPosition add(Mutation mutation) throws WriteTimeoutException
+    public CommitLogPosition add(Mutation mutation) throws CDCWriteException
     {
         assert mutation != null;
 
@@ -364,8 +375,9 @@ public class CommitLog implements CommitLogMBean
 
     public List<String> getActiveSegmentNames()
     {
-        List<String> segmentNames = new ArrayList<>();
-        for (CommitLogSegment seg : segmentManager.getActiveSegments())
+        Collection<CommitLogSegment> segments = segmentManager.getActiveSegments();
+        List<String> segmentNames = new ArrayList<>(segments.size());
+        for (CommitLogSegment seg : segments)
             segmentNames.add(seg.getName());
         return segmentNames;
     }
@@ -431,6 +443,7 @@ public class CommitLog implements CommitLogMBean
     }
 
     /**
+     * FOR TESTING PURPOSES
      */
     public void stopUnsafe(boolean deleteSegments)
     {
@@ -448,7 +461,6 @@ public class CommitLog implements CommitLogMBean
         if (DatabaseDescriptor.isCDCEnabled() && deleteSegments)
             for (File f : new File(DatabaseDescriptor.getCDCLogLocation()).listFiles())
                 FileUtils.deleteWithConfirm(f);
-
     }
 
     /**

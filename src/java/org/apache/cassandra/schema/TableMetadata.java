@@ -24,6 +24,9 @@ import java.util.Objects;
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.*;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.auth.DataResource;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
@@ -44,9 +47,28 @@ import static org.apache.cassandra.schema.IndexMetadata.isNameValid;
 @Unmetered
 public final class TableMetadata
 {
+    private static final Logger logger = LoggerFactory.getLogger(TableMetadata.class);
+    private static final ImmutableSet<Flag> DEFAULT_CQL_FLAGS = ImmutableSet.of(Flag.COMPOUND);
+    private static final ImmutableSet<Flag> DEPRECATED_CS_FLAGS = ImmutableSet.of(Flag.DENSE, Flag.SUPER);
+
+    public static final String COMPACT_STORAGE_HALT_MESSAGE =
+             "Compact Tables are not allowed in Cassandra starting with 4.0 version. " +
+             "Use `ALTER ... DROP COMPACT STORAGE` command supplied in 3.x/3.11 Cassandra " +
+             "in order to migrate off Compact Storage.";
+
+    private static final String COMPACT_STORAGE_DEPRECATION_MESSAGE =
+             "Incorrect set of flags is was detected in table {}.{}: '{}'. \n" +
+             "Starting with version 4.0, '{}' flags are deprecated and every table has to have COMPOUND flag. \n" +
+             "Forcing the following set of flags: '{}'";
+
     public enum Flag
     {
         SUPER, COUNTER, DENSE, COMPOUND;
+
+        public static boolean isCQLCompatible(Set<Flag> flags)
+        {
+            return !flags.contains(Flag.DENSE) && !flags.contains(Flag.SUPER) && flags.contains(Flag.COMPOUND);
+        }
 
         public static Set<Flag> fromStringSet(Set<String> strings)
         {
@@ -102,13 +124,21 @@ public final class TableMetadata
 
     private TableMetadata(Builder builder)
     {
+        if (!Flag.isCQLCompatible(builder.flags))
+        {
+            flags = ImmutableSet.copyOf(Sets.union(Sets.difference(builder.flags, DEPRECATED_CS_FLAGS), DEFAULT_CQL_FLAGS));
+            logger.warn(COMPACT_STORAGE_DEPRECATION_MESSAGE, builder.keyspace, builder.name,  builder.flags, DEPRECATED_CS_FLAGS, flags);
+        }
+        else
+        {
+            flags = Sets.immutableEnumSet(builder.flags);
+        }
         keyspace = builder.keyspace;
         name = builder.name;
         id = builder.id;
 
         partitioner = builder.partitioner;
         params = builder.params.build();
-        flags = Sets.immutableEnumSet(builder.flags);
         isView = builder.isView;
 
         indexName = name.contains(".")
@@ -507,7 +537,7 @@ public final class TableMetadata
 
     private void except(String format, Object... args)
     {
-        throw new ConfigurationException(format(format, args));
+        throw new ConfigurationException(keyspace + "." + name + ": " +format(format, args));
     }
 
     @Override
@@ -852,7 +882,7 @@ public final class TableMetadata
         public Builder recordDeprecatedSystemColumn(String name, AbstractType<?> type)
         {
             // As we play fast and loose with the removal timestamp, make sure this is misued for a non system table.
-            assert SchemaConstants.isSystemKeyspace(keyspace);
+            assert SchemaConstants.isLocalSystemKeyspace(keyspace);
             recordColumnDrop(ColumnMetadata.regularColumn(keyspace, this.name, name, type), Long.MAX_VALUE);
             return this;
         }
@@ -952,5 +982,18 @@ public final class TableMetadata
 
             return this;
         }
+    }
+    
+    /**
+     * A table with strict liveness filters/ignores rows without PK liveness info,
+     * effectively tying the row liveness to its primary key liveness.
+     *
+     * Currently this is only used by views with normal base column as PK column
+     * so updates to other columns do not make the row live when the base column
+     * is not live. See CASSANDRA-11500.
+     */
+    public boolean enforceStrictLiveness()
+    {
+        return isView && Keyspace.open(keyspace).viewManager.getByName(name).enforceStrictLiveness();
     }
 }

@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.LongPredicate;
 import java.util.stream.Collectors;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
@@ -50,7 +51,7 @@ import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.db.view.ViewBuilder;
+import org.apache.cassandra.db.view.ViewBuilderTask;
 import org.apache.cassandra.dht.Bounds;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -123,11 +124,18 @@ public class CompactionManager implements CompactionManagerMBean
     private final CompactionExecutor executor = new CompactionExecutor();
     private final CompactionExecutor validationExecutor = new ValidationExecutor();
     private final static CompactionExecutor cacheCleanupExecutor = new CacheCleanupExecutor();
+    private final CompactionExecutor viewBuildExecutor = new ViewBuildExecutor();
 
-    private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor);
+    private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor, viewBuildExecutor);
     private final Multiset<ColumnFamilyStore> compactingCF = ConcurrentHashMultiset.create();
 
     private final RateLimiter compactionRateLimiter = RateLimiter.create(Double.MAX_VALUE);
+
+    @VisibleForTesting
+    CompactionMetrics getMetrics()
+    {
+        return metrics;
+    }
 
     /**
      * Gets compaction rate limiter.
@@ -209,6 +217,7 @@ public class CompactionManager implements CompactionManagerMBean
         // shutdown executors to prevent further submission
         executor.shutdown();
         validationExecutor.shutdown();
+        viewBuildExecutor.shutdown();
 
         // interrupt compactions and validations
         for (Holder compactionHolder : CompactionMetrics.getCompactions())
@@ -219,7 +228,7 @@ public class CompactionManager implements CompactionManagerMBean
         // wait for tasks to terminate
         // compaction tasks are interrupted above, so it shuold be fairy quick
         // until not interrupted tasks to complete.
-        for (ExecutorService exec : Arrays.asList(executor, validationExecutor))
+        for (ExecutorService exec : Arrays.asList(executor, validationExecutor, viewBuildExecutor))
         {
             try
             {
@@ -520,9 +529,7 @@ public class CompactionManager implements CompactionManagerMBean
             return AllSSTableOpStatus.ABORTED;
         }
 
-        final List<Range<Token>> localRanges = Range.sort(r);
-        final Directories.DataDirectory[] locations = cfs.getDirectories().getWriteableLocations();
-        final List<PartitionPosition> diskBoundaries = StorageService.getDiskBoundaries(localRanges, cfs.getPartitioner(), locations);
+        final List<PartitionPosition> diskBoundaries = cfs.getDiskBoundaries().positions;
 
         return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
         {
@@ -534,7 +541,7 @@ public class CompactionManager implements CompactionManagerMBean
                 transaction.cancel(Sets.difference(originals, needsRelocation));
 
                 Map<Integer, List<SSTableReader>> groupedByDisk = needsRelocation.stream().collect(Collectors.groupingBy((s) ->
-                        CompactionStrategyManager.getCompactionStrategyIndex(cfs, cfs.getDirectories(), s)));
+                        CompactionStrategyManager.getCompactionStrategyIndex(cfs, s)));
 
                 int maxSize = 0;
                 for (List<SSTableReader> diskSSTables : groupedByDisk.values())
@@ -554,7 +561,7 @@ public class CompactionManager implements CompactionManagerMBean
             {
                 if (!cfs.getPartitioner().splitter().isPresent())
                     return true;
-                int directoryIndex = CompactionStrategyManager.getCompactionStrategyIndex(cfs, cfs.getDirectories(), sstable);
+                int directoryIndex = CompactionStrategyManager.getCompactionStrategyIndex(cfs, sstable);
                 Directories.DataDirectory[] locations = cfs.getDirectories().getWriteableLocations();
 
                 Directories.DataDirectory location = locations[directoryIndex];
@@ -592,16 +599,19 @@ public class CompactionManager implements CompactionManagerMBean
             }
         };
 
-        ListenableFutureTask<?> task = ListenableFutureTask.create(runnable, null);
+        ListenableFuture<?> task = null;
         try
         {
-            executor.submitIfRunning(task, "pending anticompaction");
+            task = executor.submitIfRunning(runnable, "pending anticompaction");
             return task;
         }
         finally
         {
-            if (task.isCancelled())
+            if (task == null || task.isCancelled())
+            {
                 sstables.release();
+                txn.abort();
+            }
         }
     }
 
@@ -625,25 +635,20 @@ public class CompactionManager implements CompactionManagerMBean
                                       UUID pendingRepair,
                                       UUID parentRepairSession) throws InterruptedException, IOException
     {
-        ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(parentRepairSession);
-        Preconditions.checkArgument(!prs.isPreview(), "Cannot anticompact for previews");
-
-        logger.info("{} Starting anticompaction for {}.{} on {}/{} sstables", PreviewKind.NONE.logPrefix(parentRepairSession), cfs.keyspace.getName(), cfs.getTableName(), validatedForRepair.size(), cfs.getLiveSSTables());
-        logger.trace("{} Starting anticompaction for ranges {}", PreviewKind.NONE.logPrefix(parentRepairSession), ranges);
-        Set<SSTableReader> sstables = new HashSet<>(validatedForRepair);
-        Set<SSTableReader> mutatedRepairStatuses = new HashSet<>();
-        // we should only notify that repair status changed if it actually did:
-        Set<SSTableReader> mutatedRepairStatusToNotify = new HashSet<>();
-        Map<SSTableReader, Boolean> wasRepairedBefore = new HashMap<>();
-        for (SSTableReader sstable : sstables)
-            wasRepairedBefore.put(sstable, sstable.isRepaired());
-
-        Set<SSTableReader> nonAnticompacting = new HashSet<>();
-
-        Iterator<SSTableReader> sstableIterator = sstables.iterator();
         try
         {
+            ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(parentRepairSession);
+            Preconditions.checkArgument(!prs.isPreview(), "Cannot anticompact for previews");
+
+            logger.info("{} Starting anticompaction for {}.{} on {}/{} sstables", PreviewKind.NONE.logPrefix(parentRepairSession), cfs.keyspace.getName(), cfs.getTableName(), validatedForRepair.size(), cfs.getLiveSSTables().size());
+            logger.trace("{} Starting anticompaction for ranges {}", PreviewKind.NONE.logPrefix(parentRepairSession), ranges);
+            Set<SSTableReader> sstables = new HashSet<>(validatedForRepair);
+
+            Set<SSTableReader> nonAnticompacting = new HashSet<>();
+
+            Iterator<SSTableReader> sstableIterator = sstables.iterator();
             List<Range<Token>> normalizedRanges = Range.normalize(ranges);
+            Set<SSTableReader> fullyContainedSSTables = new HashSet<>();
 
             while (sstableIterator.hasNext())
             {
@@ -658,11 +663,7 @@ public class CompactionManager implements CompactionManagerMBean
                     if (r.contains(sstableRange))
                     {
                         logger.info("{} SSTable {} fully contained in range {}, mutating repairedAt instead of anticompacting", PreviewKind.NONE.logPrefix(parentRepairSession), sstable, r);
-                        sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, repairedAt, pendingRepair);
-                        sstable.reloadSSTableMetadata();
-                        mutatedRepairStatuses.add(sstable);
-                        if (!wasRepairedBefore.get(sstable))
-                            mutatedRepairStatusToNotify.add(sstable);
+                        fullyContainedSSTables.add(sstable);
                         sstableIterator.remove();
                         shouldAnticompact = true;
                         break;
@@ -681,10 +682,10 @@ public class CompactionManager implements CompactionManagerMBean
                     sstableIterator.remove();
                 }
             }
-            cfs.metric.bytesMutatedAnticompaction.inc(SSTableReader.getTotalBytes(mutatedRepairStatuses));
-            cfs.getTracker().notifySSTableRepairedStatusChanged(mutatedRepairStatusToNotify);
-            txn.cancel(Sets.union(nonAnticompacting, mutatedRepairStatuses));
-            validatedForRepair.release(Sets.union(nonAnticompacting, mutatedRepairStatuses));
+            cfs.metric.bytesMutatedAnticompaction.inc(SSTableReader.getTotalBytes(fullyContainedSSTables));
+            cfs.getCompactionStrategyManager().mutateRepaired(fullyContainedSSTables, repairedAt, pendingRepair);
+            txn.cancel(Sets.union(nonAnticompacting, fullyContainedSSTables));
+            validatedForRepair.release(Sets.union(nonAnticompacting, fullyContainedSSTables));
             assert txn.originals().equals(sstables);
             if (!sstables.isEmpty())
                 doAntiCompaction(cfs, ranges, txn, repairedAt, pendingRepair);
@@ -808,7 +809,7 @@ public class CompactionManager implements CompactionManagerMBean
             descriptors.put(cfs, cfs.getDirectories().find(new File(filename.trim()).getName()));
         }
 
-        List<Future<?>> futures = new ArrayList<>();
+        List<Future<?>> futures = new ArrayList<>(descriptors.size());
         int nowInSec = FBUtilities.nowInSeconds();
         for (ColumnFamilyStore cfs : descriptors.keySet())
             futures.add(submitUserDefined(cfs, descriptors.get(cfs), getDefaultGcBefore(cfs, nowInSec)));
@@ -1312,9 +1313,6 @@ public class CompactionManager implements CompactionManagerMBean
         Refs<SSTableReader> sstables = null;
         try
         {
-
-            int gcBefore;
-            int nowInSec = FBUtilities.nowInSeconds();
             UUID parentRepairSessionId = validator.desc.parentSessionId;
             String snapshotName;
             boolean isGlobalSnapshotValidation = cfs.snapshotExists(parentRepairSessionId.toString());
@@ -1330,17 +1328,10 @@ public class CompactionManager implements CompactionManagerMBean
                 // note that we populate the parent repair session when creating the snapshot, meaning the sstables in the snapshot are the ones we
                 // are supposed to validate.
                 sstables = cfs.getSnapshotSSTableReaders(snapshotName);
-
-
-                // Computing gcbefore based on the current time wouldn't be very good because we know each replica will execute
-                // this at a different time (that's the whole purpose of repair with snaphsot). So instead we take the creation
-                // time of the snapshot, which should give us roughtly the same time on each replica (roughtly being in that case
-                // 'as good as in the non-snapshot' case)
-                gcBefore = cfs.gcBefore((int)(cfs.getSnapshotCreationTime(snapshotName) / 1000));
             }
             else
             {
-                if (!validator.isConsistent)
+                if (!validator.isIncremental)
                 {
                     // flush first so everyone is validating data that is as similar as possible
                     StorageService.instance.forceKeyspaceFlush(cfs.keyspace.getName(), cfs.name);
@@ -1348,10 +1339,6 @@ public class CompactionManager implements CompactionManagerMBean
                 sstables = getSSTablesToValidate(cfs, validator);
                 if (sstables == null)
                     return; // this means the parent repair session was removed - the repair session failed on another node and we removed it
-                if (validator.gcBefore > 0)
-                    gcBefore = validator.gcBefore;
-                else
-                    gcBefore = getDefaultGcBefore(cfs, nowInSec);
             }
 
             // Create Merkle trees suitable to hold estimated partitions for the given ranges.
@@ -1360,8 +1347,8 @@ public class CompactionManager implements CompactionManagerMBean
             long start = System.nanoTime();
             long partitionCount = 0;
             try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables, validator.desc.ranges);
-                 ValidationCompactionController controller = new ValidationCompactionController(cfs, gcBefore);
-                 CompactionIterator ci = new ValidationCompactionIterator(scanners.scanners, controller, nowInSec, metrics))
+                 ValidationCompactionController controller = new ValidationCompactionController(cfs, getDefaultGcBefore(cfs, validator.nowInSec));
+                 CompactionIterator ci = new ValidationCompactionIterator(scanners.scanners, controller, validator.nowInSec, metrics))
             {
                 // validate the CF as we iterate over it
                 validator.prepare(cfs, tree);
@@ -1461,7 +1448,7 @@ public class CompactionManager implements CompactionManagerMBean
             predicate = prs.getPreviewPredicate();
 
         }
-        else if (validator.isConsistent)
+        else if (validator.isIncremental)
         {
             predicate = s -> validator.desc.parentSessionId.equals(s.getSSTableMetadata().pendingRepair);
         }
@@ -1716,7 +1703,7 @@ public class CompactionManager implements CompactionManagerMBean
         }
 
         @Override
-        public java.util.function.Predicate<Long> getPurgeEvaluator(DecoratedKey key)
+        public LongPredicate getPurgeEvaluator(DecoratedKey key)
         {
             /*
              * The main reason we always purge is that including gcable tombstone would mean that the
@@ -1733,37 +1720,27 @@ public class CompactionManager implements CompactionManagerMBean
         }
     }
 
-    public Future<?> submitViewBuilder(final ViewBuilder builder)
+    public ListenableFuture<Long> submitViewBuilder(final ViewBuilderTask task)
     {
-        Runnable runnable = new Runnable()
-        {
-            public void run()
+        return viewBuildExecutor.submitIfRunning(() -> {
+            metrics.beginCompaction(task);
+            try
             {
-                metrics.beginCompaction(builder);
-                try
-                {
-                    builder.run();
-                }
-                finally
-                {
-                    metrics.finishCompaction(builder);
-                }
+                return task.call();
             }
-        };
-        if (executor.isShutdown())
-        {
-            logger.info("Compaction executor has shut down, not submitting index build");
-            return null;
-        }
-
-        return executor.submit(runnable);
+            finally
+            {
+                metrics.finishCompaction(task);
+            }
+        }, "view build");
     }
+
     public int getActiveCompactions()
     {
         return CompactionMetrics.getCompactions().size();
     }
 
-    private static class CompactionExecutor extends JMXEnabledThreadPoolExecutor
+    static class CompactionExecutor extends JMXEnabledThreadPoolExecutor
     {
         protected CompactionExecutor(int minThreads, int maxThreads, String name, BlockingQueue<Runnable> queue)
         {
@@ -1832,7 +1809,7 @@ public class CompactionManager implements CompactionManagerMBean
          * @return the future that will deliver the task result, or a future that has already been
          *         cancelled if the task could not be submitted.
          */
-        public ListenableFuture<?> submitIfRunning(Callable<?> task, String name)
+        public <T> ListenableFuture<T> submitIfRunning(Callable<T> task, String name)
         {
             if (isShutdown())
             {
@@ -1842,8 +1819,8 @@ public class CompactionManager implements CompactionManagerMBean
 
             try
             {
-                ListenableFutureTask ret = ListenableFutureTask.create(task);
-                submit(ret);
+                ListenableFutureTask<T> ret = ListenableFutureTask.create(task);
+                execute(ret);
                 return ret;
             }
             catch (RejectedExecutionException ex)
@@ -1863,6 +1840,14 @@ public class CompactionManager implements CompactionManagerMBean
         public ValidationExecutor()
         {
             super(1, DatabaseDescriptor.getConcurrentValidations(), "ValidationExecutor", new SynchronousQueue<Runnable>());
+        }
+    }
+
+    private static class ViewBuildExecutor extends CompactionExecutor
+    {
+        public ViewBuildExecutor()
+        {
+            super(DatabaseDescriptor.getConcurrentViewBuilders(), "ViewBuildExecutor");
         }
     }
 
@@ -1989,6 +1974,22 @@ public class CompactionManager implements CompactionManagerMBean
         validationExecutor.setMaximumPoolSize(value);
     }
 
+    public void setConcurrentViewBuilders(int value)
+    {
+        if (value > viewBuildExecutor.getCorePoolSize())
+        {
+            // we are increasing the value
+            viewBuildExecutor.setMaximumPoolSize(value);
+            viewBuildExecutor.setCorePoolSize(value);
+        }
+        else if (value < viewBuildExecutor.getCorePoolSize())
+        {
+            // we are reducing the value
+            viewBuildExecutor.setCorePoolSize(value);
+            viewBuildExecutor.setMaximumPoolSize(value);
+        }
+    }
+
     public int getCoreCompactorThreads()
     {
         return executor.getCorePoolSize();
@@ -2027,6 +2028,26 @@ public class CompactionManager implements CompactionManagerMBean
     public void setMaximumValidatorThreads(int number)
     {
         validationExecutor.setMaximumPoolSize(number);
+    }
+
+    public int getCoreViewBuildThreads()
+    {
+        return viewBuildExecutor.getCorePoolSize();
+    }
+
+    public void setCoreViewBuildThreads(int number)
+    {
+        viewBuildExecutor.setCorePoolSize(number);
+    }
+
+    public int getMaximumViewBuildThreads()
+    {
+        return viewBuildExecutor.getMaximumPoolSize();
+    }
+
+    public void setMaximumViewBuildThreads(int number)
+    {
+        viewBuildExecutor.setMaximumPoolSize(number);
     }
 
     /**

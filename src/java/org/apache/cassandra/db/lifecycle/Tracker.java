@@ -245,7 +245,7 @@ public class Tracker
             // It is important that any method accepting/returning a Throwable never throws an exception, and does its best
             // to complete the instructions given to it
             List<LogTransaction.Obsoletion> obsoletions = new ArrayList<>();
-            accumulate = prepareForObsoletion(removed, txnLogs, obsoletions, accumulate);
+            accumulate = prepareForBulkObsoletion(removed, txnLogs, obsoletions, accumulate);
             try
             {
                 txnLogs.finish();
@@ -504,5 +504,13 @@ public class Tracker
     public View getView()
     {
         return view.get();
+    }
+
+    @VisibleForTesting
+    public void removeUnsafe(Set<SSTableReader> toRemove)
+    {
+        Pair<View, View> result = apply(view -> {
+            return updateLiveSet(toRemove, emptySet()).apply(view);
+        });
     }
 }

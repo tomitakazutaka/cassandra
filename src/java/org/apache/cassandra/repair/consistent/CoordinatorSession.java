@@ -22,7 +22,6 @@ import java.net.InetAddress;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
@@ -139,7 +138,7 @@ public class CoordinatorSession extends ConsistentSession
         MessagingService.instance().sendOneWay(messageOut, destination);
     }
 
-    public ListenableFuture<Boolean> prepare(Executor executor)
+    public ListenableFuture<Boolean> prepare()
     {
         Preconditions.checkArgument(allStates(State.PREPARING));
 
@@ -147,7 +146,7 @@ public class CoordinatorSession extends ConsistentSession
         PrepareConsistentRequest message = new PrepareConsistentRequest(sessionID, coordinator, participants);
         for (final InetAddress participant : participants)
         {
-            executor.execute(() -> sendMessage(participant, message));
+            sendMessage(participant, message);
         }
         return prepareFuture;
     }
@@ -181,14 +180,14 @@ public class CoordinatorSession extends ConsistentSession
         setAll(State.REPAIRING);
     }
 
-    public synchronized ListenableFuture<Boolean> finalizePropose(Executor executor)
+    public synchronized ListenableFuture<Boolean> finalizePropose()
     {
         Preconditions.checkArgument(allStates(State.REPAIRING));
         logger.debug("Proposing finalization of repair session {}", sessionID);
         FinalizePropose message = new FinalizePropose(sessionID);
         for (final InetAddress participant : participants)
         {
-            executor.execute(() -> sendMessage(participant, message));
+            sendMessage(participant, message);
         }
         return finalizeProposeFuture;
     }
@@ -217,25 +216,20 @@ public class CoordinatorSession extends ConsistentSession
         }
     }
 
-    public synchronized void finalizeCommit(Executor executor)
+    public synchronized void finalizeCommit()
     {
         Preconditions.checkArgument(allStates(State.FINALIZE_PROMISED));
         logger.debug("Committing finalization of repair session {}", sessionID);
         FinalizeCommit message = new FinalizeCommit(sessionID);
         for (final InetAddress participant : participants)
         {
-            executor.execute(() -> sendMessage(participant, message));
+            sendMessage(participant, message);
         }
         setAll(State.FINALIZED);
         logger.info("Incremental repair session {} completed", sessionID);
     }
 
-    public void fail()
-    {
-        fail(MoreExecutors.directExecutor());
-    }
-
-    public synchronized void fail(Executor executor)
+    public synchronized void fail()
     {
         logger.info("Incremental repair session {} failed", sessionID);
         FailSession message = new FailSession(sessionID);
@@ -243,10 +237,14 @@ public class CoordinatorSession extends ConsistentSession
         {
             if (participantStates.get(participant) != State.FAILED)
             {
-                executor.execute(() -> sendMessage(participant, message));
+                sendMessage(participant, message);
             }
         }
         setAll(State.FAILED);
+
+        String exceptionMsg = String.format("Incremental repair session %s has failed", sessionID);
+        finalizeProposeFuture.setException(new RuntimeException(exceptionMsg));
+        prepareFuture.setException(new RuntimeException(exceptionMsg));
     }
 
     private static String formatDuration(long then, long now)
@@ -262,15 +260,15 @@ public class CoordinatorSession extends ConsistentSession
     /**
      * Runs the asynchronous consistent repair session. Actual repair sessions are scheduled via a submitter to make unit testing easier
      */
-    public ListenableFuture execute(Executor executor, Supplier<ListenableFuture<List<RepairSessionResult>>> sessionSubmitter, AtomicBoolean hasFailure)
+    public ListenableFuture execute(Supplier<ListenableFuture<List<RepairSessionResult>>> sessionSubmitter, AtomicBoolean hasFailure)
     {
         logger.info("Beginning coordination of incremental repair session {}", sessionID);
 
         sessionStart = System.currentTimeMillis();
-        ListenableFuture<Boolean> prepareResult = prepare(executor);
+        ListenableFuture<Boolean> prepareResult = prepare();
 
         // run repair sessions normally
-        ListenableFuture<List<RepairSessionResult>> repairSessionResults = Futures.transform(prepareResult, new AsyncFunction<Boolean, List<RepairSessionResult>>()
+        ListenableFuture<List<RepairSessionResult>> repairSessionResults = Futures.transformAsync(prepareResult, new AsyncFunction<Boolean, List<RepairSessionResult>>()
         {
             public ListenableFuture<List<RepairSessionResult>> apply(Boolean success) throws Exception
             {
@@ -290,10 +288,10 @@ public class CoordinatorSession extends ConsistentSession
                 }
 
             }
-        });
+        }, MoreExecutors.directExecutor());
 
         // mark propose finalization
-        ListenableFuture<Boolean> proposeFuture = Futures.transform(repairSessionResults, new AsyncFunction<List<RepairSessionResult>, Boolean>()
+        ListenableFuture<Boolean> proposeFuture = Futures.transformAsync(repairSessionResults, new AsyncFunction<List<RepairSessionResult>, Boolean>()
         {
             public ListenableFuture<Boolean> apply(List<RepairSessionResult> results) throws Exception
             {
@@ -309,10 +307,10 @@ public class CoordinatorSession extends ConsistentSession
                 }
                 else
                 {
-                    return finalizePropose(executor);
+                    return finalizePropose();
                 }
             }
-        });
+        }, MoreExecutors.directExecutor());
 
         // commit repaired data
         Futures.addCallback(proposeFuture, new FutureCallback<Boolean>()
@@ -325,7 +323,7 @@ public class CoordinatorSession extends ConsistentSession
                     {
                         logger.debug("Incremental repair {} finalization phase completed in {}", sessionID, formatDuration(finalizeStart, System.currentTimeMillis()));
                     }
-                    finalizeCommit(executor);
+                    finalizeCommit();
                     if (logger.isDebugEnabled())
                     {
                         logger.debug("Incremental repair {} phase completed in {}", sessionID, formatDuration(sessionStart, System.currentTimeMillis()));
@@ -334,7 +332,7 @@ public class CoordinatorSession extends ConsistentSession
                 else
                 {
                     hasFailure.set(true);
-                    fail(executor);
+                    fail();
                 }
             }
 
@@ -345,7 +343,7 @@ public class CoordinatorSession extends ConsistentSession
                     logger.debug("Incremental repair {} phase failed in {}", sessionID, formatDuration(sessionStart, System.currentTimeMillis()));
                 }
                 hasFailure.set(true);
-                fail(executor);
+                fail();
             }
         });
 

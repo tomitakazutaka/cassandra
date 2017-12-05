@@ -1306,14 +1306,13 @@ public class SASIIndexTest
         RowFilter filter = RowFilter.create();
         filter.add(store.metadata().getColumn(firstName), Operator.LIKE_CONTAINS, AsciiType.instance.fromString("a"));
 
-        ReadCommand command = new PartitionRangeReadCommand(store.metadata(),
-                                                            FBUtilities.nowInSeconds(),
-                                                            ColumnFilter.all(store.metadata()),
-                                                            filter,
-                                                            DataLimits.NONE,
-                                                            DataRange.allData(store.metadata().partitioner),
-                                                            Optional.empty());
-
+        ReadCommand command =
+            PartitionRangeReadCommand.create(store.metadata(),
+                                             FBUtilities.nowInSeconds(),
+                                             ColumnFilter.all(store.metadata()),
+                                             filter,
+                                             DataLimits.NONE,
+                                             DataRange.allData(store.metadata().partitioner));
         try
         {
             new QueryPlan(store, command, 0).execute(ReadExecutionController.empty());
@@ -1653,6 +1652,20 @@ public class SASIIndexTest
 
         Assert.assertEquals(true,  indexE.isIndexed());
         Assert.assertEquals(false, indexE.isLiteral());
+
+        // test frozen-collection
+        ColumnMetadata columnF = ColumnMetadata.regularColumn(KS_NAME,
+                                                              CF_NAME,
+                                                              "special-F",
+                                                              ListType.getInstance(UTF8Type.instance, false));
+
+        ColumnIndex indexF = new ColumnIndex(UTF8Type.instance, columnF, IndexMetadata.fromSchemaMetadata("special-index-F", IndexMetadata.Kind.CUSTOM, new HashMap<String, String>()
+        {{
+            put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, SASIIndex.class.getName());
+        }}));
+
+        Assert.assertEquals(true,  indexF.isIndexed());
+        Assert.assertEquals(false, indexF.isLiteral());
     }
 
     @Test
@@ -2256,13 +2269,13 @@ public class SASIIndexTest
         ColumnIndex index = ((SASIIndex) store.indexManager.getIndexByName(store.name + "_first_name")).getIndex();
         IndexMemtable beforeFlushMemtable = index.getCurrentMemtable();
 
-        PartitionRangeReadCommand command = new PartitionRangeReadCommand(store.metadata(),
-                                                                          FBUtilities.nowInSeconds(),
-                                                                          ColumnFilter.all(store.metadata()),
-                                                                          RowFilter.NONE,
-                                                                          DataLimits.NONE,
-                                                                          DataRange.allData(store.getPartitioner()),
-                                                                          Optional.empty());
+        PartitionRangeReadCommand command =
+            PartitionRangeReadCommand.create(store.metadata(),
+                                             FBUtilities.nowInSeconds(),
+                                             ColumnFilter.all(store.metadata()),
+                                             RowFilter.NONE,
+                                             DataLimits.NONE,
+                                             DataRange.allData(store.getPartitioner()));
 
         QueryController controller = new QueryController(store, command, Integer.MAX_VALUE);
         org.apache.cassandra.index.sasi.plan.Expression expression =
@@ -2396,13 +2409,13 @@ public class SASIIndexTest
         for (Expression e : expressions)
             filter.add(store.metadata().getColumn(e.name), e.op, e.value);
 
-        ReadCommand command = new PartitionRangeReadCommand(store.metadata(),
-                                                            FBUtilities.nowInSeconds(),
-                                                            columnFilter,
-                                                            filter,
-                                                            DataLimits.cqlLimits(maxResults),
-                                                            range,
-                                                            Optional.empty());
+        ReadCommand command =
+            PartitionRangeReadCommand.create(store.metadata(),
+                                             FBUtilities.nowInSeconds(),
+                                             columnFilter,
+                                             filter,
+                                             DataLimits.cqlLimits(maxResults),
+                                             range);
 
         return command.executeLocally(command.executionController());
     }

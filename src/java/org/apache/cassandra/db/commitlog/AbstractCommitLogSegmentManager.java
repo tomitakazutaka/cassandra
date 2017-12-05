@@ -22,7 +22,7 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.*;
@@ -32,6 +32,7 @@ import org.slf4j.LoggerFactory;
 import net.nicoulaj.compilecommand.annotations.DontInline;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.schema.TableId;
@@ -84,6 +85,8 @@ public abstract class AbstractCommitLogSegmentManager
     private Thread managerThread;
     protected final CommitLog commitLog;
     private volatile boolean shutdown;
+    private final BooleanSupplier managerThreadWaitCondition = () -> (availableSegment == null && !atSegmentBufferLimit()) || shutdown;
+    private final WaitQueue managerThreadWaitQueue = new WaitQueue();
 
     private static final SimpleCachedBufferPool bufferPool =
         new SimpleCachedBufferPool(DatabaseDescriptor.getCommitLogMaxCompressionBuffersInPool(), DatabaseDescriptor.getCommitLogSegmentSize());
@@ -126,8 +129,6 @@ public abstract class AbstractCommitLogSegmentManager
                         // Writing threads are not waiting for new segments, we can spend time on other tasks.
                         // flush old Cfs if we're full
                         maybeFlushToReclaim();
-
-                        LockSupport.park();
                     }
                     catch (Throwable t)
                     {
@@ -142,8 +143,7 @@ public abstract class AbstractCommitLogSegmentManager
                         // shutting down-- nothing more can or needs to be done in that case.
                     }
 
-                    while (availableSegment != null || atSegmentBufferLimit() && !shutdown)
-                        LockSupport.park();
+                    WaitQueue.waitOnCondition(managerThreadWaitCondition, managerThreadWaitQueue);
                 }
             }
         };
@@ -181,17 +181,10 @@ public abstract class AbstractCommitLogSegmentManager
         }
     }
 
-
     /**
      * Allocate a segment within this CLSM. Should either succeed or throw.
      */
     public abstract Allocation allocate(Mutation mutation, int size);
-
-    /**
-     * The recovery and replay process replays mutations into memtables and flushes them to disk. Individual CLSM
-     * decide what to do with those segments on disk after they've been replayed.
-     */
-    abstract void handleReplayedSegment(final File file);
 
     /**
      * Hook to allow segment managers to track state surrounding creation of new segments. Onl perform as task submit
@@ -330,6 +323,18 @@ public abstract class AbstractCommitLogSegmentManager
         // if archiving (command) was not successful then leave the file alone. don't delete or recycle.
         logger.debug("Segment {} is no longer active and will be deleted {}", segment, archiveSuccess ? "now" : "by the archive script");
         discard(segment, archiveSuccess);
+    }
+
+    /**
+     * Delete untracked segment files after replay
+     *
+     * @param file segment file that is no longer in use.
+     */
+    void handleReplayedSegment(final File file)
+    {
+        // (don't decrease managed size, since this was never a "live" segment)
+        logger.trace("(Unopened) segment {} is no longer needed and will be deleted now", file);
+        FileUtils.deleteWithConfirm(file);
     }
 
     /**
@@ -531,7 +536,7 @@ public abstract class AbstractCommitLogSegmentManager
 
     void wakeManager()
     {
-        LockSupport.unpark(managerThread);
+        managerThreadWaitQueue.signalAll();
     }
 
     /**

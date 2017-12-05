@@ -91,7 +91,8 @@ public class KeysSearcher extends CassandraIndexSearcher
                                                                                            command.rowFilter(),
                                                                                            DataLimits.NONE,
                                                                                            key,
-                                                                                           command.clusteringIndexFilter(key));
+                                                                                           command.clusteringIndexFilter(key),
+                                                                                           null);
 
                     @SuppressWarnings("resource") // filterIfStale closes it's iterator if either it materialize it or if it returns null.
                                                   // Otherwise, we close right away if empty, and if it's assigned to next it will be called either
@@ -144,7 +145,6 @@ public class KeysSearcher extends CassandraIndexSearcher
                                                 OpOrder.Group writeOp,
                                                 int nowInSec)
     {
-        assert iterator.metadata().isCompactTable();
         Row data = iterator.staticRow();
         if (index.isStale(data, indexedValue, nowInSec))
         {

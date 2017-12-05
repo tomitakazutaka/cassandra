@@ -293,15 +293,7 @@ public abstract class AbstractCompactionStrategy
         }
         catch (Throwable t)
         {
-            try
-            {
-                new ScannerList(scanners).close();
-            }
-            catch (Throwable t2)
-            {
-                t.addSuppressed(t2);
-            }
-            throw t;
+            ISSTableScanner.closeAllAndPropagate(scanners, t);
         }
         return new ScannerList(scanners);
     }
@@ -385,24 +377,7 @@ public abstract class AbstractCompactionStrategy
 
         public void close()
         {
-            Throwable t = null;
-            for (ISSTableScanner scanner : scanners)
-            {
-                try
-                {
-                    scanner.close();
-                }
-                catch (Throwable t2)
-                {
-                    JVMStabilityInspector.inspectThrowable(t2);
-                    if (t == null)
-                        t = t2;
-                    else
-                        t.addSuppressed(t2);
-                }
-            }
-            if (t != null)
-                throw Throwables.propagate(t);
+            ISSTableScanner.closeAllAndPropagate(scanners, null);
         }
     }
 
@@ -564,7 +539,7 @@ public abstract class AbstractCompactionStrategy
         Collections.sort(sortedSSTablesToGroup, SSTableReader.sstableComparator);
 
         Collection<Collection<SSTableReader>> groupedSSTables = new ArrayList<>();
-        Collection<SSTableReader> currGroup = new ArrayList<>();
+        Collection<SSTableReader> currGroup = new ArrayList<>(groupSize);
 
         for (SSTableReader sstable : sortedSSTablesToGroup)
         {
@@ -572,7 +547,7 @@ public abstract class AbstractCompactionStrategy
             if (currGroup.size() == groupSize)
             {
                 groupedSSTables.add(currGroup);
-                currGroup = new ArrayList<>();
+                currGroup = new ArrayList<>(groupSize);
             }
         }
 

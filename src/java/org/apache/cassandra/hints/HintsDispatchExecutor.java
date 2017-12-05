@@ -24,7 +24,7 @@ import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
-import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import com.google.common.util.concurrent.RateLimiter;
@@ -50,17 +50,17 @@ final class HintsDispatchExecutor
     private final File hintsDirectory;
     private final ExecutorService executor;
     private final AtomicBoolean isPaused;
-    private final Function<InetAddress, Boolean> isAlive;
+    private final Predicate<InetAddress> isAlive;
     private final Map<UUID, Future> scheduledDispatches;
 
-    HintsDispatchExecutor(File hintsDirectory, int maxThreads, AtomicBoolean isPaused, Function<InetAddress, Boolean> isAlive)
+    HintsDispatchExecutor(File hintsDirectory, int maxThreads, AtomicBoolean isPaused, Predicate<InetAddress> isAlive)
     {
         this.hintsDirectory = hintsDirectory;
         this.isPaused = isPaused;
         this.isAlive = isAlive;
 
         scheduledDispatches = new ConcurrentHashMap<>();
-        executor = new JMXEnabledThreadPoolExecutor(maxThreads, maxThreads,1, TimeUnit.MINUTES,
+        executor = new JMXEnabledThreadPoolExecutor(maxThreads, 1, TimeUnit.MINUTES,
                                                     new LinkedBlockingQueue<>(),
                                                     new NamedThreadFactory("HintsDispatcher", Thread.MIN_PRIORITY),
                                                     "internal");
@@ -240,7 +240,9 @@ final class HintsDispatchExecutor
                 }
                 catch (FSReadError e)
                 {
-                    logger.error("Failed to dispatch hints file {}: file is corrupted ({})", descriptor.fileName(), e);
+                    logger.error("Failed to dispatch hints file {}: file is corrupted ({})",
+                                 descriptor.fileName(),
+                                 e.getMessage());
                     store.cleanUp(descriptor);
                     store.blacklist(descriptor);
                     throw e;
@@ -269,7 +271,7 @@ final class HintsDispatchExecutor
             File file = new File(hintsDirectory, descriptor.fileName());
             InputPosition offset = store.getDispatchOffset(descriptor);
 
-            BooleanSupplier shouldAbort = () -> !isAlive.apply(address) || isPaused.get();
+            BooleanSupplier shouldAbort = () -> !isAlive.test(address) || isPaused.get();
             try (HintsDispatcher dispatcher = HintsDispatcher.create(file, rateLimiter, address, descriptor.hostId, shouldAbort))
             {
                 if (offset != null)

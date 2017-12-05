@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 
@@ -71,20 +72,57 @@ public class SinglePartitionReadCommand extends ReadCommand
 
     private int oldestUnrepairedTombstone = Integer.MAX_VALUE;
 
-    public SinglePartitionReadCommand(boolean isDigest,
-                                      int digestVersion,
-                                      TableMetadata metadata,
-                                      int nowInSec,
-                                      ColumnFilter columnFilter,
-                                      RowFilter rowFilter,
-                                      DataLimits limits,
-                                      DecoratedKey partitionKey,
-                                      ClusteringIndexFilter clusteringIndexFilter)
+    @VisibleForTesting
+    protected SinglePartitionReadCommand(boolean isDigest,
+                                         int digestVersion,
+                                         TableMetadata metadata,
+                                         int nowInSec,
+                                         ColumnFilter columnFilter,
+                                         RowFilter rowFilter,
+                                         DataLimits limits,
+                                         DecoratedKey partitionKey,
+                                         ClusteringIndexFilter clusteringIndexFilter,
+                                         IndexMetadata index)
     {
-        super(Kind.SINGLE_PARTITION, isDigest, digestVersion, metadata, nowInSec, columnFilter, rowFilter, limits);
+        super(Kind.SINGLE_PARTITION, isDigest, digestVersion, metadata, nowInSec, columnFilter, rowFilter, limits, index);
         assert partitionKey.getPartitioner() == metadata.partitioner;
         this.partitionKey = partitionKey;
         this.clusteringIndexFilter = clusteringIndexFilter;
+    }
+
+    /**
+     * Creates a new read command on a single partition.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are "now" for this query.
+     * @param columnFilter the column filter to use for the query.
+     * @param rowFilter the row filter to use for the query.
+     * @param limits the limits to use for the query.
+     * @param partitionKey the partition key for the partition to query.
+     * @param clusteringIndexFilter the clustering index filter to use for the query.
+     * @param indexMetadata explicitly specified index to use for the query
+     *
+     * @return a newly created read command.
+     */
+    public static SinglePartitionReadCommand create(TableMetadata metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter,
+                                                    IndexMetadata indexMetadata)
+    {
+        return new SinglePartitionReadCommand(false,
+                                              0,
+                                              metadata,
+                                              nowInSec,
+                                              columnFilter,
+                                              rowFilter,
+                                              limits,
+                                              partitionKey,
+                                              clusteringIndexFilter,
+                                              indexMetadata);
     }
 
     /**
@@ -108,7 +146,14 @@ public class SinglePartitionReadCommand extends ReadCommand
                                                     DecoratedKey partitionKey,
                                                     ClusteringIndexFilter clusteringIndexFilter)
     {
-        return new SinglePartitionReadCommand(false, 0, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, clusteringIndexFilter);
+        return create(metadata,
+                      nowInSec,
+                      columnFilter,
+                      rowFilter,
+                      limits,
+                      partitionKey,
+                      clusteringIndexFilter,
+                      findIndex(metadata, rowFilter));
     }
 
     /**
@@ -122,7 +167,11 @@ public class SinglePartitionReadCommand extends ReadCommand
      *
      * @return a newly created read command. The returned command will use no row filter and have no limits.
      */
-    public static SinglePartitionReadCommand create(TableMetadata metadata, int nowInSec, DecoratedKey key, ColumnFilter columnFilter, ClusteringIndexFilter filter)
+    public static SinglePartitionReadCommand create(TableMetadata metadata,
+                                                    int nowInSec,
+                                                    DecoratedKey key,
+                                                    ColumnFilter columnFilter,
+                                                    ClusteringIndexFilter filter)
     {
         return create(metadata, nowInSec, columnFilter, RowFilter.NONE, DataLimits.NONE, key, filter);
     }
@@ -138,7 +187,7 @@ public class SinglePartitionReadCommand extends ReadCommand
      */
     public static SinglePartitionReadCommand fullPartitionRead(TableMetadata metadata, int nowInSec, DecoratedKey key)
     {
-        return SinglePartitionReadCommand.create(metadata, nowInSec, key, Slices.ALL);
+        return create(metadata, nowInSec, key, Slices.ALL);
     }
 
     /**
@@ -152,7 +201,7 @@ public class SinglePartitionReadCommand extends ReadCommand
      */
     public static SinglePartitionReadCommand fullPartitionRead(TableMetadata metadata, int nowInSec, ByteBuffer key)
     {
-        return SinglePartitionReadCommand.create(metadata, nowInSec, metadata.partitioner.decorateKey(key), Slices.ALL);
+        return create(metadata, nowInSec, metadata.partitioner.decorateKey(key), Slices.ALL);
     }
 
     /**
@@ -185,7 +234,7 @@ public class SinglePartitionReadCommand extends ReadCommand
     public static SinglePartitionReadCommand create(TableMetadata metadata, int nowInSec, DecoratedKey key, Slices slices)
     {
         ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(slices, false);
-        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
+        return create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
     }
 
     /**
@@ -218,7 +267,7 @@ public class SinglePartitionReadCommand extends ReadCommand
     public static SinglePartitionReadCommand create(TableMetadata metadata, int nowInSec, DecoratedKey key, NavigableSet<Clustering> names)
     {
         ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(names, false);
-        return SinglePartitionReadCommand.create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
+        return create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);
     }
 
     /**
@@ -239,7 +288,44 @@ public class SinglePartitionReadCommand extends ReadCommand
 
     public SinglePartitionReadCommand copy()
     {
-        return new SinglePartitionReadCommand(isDigestQuery(), digestVersion(), metadata(), nowInSec(), columnFilter(), rowFilter(), limits(), partitionKey(), clusteringIndexFilter());
+        return new SinglePartitionReadCommand(isDigestQuery(),
+                                              digestVersion(),
+                                              metadata(),
+                                              nowInSec(),
+                                              columnFilter(),
+                                              rowFilter(),
+                                              limits(),
+                                              partitionKey(),
+                                              clusteringIndexFilter(),
+                                              indexMetadata());
+    }
+
+    public SinglePartitionReadCommand copyAsDigestQuery()
+    {
+        return new SinglePartitionReadCommand(true,
+                                              digestVersion(),
+                                              metadata(),
+                                              nowInSec(),
+                                              columnFilter(),
+                                              rowFilter(),
+                                              limits(),
+                                              partitionKey(),
+                                              clusteringIndexFilter(),
+                                              indexMetadata());
+    }
+
+    public SinglePartitionReadCommand withUpdatedLimit(DataLimits newLimits)
+    {
+        return new SinglePartitionReadCommand(isDigestQuery(),
+                                              digestVersion(),
+                                              metadata(),
+                                              nowInSec(),
+                                              columnFilter(),
+                                              rowFilter(),
+                                              newLimits,
+                                              partitionKey(),
+                                              clusteringIndexFilter(),
+                                              indexMetadata());
     }
 
     public DecoratedKey partitionKey()
@@ -304,19 +390,6 @@ public class SinglePartitionReadCommand extends ReadCommand
                       lastReturned == null ? clusteringIndexFilter() : clusteringIndexFilter.forPaging(metadata().comparator, lastReturned, false));
     }
 
-    public SinglePartitionReadCommand withUpdatedLimit(DataLimits newLimits)
-    {
-        return new SinglePartitionReadCommand(isDigestQuery(),
-                                              digestVersion(),
-                                              metadata(),
-                                              nowInSec(),
-                                              columnFilter(),
-                                              rowFilter(),
-                                              newLimits,
-                                              partitionKey,
-                                              clusteringIndexFilter);
-    }
-
     public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
     {
         return StorageProxy.read(Group.one(this), consistency, clientState, queryStartNanoTime);
@@ -377,7 +450,7 @@ public class SinglePartitionReadCommand extends ReadCommand
             }
 
             CachedPartition cachedPartition = (CachedPartition)cached;
-            if (cfs.isFilterFullyCoveredBy(clusteringIndexFilter(), limits(), cachedPartition, nowInSec()))
+            if (cfs.isFilterFullyCoveredBy(clusteringIndexFilter(), limits(), cachedPartition, nowInSec(), metadata().enforceStrictLiveness()))
             {
                 cfs.metric.rowCacheHit.inc();
                 Tracing.trace("Row cache hit");
@@ -415,13 +488,40 @@ public class SinglePartitionReadCommand extends ReadCommand
 
             try
             {
-                int rowsToCache = metadata().params.caching.rowsPerPartitionToCache();
+                final int rowsToCache = metadata().params.caching.rowsPerPartitionToCache();
+                final boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
+
                 @SuppressWarnings("resource") // we close on exception or upon closing the result of this method
-                UnfilteredRowIterator iter = SinglePartitionReadCommand.fullPartitionRead(metadata(), nowInSec(), partitionKey()).queryMemtableAndDisk(cfs, executionController);
+                UnfilteredRowIterator iter = fullPartitionRead(metadata(), nowInSec(), partitionKey()).queryMemtableAndDisk(cfs, executionController);
                 try
                 {
+                    // Use a custom iterator instead of DataLimits to avoid stopping the original iterator
+                    UnfilteredRowIterator toCacheIterator = new WrappingUnfilteredRowIterator(iter)
+                    {
+                        private int rowsCounted = 0;
+
+                        @Override
+                        public boolean hasNext()
+                        {
+                            return rowsCounted < rowsToCache && super.hasNext();
+                        }
+
+                        @Override
+                        public Unfiltered next()
+                        {
+                            Unfiltered unfiltered = super.next();
+                            if (unfiltered.isRow())
+                            {
+                                Row row = (Row) unfiltered;
+                                if (row.hasLiveData(nowInSec(), enforceStrictLiveness))
+                                    rowsCounted++;
+                            }
+                            return unfiltered;
+                        }
+                    };
+
                     // We want to cache only rowsToCache rows
-                    CachedPartition toCache = CachedBTreePartition.create(DataLimits.cqlLimits(rowsToCache).filter(iter, nowInSec()), nowInSec());
+                    CachedPartition toCache = CachedBTreePartition.create(toCacheIterator, nowInSec());
                     if (sentinelSuccess && !toCache.isEmpty())
                     {
                         Tracing.trace("Caching {} rows", toCache.rowCount());
@@ -894,6 +994,13 @@ public class SinglePartitionReadCommand extends ReadCommand
     }
 
     @Override
+    public boolean selectsFullPartition()
+    {
+        return metadata().isStaticCompactTable() ||
+               (clusteringIndexFilter.selectsAllPartition() && !rowFilter().hasExpressionOnClusteringOrRegularColumns());
+    }
+
+    @Override
     public String toString()
     {
         return String.format("Read(%s columns=%s rowFilter=%s limits=%s key=%s filter=%s, nowInSec=%d)",
@@ -939,6 +1046,11 @@ public class SinglePartitionReadCommand extends ReadCommand
              + ClusteringIndexFilter.serializer.serializedSize(clusteringIndexFilter(), version);
     }
 
+    public boolean isLimitedToOnePartition()
+    {
+        return true;
+    }
+
     /**
      * Groups multiple single partition read commands.
      */
@@ -947,13 +1059,16 @@ public class SinglePartitionReadCommand extends ReadCommand
         public final List<SinglePartitionReadCommand> commands;
         private final DataLimits limits;
         private final int nowInSec;
+        private final boolean selectsFullPartitions;
 
         public Group(List<SinglePartitionReadCommand> commands, DataLimits limits)
         {
             assert !commands.isEmpty();
             this.commands = commands;
             this.limits = limits;
-            this.nowInSec = commands.get(0).nowInSec();
+            SinglePartitionReadCommand firstCommand = commands.get(0);
+            this.nowInSec = firstCommand.nowInSec();
+            this.selectsFullPartitions = firstCommand.selectsFullPartition();
             for (int i = 1; i < commands.size(); i++)
                 assert commands.get(i).nowInSec() == nowInSec;
         }
@@ -983,6 +1098,12 @@ public class SinglePartitionReadCommand extends ReadCommand
             return commands.get(0).metadata();
         }
 
+        @Override
+        public boolean selectsFullPartition()
+        {
+            return selectsFullPartitions;
+        }
+
         public ReadExecutionController executionController()
         {
             // Note that the only difference between the command in a group must be the partition key on which
@@ -992,7 +1113,13 @@ public class SinglePartitionReadCommand extends ReadCommand
 
         public PartitionIterator executeInternal(ReadExecutionController controller)
         {
-            return limits.filter(UnfilteredPartitionIterators.filter(executeLocally(controller, false), nowInSec), nowInSec);
+            // Note that the only difference between the command in a group must be the partition key on which
+            // they applied.
+            boolean enforceStrictLiveness = commands.get(0).metadata().enforceStrictLiveness();
+            return limits.filter(UnfilteredPartitionIterators.filter(executeLocally(controller, false), nowInSec),
+                                 nowInSec,
+                                 selectsFullPartitions,
+                                 enforceStrictLiveness);
         }
 
         public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
@@ -1050,12 +1177,21 @@ public class SinglePartitionReadCommand extends ReadCommand
 
     private static class Deserializer extends SelectionDeserializer
     {
-        public ReadCommand deserialize(DataInputPlus in, int version, boolean isDigest, int digestVersion, TableMetadata metadata, int nowInSec, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limits, Optional<IndexMetadata> index)
+        public ReadCommand deserialize(DataInputPlus in,
+                                       int version,
+                                       boolean isDigest,
+                                       int digestVersion,
+                                       TableMetadata metadata,
+                                       int nowInSec,
+                                       ColumnFilter columnFilter,
+                                       RowFilter rowFilter,
+                                       DataLimits limits,
+                                       IndexMetadata index)
         throws IOException
         {
             DecoratedKey key = metadata.partitioner.decorateKey(metadata.partitionKeyType.readValue(in, DatabaseDescriptor.getMaxValueSize()));
             ClusteringIndexFilter filter = ClusteringIndexFilter.serializer.deserialize(in, version, metadata);
-            return new SinglePartitionReadCommand(isDigest, digestVersion, metadata, nowInSec, columnFilter, rowFilter, limits, key, filter);
+            return new SinglePartitionReadCommand(isDigest, digestVersion, metadata, nowInSec, columnFilter, rowFilter, limits, key, filter, index);
         }
     }
 

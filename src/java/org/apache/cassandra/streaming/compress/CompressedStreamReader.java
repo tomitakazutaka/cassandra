@@ -18,8 +18,6 @@
 package org.apache.cassandra.streaming.compress;
 
 import java.io.IOException;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
 
 import com.google.common.base.Throwables;
 import org.slf4j.Logger;
@@ -28,7 +26,8 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.io.compress.CompressionMetadata;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
-import org.apache.cassandra.io.util.TrackedInputStream;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.TrackedDataInputPlus;
 import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamReader;
 import org.apache.cassandra.streaming.StreamSession;
@@ -59,8 +58,8 @@ public class CompressedStreamReader extends StreamReader
      * @throws java.io.IOException if reading the remote sstable fails. Will throw an RTE if local write fails.
      */
     @Override
-    @SuppressWarnings("resource") // channel needs to remain open, streams on top of it can't be closed
-    public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
+    @SuppressWarnings("resource") // input needs to remain open, streams on top of it can't be closed
+    public SSTableMultiWriter read(DataInputPlus inputPlus) throws IOException
     {
         long totalSize = totalSize();
 
@@ -76,14 +75,12 @@ public class CompressedStreamReader extends StreamReader
                      session.planId(), fileSeqNum, session.peer, repairedAt, totalSize, cfs.keyspace.getName(), pendingRepair,
                      cfs.getTableName());
 
-        CompressedInputStream cis = new CompressedInputStream(Channels.newInputStream(channel), compressionInfo,
-                                                              ChecksumType.CRC32, cfs::getCrcCheckChance);
-        TrackedInputStream in = new TrackedInputStream(cis);
-
-        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata(), in, inputVersion, getHeader(cfs.metadata()));
+        StreamDeserializer deserializer = null;
         SSTableMultiWriter writer = null;
-        try
+        try (CompressedInputStream cis = new CompressedInputStream(inputPlus, compressionInfo, ChecksumType.CRC32, cfs::getCrcCheckChance))
         {
+            TrackedDataInputPlus in = new TrackedDataInputPlus(cis);
+            deserializer = new StreamDeserializer(cfs.metadata(), in, inputVersion, getHeader(cfs.metadata()));
             writer = createWriter(cfs, totalSize, repairedAt, pendingRepair, format);
             String filename = writer.getFilename();
             int sectionIdx = 0;
@@ -110,8 +107,9 @@ public class CompressedStreamReader extends StreamReader
         }
         catch (Throwable e)
         {
+            Object partitionKey = deserializer != null ? deserializer.partitionKey() : "";
             logger.warn("[Stream {}] Error while reading partition {} from stream on ks='{}' and table='{}'.",
-                        session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getTableName());
+                        session.planId(), partitionKey, cfs.keyspace.getName(), cfs.getTableName());
             if (writer != null)
             {
                 writer.abort(e);

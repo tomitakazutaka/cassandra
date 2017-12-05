@@ -56,6 +56,7 @@ import org.apache.cassandra.auth.AuthSchemaChangeListener;
 import org.apache.cassandra.batchlog.BatchRemoveVerbHandler;
 import org.apache.cassandra.batchlog.BatchStoreVerbHandler;
 import org.apache.cassandra.batchlog.BatchlogManager;
+import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.Stage;
@@ -119,8 +120,6 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public static final int RING_DELAY = getRingDelay(); // delay after which we assume ring has stablized
 
     private final JMXProgressSupport progressSupport = new JMXProgressSupport(this);
-
-    private static final AtomicInteger threadCounter = new AtomicInteger(1);
 
     private static int getRingDelay()
     {
@@ -865,7 +864,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                         tokenMetadata.getSizeOfMovingEndpoints() > 0
                     ))
             {
-                throw new UnsupportedOperationException("Other bootstrapping/leaving/moving nodes detected, cannot bootstrap while cassandra.consistent.rangemovement is true");
+                String bootstrapTokens = StringUtils.join(tokenMetadata.getBootstrapTokens().valueSet(), ',');
+                String leavingTokens = StringUtils.join(tokenMetadata.getLeavingEndpoints(), ',');
+                String movingTokens = StringUtils.join(tokenMetadata.getMovingEndpoints().stream().map(e -> e.right).toArray(), ',');
+                throw new UnsupportedOperationException(String.format("Other bootstrapping/leaving/moving nodes detected, cannot bootstrap while cassandra.consistent.rangemovement is true. Nodes detected, bootstrapping: %s; leaving: %s; moving: %s;", bootstrapTokens, leavingTokens, movingTokens));
             }
 
             // get bootstrap tokens
@@ -1055,6 +1057,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         try
         {
+            /*
+             * We use timestamp of 0, intentionally, so that varying timestamps wouldn't cause schema mismatches on
+             * newly added nodes.
+             *
+             * Having the initial/default timestamp as 0 also allows users to make and persist changes to replication
+             * of our replicated system keyspaces.
+             *
+             * In case that we need to make incompatible changes to those kesypaces/tables, we'd need to bump the timestamp
+             * on per-keyspace/per-table basis. So far we've never needed to.
+             */
             MigrationManager.announceNewKeyspace(ksm, 0, false);
         }
         catch (AlreadyExistsException e)
@@ -1310,17 +1322,6 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return DatabaseDescriptor.getTruncateRpcTimeout();
     }
 
-    public void setStreamingSocketTimeout(int value)
-    {
-        DatabaseDescriptor.setStreamingSocketTimeout(value);
-        logger.info("set streaming socket timeout to {} ms", value);
-    }
-
-    public int getStreamingSocketTimeout()
-    {
-        return DatabaseDescriptor.getStreamingSocketTimeout();
-    }
-
     public void setStreamThroughputMbPerSec(int value)
     {
         DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(value);
@@ -1388,6 +1389,19 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         DatabaseDescriptor.setConcurrentValidations(value);
         CompactionManager.instance.setConcurrentValidations(DatabaseDescriptor.getConcurrentValidations());
+    }
+
+    public int getConcurrentViewBuilders()
+    {
+        return DatabaseDescriptor.getConcurrentViewBuilders();
+    }
+
+    public void setConcurrentViewBuilders(int value)
+    {
+        if (value <= 0)
+            throw new IllegalArgumentException("Number of concurrent view builders should be greater than 0.");
+        DatabaseDescriptor.setConcurrentViewBuilders(value);
+        CompactionManager.instance.setConcurrentViewBuilders(DatabaseDescriptor.getConcurrentViewBuilders());
     }
 
     public boolean isIncrementalBackupsEnabled()
@@ -1543,8 +1557,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                 @Override
                 public void onFailure(Throwable e)
                 {
-                    String message = "Error during bootstrap: " + e.getCause().getMessage();
-                    logger.error(message, e.getCause());
+                    String message = "Error during bootstrap: ";
+                    if (e instanceof ExecutionException && e.getCause() != null)
+                    {
+                        message += e.getCause().getMessage();
+                    }
+                    else
+                    {
+                        message += e.getMessage();
+                    }
+                    logger.error(message, e);
                     progressSupport.progress("bootstrap", new ProgressEvent(ProgressEventType.ERROR, 1, 1, message));
                     progressSupport.progress("bootstrap", new ProgressEvent(ProgressEventType.COMPLETE, 1, 1, "Resume bootstrap complete"));
                 }
@@ -2876,7 +2898,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public int forceKeyspaceCleanup(int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
     {
-        if (SchemaConstants.isSystemKeyspace(keyspaceName))
+        if (SchemaConstants.isLocalSystemKeyspace(keyspaceName))
             throw new RuntimeException("Cleanup of the system keyspace is neither necessary nor wise");
 
         CompactionManager.AllSSTableOpStatus status = CompactionManager.AllSSTableOpStatus.SUCCESSFUL;
@@ -3199,7 +3221,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         Map<String, TabularData> snapshotMap = new HashMap<>();
         for (Keyspace keyspace : Keyspace.all())
         {
-            if (SchemaConstants.isSystemKeyspace(keyspace.getName()))
+            if (SchemaConstants.isLocalSystemKeyspace(keyspace.getName()))
                 continue;
 
             for (ColumnFamilyStore cfStore : keyspace.getColumnFamilyStores())
@@ -3225,7 +3247,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         long total = 0;
         for (Keyspace keyspace : Keyspace.all())
         {
-            if (SchemaConstants.isSystemKeyspace(keyspace.getName()))
+            if (SchemaConstants.isLocalSystemKeyspace(keyspace.getName()))
                 continue;
 
             for (ColumnFamilyStore cfStore : keyspace.getColumnFamilyStores())
@@ -3296,7 +3318,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             return 0;
 
         int cmd = nextRepairCommand.incrementAndGet();
-        NamedThreadFactory.createThread(createRepairTask(cmd, keyspace, option), "Repair-Task-" + threadCounter.incrementAndGet()).start();
+        ActiveRepairService.repairCommandExecutor.execute(createRepairTask(cmd, keyspace, option));
         return cmd;
     }
 
@@ -3352,6 +3374,21 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
         RepairRunnable task = new RepairRunnable(this, cmd, options, keyspace);
         task.addProgressListener(progressSupport);
+        if (options.isTraced())
+        {
+            Runnable r = () ->
+            {
+                try
+                {
+                    task.run();
+                }
+                finally
+                {
+                    ExecutorLocals.set(null);
+                }
+            };
+            return new FutureTask<>(r, null);
+        }
         return new FutureTask<>(task, null);
     }
 
@@ -3529,16 +3566,28 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public List<InetAddress> getLiveNaturalEndpoints(Keyspace keyspace, RingPosition pos)
     {
+        List<InetAddress> liveEps = new ArrayList<>();
+        getLiveNaturalEndpoints(keyspace, pos, liveEps);
+        return liveEps;
+    }
+
+    /**
+     * This method attempts to return N endpoints that are responsible for storing the
+     * specified key i.e for replication.
+     *
+     * @param keyspace keyspace name also known as keyspace
+     * @param pos position for which we need to find the endpoint
+     * @param liveEps the list of endpoints to mutate
+     */
+    public void getLiveNaturalEndpoints(Keyspace keyspace, RingPosition pos, List<InetAddress> liveEps)
+    {
         List<InetAddress> endpoints = keyspace.getReplicationStrategy().getNaturalEndpoints(pos);
-        List<InetAddress> liveEps = new ArrayList<>(endpoints.size());
 
         for (InetAddress endpoint : endpoints)
         {
             if (FailureDetector.instance.isAlive(endpoint))
                 liveEps.add(endpoint);
         }
-
-        return liveEps;
     }
 
     public void setLoggingLevel(String classQualifier, String rawLevel) throws Exception
@@ -4906,6 +4955,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         MigrationManager.resetLocalSchema();
     }
 
+    public void reloadLocalSchema()
+    {
+        Schema.instance.reloadSchemaAndAnnounceVersion();
+    }
+
     public void setTraceProbability(double probability)
     {
         this.traceProbability = probability;
@@ -4932,6 +4986,14 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         {
             cfs.enableAutoCompaction();
         }
+    }
+
+    public Map<String, Boolean> getAutoCompactionStatus(String ks, String... tables) throws IOException
+    {
+        Map<String, Boolean> status = new HashMap<String, Boolean>();
+        for (ColumnFamilyStore cfs : getValidColumnFamilies(true, true, ks, tables))
+            status.put(cfs.getTableName(), cfs.isAutoCompactionDisabled());
+        return status;
     }
 
     /** Returns the name of the cluster */
@@ -4974,69 +5036,23 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public void setBatchSizeFailureThreshold(int threshold)
     {
         DatabaseDescriptor.setBatchSizeFailThresholdInKB(threshold);
+        logger.info("Updated batch_size_fail_threshold_in_kb to {}", threshold);
+    }
+
+    public int getBatchSizeWarnThreshold()
+    {
+        return DatabaseDescriptor.getBatchSizeWarnThresholdInKB();
+    }
+
+    public void setBatchSizeWarnThreshold(int threshold)
+    {
+        DatabaseDescriptor.setBatchSizeWarnThresholdInKB(threshold);
+        logger.info("Updated batch_size_warn_threshold_in_kb to {}", threshold);
     }
 
     public void setHintedHandoffThrottleInKB(int throttleInKB)
     {
         DatabaseDescriptor.setHintedHandoffThrottleInKB(throttleInKB);
         logger.info("Updated hinted_handoff_throttle_in_kb to {}", throttleInKB);
-    }
-
-    public static List<PartitionPosition> getDiskBoundaries(ColumnFamilyStore cfs, Directories.DataDirectory[] directories)
-    {
-        if (!cfs.getPartitioner().splitter().isPresent())
-            return null;
-
-        Collection<Range<Token>> lr;
-
-        if (StorageService.instance.isBootstrapMode())
-        {
-            lr = StorageService.instance.getTokenMetadata().getPendingRanges(cfs.keyspace.getName(), FBUtilities.getBroadcastAddress());
-        }
-        else
-        {
-            // Reason we use use the future settled TMD is that if we decommission a node, we want to stream
-            // from that node to the correct location on disk, if we didn't, we would put new files in the wrong places.
-            // We do this to minimize the amount of data we need to move in rebalancedisks once everything settled
-            TokenMetadata tmd = StorageService.instance.getTokenMetadata().cloneAfterAllSettled();
-            lr = cfs.keyspace.getReplicationStrategy().getAddressRanges(tmd).get(FBUtilities.getBroadcastAddress());
-        }
-
-        if (lr == null || lr.isEmpty())
-            return null;
-        List<Range<Token>> localRanges = Range.sort(lr);
-
-        return getDiskBoundaries(localRanges, cfs.getPartitioner(), directories);
-    }
-
-    public static List<PartitionPosition> getDiskBoundaries(ColumnFamilyStore cfs)
-    {
-        return getDiskBoundaries(cfs, cfs.getDirectories().getWriteableLocations());
-    }
-
-    /**
-     * Returns a list of disk boundaries, the result will differ depending on whether vnodes are enabled or not.
-     *
-     * What is returned are upper bounds for the disks, meaning everything from partitioner.minToken up to
-     * getDiskBoundaries(..).get(0) should be on the first disk, everything between 0 to 1 should be on the second disk
-     * etc.
-     *
-     * The final entry in the returned list will always be the partitioner maximum tokens upper key bound
-     */
-    public static List<PartitionPosition> getDiskBoundaries(List<Range<Token>> localRanges, IPartitioner partitioner, Directories.DataDirectory[] dataDirectories)
-    {
-        assert partitioner.splitter().isPresent();
-        Splitter splitter = partitioner.splitter().get();
-        boolean dontSplitRanges = DatabaseDescriptor.getNumTokens() > 1;
-        List<Token> boundaries = splitter.splitOwnedRanges(dataDirectories.length, localRanges, dontSplitRanges);
-        // If we can't split by ranges, split evenly to ensure utilisation of all disks
-        if (dontSplitRanges && boundaries.size() < dataDirectories.length)
-            boundaries = splitter.splitOwnedRanges(dataDirectories.length, localRanges, false);
-
-        List<PartitionPosition> diskBoundaries = new ArrayList<>();
-        for (int i = 0; i < boundaries.size() - 1; i++)
-            diskBoundaries.add(boundaries.get(i).maxKeyBound());
-        diskBoundaries.add(partitioner.getMaximumToken().maxKeyBound());
-        return diskBoundaries;
     }
 }

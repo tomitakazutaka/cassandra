@@ -77,11 +77,11 @@ public class LoaderOptions
     public final int interDcThrottle;
     public final int storagePort;
     public final int sslStoragePort;
-    public final EncryptionOptions.ClientEncryptionOptions clientEncOptions;
+    public final EncryptionOptions clientEncOptions;
     public final int connectionsPerHost;
     public final EncryptionOptions.ServerEncryptionOptions serverEncOptions;
     public final Set<InetAddress> hosts;
-    public final Set<InetAddress> ignores = new HashSet<>();
+    public final Set<InetAddress> ignores;
 
     LoaderOptions(Builder builder)
     {
@@ -101,6 +101,7 @@ public class LoaderOptions
         connectionsPerHost = builder.connectionsPerHost;
         serverEncOptions = builder.serverEncOptions;
         hosts = builder.hosts;
+        ignores = builder.ignores;
     }
 
     static class Builder
@@ -118,7 +119,7 @@ public class LoaderOptions
         int interDcThrottle = 0;
         int storagePort;
         int sslStoragePort;
-        EncryptionOptions.ClientEncryptionOptions clientEncOptions = new EncryptionOptions.ClientEncryptionOptions();
+        EncryptionOptions clientEncOptions = new EncryptionOptions();
         int connectionsPerHost = 1;
         EncryptionOptions.ServerEncryptionOptions serverEncOptions = new EncryptionOptions.ServerEncryptionOptions();
         Set<InetAddress> hosts = new HashSet<>();
@@ -207,7 +208,7 @@ public class LoaderOptions
             return this;
         }
 
-        public Builder encOptions(EncryptionOptions.ClientEncryptionOptions encOptions)
+        public Builder encOptions(EncryptionOptions encOptions)
         {
             this.clientEncOptions = encOptions;
             return this;

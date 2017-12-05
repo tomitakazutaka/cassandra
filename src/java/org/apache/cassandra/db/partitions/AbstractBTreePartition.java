@@ -26,7 +26,6 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
-import org.apache.cassandra.utils.btree.BTreeSearchIterator;
 
 import static org.apache.cassandra.utils.btree.BTree.Dir.desc;
 
@@ -94,7 +93,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 
     public DeletionTime partitionLevelDeletion()
     {
-        return holder().deletionInfo.getPartitionDeletion();
+        return deletionInfo().getPartitionDeletion();
     }
 
     public RegularAndStaticColumns columns()
@@ -131,7 +130,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
         final Holder current = holder();
         return new SearchIterator<Clustering, Row>()
         {
-            private final SearchIterator<Clustering, Row> rawIter = new BTreeSearchIterator<>(current.tree, metadata().comparator, desc(reversed));
+            private final SearchIterator<Clustering, Row> rawIter = BTree.slice(current.tree, metadata().comparator, desc(reversed));
             private final DeletionTime partitionDeletion = current.deletionInfo.getPartitionDeletion();
 
             public Row next(Clustering clustering)
@@ -317,16 +316,20 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
     {
         StringBuilder sb = new StringBuilder();
 
-        sb.append(String.format("[%s] key=%s columns=%s",
-                                metadata().toString(),
+        sb.append(String.format("[%s] key=%s partition_deletion=%s columns=%s",
+                                metadata(),
                                 metadata().partitionKeyType.getString(partitionKey().getKey()),
+                                partitionLevelDeletion(),
                                 columns()));
 
         if (staticRow() != Rows.EMPTY_STATIC_ROW)
-            sb.append("\n    ").append(staticRow().toString(metadata()));
+            sb.append("\n    ").append(staticRow().toString(metadata(), true));
 
-        for (Row row : this)
-            sb.append("\n    ").append(row.toString(metadata()));
+        try (UnfilteredRowIterator iter = unfilteredIterator())
+        {
+            while (iter.hasNext())
+                sb.append("\n    ").append(iter.next().toString(metadata(), true));
+        }
 
         return sb.toString();
     }

@@ -20,6 +20,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.nio.ByteBuffer;
 import java.util.Set;
+import java.util.function.LongPredicate;
 import java.util.function.Predicate;
 
 import com.google.common.collect.Sets;
@@ -179,6 +180,11 @@ public class CompactionControllerTest extends SchemaLoader
         expired = CompactionController.getFullyExpiredSSTables(cfs, compacting, overlapping, gcBefore);
         assertNotNull(expired);
         assertEquals(0, expired.size());
+
+        // Now if we explicitly ask to ignore overlaped sstables, we should get back our expired sstable
+        expired = CompactionController.getFullyExpiredSSTables(cfs, compacting, overlapping, gcBefore, true);
+        assertNotNull(expired);
+        assertEquals(1, expired.size());
     }
 
     private void applyMutation(TableMetadata cfm, DecoratedKey key, long timestamp)
@@ -198,7 +204,7 @@ public class CompactionControllerTest extends SchemaLoader
         .applyUnsafe();
     }
 
-    private void assertPurgeBoundary(Predicate<Long> evaluator, long boundary)
+    private void assertPurgeBoundary(LongPredicate evaluator, long boundary)
     {
         assertFalse(evaluator.test(boundary));
         assertTrue(evaluator.test(boundary - 1));

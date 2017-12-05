@@ -165,6 +165,22 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
         return new SSTableTidier(reader, false, this);
     }
 
+    Map<SSTableReader, SSTableTidier> bulkObsoletion(Iterable<SSTableReader> sstables)
+    {
+        if (!txnFile.isEmpty())
+            throw new IllegalStateException("Bad state when doing bulk obsoletions");
+
+        txnFile.addAll(Type.REMOVE, sstables);
+        Map<SSTableReader, SSTableTidier> tidiers = new HashMap<>();
+        for (SSTableReader sstable : sstables)
+        {
+            if (tracker != null)
+                tracker.notifyDeleting(sstable);
+            tidiers.put(sstable, new SSTableTidier(sstable, false, this));
+        }
+        return tidiers;
+    }
+
     OperationType type()
     {
         return txnFile.type();
@@ -212,7 +228,7 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
                 {
                     e.printStackTrace(ps);
                 }
-                logger.debug("Unable to delete {} as it does not exist, stack trace:\n {}", file, baos.toString());
+                logger.debug("Unable to delete {} as it does not exist, stack trace:\n {}", file, baos);
             }
         }
         catch (IOException e)

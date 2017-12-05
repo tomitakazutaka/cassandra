@@ -545,24 +545,6 @@ public class InsertUpdateIfConditionTest extends CQLTester
                    row(true));
     }
 
-    /**
-     * Test for CAS with compact storage table, and #6813 in particular,
-     * migrated from cql_tests.py:TestCQL.cas_and_compact_test()
-     */
-    @Test
-    public void testCompactStorage() throws Throwable
-    {
-        createTable("CREATE TABLE %s (partition text, key text, owner text, PRIMARY KEY (partition, key) ) WITH COMPACT STORAGE");
-
-        execute("INSERT INTO %s (partition, key, owner) VALUES ('a', 'b', null)");
-        assertRows(execute("UPDATE %s SET owner='z' WHERE partition='a' AND key='b' IF owner=null"), row(true));
-
-        assertRows(execute("UPDATE %s SET owner='b' WHERE partition='a' AND key='b' IF owner='a'"), row(false, "z"));
-        assertRows(execute("UPDATE %s SET owner='b' WHERE partition='a' AND key='b' IF owner='z'"), row(true));
-
-        assertRows(execute("INSERT INTO %s (partition, key, owner) VALUES ('a', 'c', 'x') IF NOT EXISTS"), row(true));
-    }
-
     @Test
     public void testWholeUDT() throws Throwable
     {
@@ -2038,13 +2020,13 @@ public class InsertUpdateIfConditionTest extends CQLTester
     {
         createTable(" CREATE TABLE %s (k int PRIMARY KEY, v int, d duration)");
 
-        assertInvalidMessage("Slice conditions are not supported on durations",
+        assertInvalidMessage("Slice conditions ( > ) are not supported on durations",
                              "UPDATE %s SET v = 3 WHERE k = 0 IF d > 1s");
-        assertInvalidMessage("Slice conditions are not supported on durations",
+        assertInvalidMessage("Slice conditions ( >= ) are not supported on durations",
                              "UPDATE %s SET v = 3 WHERE k = 0 IF d >= 1s");
-        assertInvalidMessage("Slice conditions are not supported on durations",
+        assertInvalidMessage("Slice conditions ( <= ) are not supported on durations",
                              "UPDATE %s SET v = 3 WHERE k = 0 IF d <= 1s");
-        assertInvalidMessage("Slice conditions are not supported on durations",
+        assertInvalidMessage("Slice conditions ( < ) are not supported on durations",
                              "UPDATE %s SET v = 3 WHERE k = 0 IF d < 1s");
 
         execute("INSERT INTO %s (k, v, d) VALUES (1, 1, 2s)");
@@ -2100,13 +2082,13 @@ public class InsertUpdateIfConditionTest extends CQLTester
 
             assertRows(execute("SELECT * FROM %s WHERE k = 1"), row(1, list(Duration.from("5s"), Duration.from("10s")), 6));
 
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( > ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF l[0] > 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( >= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF l[0] >= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( <= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF l[0] <= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( < ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF l[0] < 1s");
 
             assertRows(execute("UPDATE %s SET v = 4 WHERE k = 1 IF l[0] = 2s"), row(false, list(Duration.from("5s"), Duration.from("10s"))));
@@ -2218,13 +2200,13 @@ public class InsertUpdateIfConditionTest extends CQLTester
 
             assertRows(execute("SELECT * FROM %s WHERE k = 1"), row(1, map(1, Duration.from("5s"), 2, Duration.from("10s")), 6));
 
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( > ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF m[1] > 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( >= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF m[1] >= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( <= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF m[1] <= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( < ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF m[1] < 1s");
 
             assertRows(execute("UPDATE %s SET v = 4 WHERE k = 1 IF m[1] = 2s"), row(false, map(1, Duration.from("5s"), 2, Duration.from("10s"))));
@@ -2338,13 +2320,13 @@ public class InsertUpdateIfConditionTest extends CQLTester
 
             assertRows(execute("SELECT * FROM %s WHERE k = 1"), row(1, userType("i", 1, "d", Duration.from("10s")), 6));
 
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( > ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF u.d > 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( >= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF u.d >= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( <= ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF u.d <= 1s");
-            assertInvalidMessage("Slice conditions are not supported on durations",
+            assertInvalidMessage("Slice conditions ( < ) are not supported on durations",
                                  "UPDATE %s SET v = 3 WHERE k = 0 IF u.d < 1s");
 
             assertRows(execute("UPDATE %s SET v = 4 WHERE k = 1 IF u.d = 2s"), row(false, userType("i", 1, "d", Duration.from("10s"))));

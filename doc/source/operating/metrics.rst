@@ -126,6 +126,9 @@ CasPrepare                              Latency        Latency of paxos prepare 
 CasPropose                              Latency        Latency of paxos propose round.
 CasCommit                               Latency        Latency of paxos commit round.
 PercentRepaired                         Gauge<Double>  Percent of table data that is repaired on disk.
+BytesRepaired                           Gauge<Long>    Size of table data repaired on disk
+BytesUnrepaired                         Gauge<Long>    Size of table data unrepaired on disk
+BytesPendingRepair                      Gauge<Long>    Size of table data isolated for an ongoing incremental repair
 SpeculativeRetries                      Counter        Number of times speculative retries were sent for this table.
 SpeculativeFailedRetries                Counter        Number of speculative retries that failed to prevent a timeout
 SpeculativeInsufficientReplicas         Counter        Number of speculative retries that couldn't be attempted due to lack of replicas
@@ -182,7 +185,7 @@ Reported name format:
     ``org.apache.cassandra.metrics.ThreadPools.<MetricName>.<Path>.<ThreadPoolName>``
 
 **JMX MBean**
-    ``org.apache.cassandra.metrics:type=ThreadPools scope=<ThreadPoolName> type=<Type> name=<MetricName>``
+    ``org.apache.cassandra.metrics:type=ThreadPools path=<Path> scope=<ThreadPoolName> name=<MetricName>``
 
 ===================== ============== ===========
 Name                  Type           Description
@@ -193,6 +196,7 @@ CompletedTasks        Counter        Number of tasks completed.
 TotalBlockedTasks     Counter        Number of tasks that were blocked due to queue saturation.
 CurrentlyBlockedTask  Counter        Number of tasks that are currently blocked due to queue saturation but on retry will become unblocked.
 MaxPoolSize           Gauge<Integer> The maximum number of threads in this pool.
+MaxTasksQueued        Gauge<Integer> The maximum number of tasks queued before a task get blocked.
 ===================== ============== ===========
 
 The following thread pools can be monitored.
@@ -223,6 +227,7 @@ PerDiskMemtableFlushWriter_0 internal       Responsible for writing a spec (ther
 Sampler                      internal       Responsible for re-sampling the index summaries of SStables
 SecondaryIndexManagement     internal       Performs updates to secondary indexes
 ValidationExecutor           internal       Performs validation compaction or scrubbing
+ViewBuildExecutor            internal       Performs materialized views initial build
 ============================ ============== ===========
 
 .. |nbsp| unicode:: 0xA0 .. nonbreaking space
@@ -401,10 +406,10 @@ Dropped writes are stored and retried by ``Hinted Handoff``
 Reported name format:
 
 **Metric Name**
-    ``org.apache.cassandra.metrics.DroppedMessages.<MetricName>.<Type>``
+    ``org.apache.cassandra.metrics.DroppedMessage.<MetricName>.<Type>``
 
 **JMX MBean**
-    ``org.apache.cassandra.metrics:type=DroppedMetrics scope=<Type> name=<MetricName>``
+    ``org.apache.cassandra.metrics:type=DroppedMessage scope=<Type> name=<MetricName>``
 
 ========================== ============== ===========
 Name                       Type           Description

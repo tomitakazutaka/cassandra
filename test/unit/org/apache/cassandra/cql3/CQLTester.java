@@ -43,8 +43,11 @@ import org.slf4j.LoggerFactory;
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.ResultSet;
+
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.functions.FunctionName;
@@ -93,7 +96,7 @@ public abstract class CQLTester
     protected static final int nativePort;
     protected static final InetAddress nativeAddr;
     private static final Map<ProtocolVersion, Cluster> clusters = new HashMap<>();
-    private static final Map<ProtocolVersion, Session> sessions = new HashMap<>();
+    protected static final Map<ProtocolVersion, Session> sessions = new HashMap<>();
 
     private static boolean isServerPrepared = false;
 
@@ -385,12 +388,18 @@ public abstract class CQLTester
             if (clusters.containsKey(version))
                 continue;
 
-            Cluster cluster = Cluster.builder()
-                                     .addContactPoints(nativeAddr)
-                                     .withClusterName("Test Cluster")
-                                     .withPort(nativePort)
-                                     .withProtocolVersion(com.datastax.driver.core.ProtocolVersion.fromInt(version.asInt()))
-                                     .build();
+            Cluster.Builder builder = Cluster.builder()
+                                             .withoutJMXReporting()
+                                             .addContactPoints(nativeAddr)
+                                             .withClusterName("Test Cluster")
+                                             .withPort(nativePort);
+
+            if (version.isBeta())
+                builder = builder.allowBetaProtocolVersion();
+            else
+                builder = builder.withProtocolVersion(com.datastax.driver.core.ProtocolVersion.fromInt(version.asInt()));
+
+            Cluster cluster = builder.build();
             clusters.put(version, cluster);
             sessions.put(version, cluster.connect());
 
@@ -446,7 +455,8 @@ public abstract class CQLTester
     public void disableCompaction(String keyspace)
     {
         ColumnFamilyStore store = getCurrentColumnFamilyStore(keyspace);
-        store.disableAutoCompaction();
+        if (store != null)
+            store.disableAutoCompaction();
     }
 
     public void compact()
@@ -461,6 +471,23 @@ public abstract class CQLTester
         {
             throw new RuntimeException(e);
         }
+    }
+
+    public void disableCompaction()
+    {
+        disableCompaction(KEYSPACE);
+    }
+
+    public void enableCompaction(String keyspace)
+    {
+        ColumnFamilyStore store = getCurrentColumnFamilyStore(keyspace);
+        if (store != null)
+            store.enableAutoCompaction();
+    }
+
+    public void enableCompaction()
+    {
+        enableCompaction(KEYSPACE);
     }
 
     public void cleanupCache()
@@ -711,6 +738,38 @@ public abstract class CQLTester
         return indexCreated;
     }
 
+    /**
+     * Index creation is asynchronous, this method waits until the specified index hasn't any building task running.
+     * <p>
+     * This method differs from {@link #waitForIndex(String, String, String)} in that it doesn't require the index to be
+     * fully nor successfully built, so it can be used to wait for failing index builds.
+     *
+     * @param keyspace the index keyspace name
+     * @param indexName the index name
+     * @return {@code true} if the index build tasks have finished in 5 seconds, {@code false} otherwise
+     */
+    protected boolean waitForIndexBuilds(String keyspace, String indexName) throws InterruptedException
+    {
+        long start = System.currentTimeMillis();
+        SecondaryIndexManager indexManager = getCurrentColumnFamilyStore(keyspace).indexManager;
+
+        while (true)
+        {
+            if (!indexManager.isIndexBuilding(indexName))
+            {
+                return true;
+            }
+            else if (System.currentTimeMillis() - start > 5000)
+            {
+                return false;
+            }
+            else
+            {
+                Thread.sleep(10);
+            }
+        }
+    }
+
     protected void createIndexMayThrow(String query) throws Throwable
     {
         String fullQuery = formatQuery(query);
@@ -770,6 +829,11 @@ public abstract class CQLTester
         return sessionNet(protocolVersion).execute(formatQuery(query), values);
     }
 
+    protected com.datastax.driver.core.ResultSet executeNetWithPaging(String query, int pageSize) throws Throwable
+    {
+        return sessionNet().execute(new SimpleStatement(formatQuery(query)).setFetchSize(pageSize));
+    }
+
     protected Session sessionNet()
     {
         return sessionNet(getDefaultVersion());
@@ -780,6 +844,11 @@ public abstract class CQLTester
         requireNetwork();
 
         return sessions.get(protocolVersion);
+    }
+
+    protected SimpleClient newSimpleClient(ProtocolVersion version, boolean compression) throws IOException
+    {
+        return new SimpleClient(nativeAddr.getHostAddress(), nativePort, version, version.isBeta(), new EncryptionOptions()).connect(compression);
     }
 
     protected String formatQuery(String query)
@@ -1043,7 +1112,7 @@ public abstract class CQLTester
         assert ignoreExtra || expectedRows.size() == actualRows.size();
     }
 
-    private static List<String> makeRowStrings(UntypedResultSet resultSet)
+    protected static List<String> makeRowStrings(UntypedResultSet resultSet)
     {
         List<List<ByteBuffer>> rows = new ArrayList<>();
         for (UntypedResultSet.Row row : resultSet)

@@ -18,8 +18,9 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Objects;
+
+import com.google.common.hash.Hasher;
 
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.DeletionPurger;
@@ -28,7 +29,7 @@ import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
 /**
@@ -46,7 +47,7 @@ public abstract class AbstractCell extends Cell
 
     public boolean isCounterCell()
     {
-        return !isTombstone() && column.cellValueType().isCounter();
+        return !isTombstone() && column.isCounterColumn();
     }
 
     public boolean isLive(int nowInSec)
@@ -91,7 +92,7 @@ public abstract class AbstractCell extends Cell
                 // Note that as long as the expiring column and the tombstone put together live longer than GC grace seconds,
                 // we'll fulfil our responsibility to repair. See discussion at
                 // http://cassandra-user-incubator-apache-org.3065146.n2.nabble.com/repair-compaction-and-tombstone-rows-td7583481.html
-                return BufferCell.tombstone(column, timestamp(), localDeletionTime() - ttl(), path());
+                return BufferCell.tombstone(column, timestamp(), localDeletionTime() - ttl(), path()).purge(purger, nowInSec);
             }
         }
         return this;
@@ -119,14 +120,22 @@ public abstract class AbstractCell extends Cell
                + (path == null ? 0 : path.dataSize());
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Hasher hasher)
     {
-        digest.update(value().duplicate());
-        FBUtilities.updateWithLong(digest, timestamp());
-        FBUtilities.updateWithInt(digest, ttl());
-        FBUtilities.updateWithBoolean(digest, isCounterCell());
+        if (isCounterCell())
+        {
+            CounterContext.instance().updateDigest(hasher, value());
+        }
+        else
+        {
+            HashingUtils.updateBytes(hasher, value().duplicate());
+        }
+
+        HashingUtils.updateWithLong(hasher, timestamp());
+        HashingUtils.updateWithInt(hasher, ttl());
+        HashingUtils.updateWithBoolean(hasher, isCounterCell());
         if (path() != null)
-            path().digest(digest);
+            path().digest(hasher);
     }
 
     public void validate()

@@ -19,18 +19,18 @@ package org.apache.cassandra.schema;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.*;
 import com.google.common.collect.Maps;
+import com.google.common.hash.Hasher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.ColumnMetadata.ClusteringOrder;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.functions.*;
@@ -45,6 +45,7 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.HashingUtils;
 
 import static java.lang.String.format;
 
@@ -282,7 +283,7 @@ public final class SchemaKeyspace
         for (String schemaTable : ALL)
         {
             String query = String.format("DELETE FROM %s.%s USING TIMESTAMP ? WHERE keyspace_name = ?", SchemaConstants.SCHEMA_KEYSPACE_NAME, schemaTable);
-            for (String systemKeyspace : SchemaConstants.SYSTEM_KEYSPACE_NAMES)
+            for (String systemKeyspace : SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES)
                 executeOnceInternal(query, timestamp, systemKeyspace);
         }
 
@@ -308,15 +309,7 @@ public final class SchemaKeyspace
      */
     static UUID calculateSchemaDigest()
     {
-        MessageDigest digest;
-        try
-        {
-            digest = MessageDigest.getInstance("MD5");
-        }
-        catch (NoSuchAlgorithmException e)
-        {
-            throw new RuntimeException(e);
-        }
+        Hasher hasher = HashingUtils.CURRENT_HASH_FUNCTION.newHasher();
 
         for (String table : ALL)
         {
@@ -334,12 +327,12 @@ public final class SchemaKeyspace
                     try (RowIterator partition = schema.next())
                     {
                         if (!isSystemKeyspaceSchemaPartition(partition.partitionKey()))
-                            RowIterators.digest(partition, digest);
+                            RowIterators.digest(partition, hasher);
                     }
                 }
             }
         }
-        return UUID.nameUUIDFromBytes(digest.digest());
+        return UUID.nameUUIDFromBytes(hasher.hash().asBytes());
     }
 
     /**
@@ -420,7 +413,7 @@ public final class SchemaKeyspace
 
     private static boolean isSystemKeyspaceSchemaPartition(DecoratedKey partitionKey)
     {
-        return SchemaConstants.isSystemKeyspace(UTF8Type.instance.compose(partitionKey.getKey()));
+        return SchemaConstants.isLocalSystemKeyspace(UTF8Type.instance.compose(partitionKey.getKey()));
     }
 
     /*
@@ -648,6 +641,9 @@ public final class SchemaKeyspace
         for (TriggerMetadata trigger : table.triggers)
             dropTriggerFromSchemaMutation(table, trigger, builder);
 
+        for (DroppedColumn column : table.droppedColumns.values())
+            dropDroppedColumnFromSchemaMutation(table, column, builder);
+
         for (IndexMetadata index : table.indexes)
             dropIndexFromSchemaMutation(table, index, builder);
 
@@ -682,6 +678,11 @@ public final class SchemaKeyspace
                .add("dropped_time", new Date(TimeUnit.MICROSECONDS.toMillis(column.droppedTime)))
                .add("type", expandUserTypes(column.column.type).asCQL3Type().toString())
                .add("kind", column.column.kind.toString().toLowerCase());
+    }
+
+    private static void dropDroppedColumnFromSchemaMutation(TableMetadata table, DroppedColumn column, Mutation.SimpleBuilder builder)
+    {
+        builder.update(DroppedColumns).row(table.name, column.column.name.toString()).delete();
     }
 
     private static void addTriggerToSchemaMutation(TableMetadata table, TriggerMetadata trigger, Mutation.SimpleBuilder builder)
@@ -744,13 +745,10 @@ public final class SchemaKeyspace
         return builder;
     }
 
-    static Mutation.SimpleBuilder makeUpdateViewMutation(KeyspaceMetadata keyspace,
+    public static Mutation.SimpleBuilder makeUpdateViewMutation(Mutation.SimpleBuilder builder,
                                                                 ViewMetadata oldView,
-                                                                ViewMetadata newView,
-                                                                long timestamp)
+                                                                ViewMetadata newView)
     {
-        Mutation.SimpleBuilder builder = makeCreateKeyspaceMutation(keyspace.name, keyspace.params, timestamp);
-
         addViewToSchemaMutation(newView, false, builder);
 
         MapDifference<ByteBuffer, ColumnMetadata> columnDiff = Maps.difference(oldView.metadata.columns,
@@ -878,7 +876,7 @@ public final class SchemaKeyspace
 
     static Keyspaces fetchNonSystemKeyspaces()
     {
-        return fetchKeyspacesWithout(SchemaConstants.SYSTEM_KEYSPACE_NAMES);
+        return fetchKeyspacesWithout(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);
     }
 
     private static Keyspaces fetchKeyspacesWithout(Set<String> excludedKeyspaceNames)
@@ -971,8 +969,15 @@ public final class SchemaKeyspace
             throw new RuntimeException(String.format("%s:%s not found in the schema definitions keyspace.", keyspaceName, tableName));
         UntypedResultSet.Row row = rows.one();
 
+        Set<TableMetadata.Flag> flags = TableMetadata.Flag.fromStringSet(row.getFrozenSet("flags", UTF8Type.instance));
+
+        if (!TableMetadata.Flag.isCQLCompatible(flags))
+        {
+            throw new IllegalArgumentException(TableMetadata.COMPACT_STORAGE_HALT_MESSAGE);
+        }
+
         return TableMetadata.builder(keyspaceName, tableName, TableId.fromUUID(row.getUUID("id")))
-                            .flags(TableMetadata.Flag.fromStringSet(row.getFrozenSet("flags", UTF8Type.instance)))
+                            .flags(flags)
                             .params(createTableParamsFromRow(row))
                             .addColumns(fetchColumns(keyspaceName, tableName, types))
                             .droppedColumns(fetchDroppedColumns(keyspaceName, tableName))

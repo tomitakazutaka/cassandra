@@ -97,12 +97,6 @@ public class Config
 
     public volatile long truncate_request_timeout_in_ms = 60000L;
 
-    /**
-     * @deprecated use {@link #streaming_keep_alive_period_in_secs} instead
-     */
-    @Deprecated
-    public int streaming_socket_timeout_in_ms = 86400000; //24 hours
-
     public Integer streaming_connections_per_host = 1;
     public Integer streaming_keep_alive_period_in_secs = 300; //5 minutes
 
@@ -142,7 +136,7 @@ public class Config
     public int internode_send_buff_size_in_bytes = 0;
     public int internode_recv_buff_size_in_bytes = 0;
 
-    public boolean start_native_transport = false;
+    public boolean start_native_transport = true;
     public int native_transport_port = 9042;
     public Integer native_transport_port_ssl = null;
     public int native_transport_max_threads = 128;
@@ -172,6 +166,7 @@ public class Config
     public int min_free_space_per_drive_in_mb = 50;
 
     public volatile int concurrent_validations = Integer.MAX_VALUE;
+    public volatile int concurrent_materialized_view_builders = 1;
 
     /**
      * @deprecated retry support removed on CASSANDRA-10992
@@ -190,7 +185,12 @@ public class Config
     public String commitlog_directory;
     public Integer commitlog_total_space_in_mb;
     public CommitLogSync commitlog_sync;
+
+    /**
+     * @deprecated since 4.0 This value was near useless, and we're not using it anymore
+     */
     public double commitlog_sync_batch_window_in_ms = Double.NaN;
+    public double commitlog_sync_group_window_in_ms = Double.NaN;
     public int commitlog_sync_period_in_ms;
     public int commitlog_segment_size_in_mb = 32;
     public ParameterizedClass commitlog_compression;
@@ -215,9 +215,7 @@ public class Config
     public double dynamic_snitch_badness_threshold = 0.1;
 
     public EncryptionOptions.ServerEncryptionOptions server_encryption_options = new EncryptionOptions.ServerEncryptionOptions();
-    public EncryptionOptions.ClientEncryptionOptions client_encryption_options = new EncryptionOptions.ClientEncryptionOptions();
-    // this encOptions is for backward compatibility (a warning is logged by DatabaseDescriptor)
-    public EncryptionOptions.ServerEncryptionOptions encryption_options;
+    public EncryptionOptions client_encryption_options = new EncryptionOptions();
 
     public InternodeCompression internode_compression = InternodeCompression.none;
 
@@ -249,6 +247,17 @@ public class Config
     private static boolean isClientMode = false;
 
     public Integer file_cache_size_in_mb;
+
+    /**
+     * Because of the current {@link org.apache.cassandra.utils.memory.BufferPool} slab sizes of 64 kb, we
+     * store in the file cache buffers that divide 64 kb, so we need to round the buffer sizes to powers of two.
+     * This boolean controls weather they are rounded up or down. Set it to true to round up to the
+     * next power of two, set it to false to round down to the previous power of two. Note that buffer sizes are
+     * already rounded to 4 kb and capped between 4 kb minimum and 64 kb maximum by the {@link DiskOptimizationStrategy}.
+     * By default, this boolean is set to round down when {@link #disk_optimization_strategy} is {@code ssd},
+     * and to round up when it is {@code spinning}.
+     */
+    public Boolean file_cache_round_up;
 
     public boolean buffer_pool_use_heap_if_exhausted = true;
 
@@ -282,9 +291,10 @@ public class Config
     public volatile ConsistencyLevel ideal_consistency_level = null;
 
     /*
-     * Strategy to use for coalescing messages in OutboundTcpConnection.
+     * Strategy to use for coalescing messages in {@link OutboundMessagingPool}.
      * Can be fixed, movingaverage, timehorizon, disabled. Setting is case and leading/trailing
-     * whitespace insensitive. You can also specify a subclass of CoalescingStrategies.CoalescingStrategy by name.
+     * whitespace insensitive. You can also specify a subclass of
+     * {@link org.apache.cassandra.utils.CoalescingStrategies.CoalescingStrategy} by name.
      */
     public String otc_coalescing_strategy = "DISABLED";
 
@@ -314,6 +324,9 @@ public class Config
 
     public boolean enable_user_defined_functions = false;
     public boolean enable_scripted_user_defined_functions = false;
+
+    public boolean enable_materialized_views = true;
+
     /**
      * Optionally disable asynchronous UDF execution.
      * Disabling asynchronous UDF execution also implicitly disables the security-manager!
@@ -348,6 +361,11 @@ public class Config
     public volatile boolean back_pressure_enabled = false;
     public volatile ParameterizedClass back_pressure_strategy;
 
+    public RepairCommandPoolFullStrategy repair_command_pool_full_strategy = RepairCommandPoolFullStrategy.queue;
+    public int repair_command_pool_size = concurrent_validations;
+
+    public String full_query_log_dir = null;
+
     /**
      * @deprecated migrate to {@link DatabaseDescriptor#isClientInitialized()}
      */
@@ -372,7 +390,8 @@ public class Config
     public enum CommitLogSync
     {
         periodic,
-        batch
+        batch,
+        group
     }
     public enum InternodeCompression
     {
@@ -423,6 +442,12 @@ public class Config
     {
         ssd,
         spinning
+    }
+
+    public enum RepairCommandPoolFullStrategy
+    {
+        queue,
+        reject
     }
 
     private static final List<String> SENSITIVE_KEYS = new ArrayList<String>() {{

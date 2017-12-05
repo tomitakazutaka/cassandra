@@ -156,26 +156,14 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
     }
     private static final RateLimiter meterSyncThrottle = RateLimiter.create(100.0);
 
-    public static final Comparator<SSTableReader> maxTimestampComparator = new Comparator<SSTableReader>()
-    {
-        public int compare(SSTableReader o1, SSTableReader o2)
-        {
-            long ts1 = o1.getMaxTimestamp();
-            long ts2 = o2.getMaxTimestamp();
-            return (ts1 > ts2 ? -1 : (ts1 == ts2 ? 0 : 1));
-        }
-    };
+    public static final Comparator<SSTableReader> maxTimestampComparator = (o1, o2) -> Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp());
 
     // it's just an object, which we use regular Object equality on; we introduce a special class just for easy recognition
     public static final class UniqueIdentifier {}
 
-    public static final Comparator<SSTableReader> sstableComparator = new Comparator<SSTableReader>()
-    {
-        public int compare(SSTableReader o1, SSTableReader o2)
-        {
-            return o1.first.compareTo(o2.first);
-        }
-    };
+    public static final Comparator<SSTableReader> sstableComparator = (o1, o2) -> o1.first.compareTo(o2.first);
+
+    public static final Comparator<SSTableReader> generationReverseComparator = (o1, o2) -> -Integer.compare(o1.descriptor.generation, o2.descriptor.generation);
 
     public static final Ordering<SSTableReader> sstableOrdering = Ordering.from(sstableComparator);
 
@@ -356,7 +344,7 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
         return base;
     }
 
-    public static SSTableReader open(Descriptor descriptor) throws IOException
+    public static SSTableReader open(Descriptor descriptor)
     {
         TableMetadataRef metadata;
         if (descriptor.cfname.contains(SECONDARY_INDEX_NAME_SEPARATOR))
@@ -374,24 +362,24 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
         return open(descriptor, metadata);
     }
 
-    public static SSTableReader open(Descriptor desc, TableMetadataRef metadata) throws IOException
+    public static SSTableReader open(Descriptor desc, TableMetadataRef metadata)
     {
         return open(desc, componentsFor(desc), metadata);
     }
 
-    public static SSTableReader open(Descriptor descriptor, Set<Component> components, TableMetadataRef metadata) throws IOException
+    public static SSTableReader open(Descriptor descriptor, Set<Component> components, TableMetadataRef metadata)
     {
         return open(descriptor, components, metadata, true, true);
     }
 
     // use only for offline or "Standalone" operations
-    public static SSTableReader openNoValidation(Descriptor descriptor, Set<Component> components, ColumnFamilyStore cfs) throws IOException
+    public static SSTableReader openNoValidation(Descriptor descriptor, Set<Component> components, ColumnFamilyStore cfs)
     {
         return open(descriptor, components, cfs.metadata, false, false); // do not track hotness
     }
 
     // use only for offline or "Standalone" operations
-    public static SSTableReader openNoValidation(Descriptor descriptor, TableMetadataRef metadata) throws IOException
+    public static SSTableReader openNoValidation(Descriptor descriptor, TableMetadataRef metadata)
     {
         return open(descriptor, componentsFor(descriptor), metadata, false, false); // do not track hotness
     }
@@ -405,14 +393,22 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
      * @return opened SSTableReader
      * @throws IOException
      */
-    public static SSTableReader openForBatch(Descriptor descriptor, Set<Component> components, TableMetadataRef metadata) throws IOException
+    public static SSTableReader openForBatch(Descriptor descriptor, Set<Component> components, TableMetadataRef metadata)
     {
         // Minimum components without which we can't do anything
         assert components.contains(Component.DATA) : "Data component is missing for sstable " + descriptor;
         assert components.contains(Component.PRIMARY_INDEX) : "Primary index component is missing for sstable " + descriptor;
 
         EnumSet<MetadataType> types = EnumSet.of(MetadataType.VALIDATION, MetadataType.STATS, MetadataType.HEADER);
-        Map<MetadataType, MetadataComponent> sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);
+        Map<MetadataType, MetadataComponent> sstableMetadata;
+        try
+        {
+             sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);
+        }
+        catch (IOException e)
+        {
+            throw new CorruptSSTableException(e, descriptor.filenameFor(Component.STATS));
+        }
 
         ValidationMetadata validationMetadata = (ValidationMetadata) sstableMetadata.get(MetadataType.VALIDATION);
         StatsMetadata statsMetadata = (StatsMetadata) sstableMetadata.get(MetadataType.STATS);
@@ -447,7 +443,16 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
                                                      .withChunkCache(ChunkCache.instance))
         {
             if (!sstable.loadSummary())
-                sstable.buildSummary(false, false, Downsampling.BASE_SAMPLING_LEVEL);
+            {
+                try
+                {
+                    sstable.buildSummary(false, false, Downsampling.BASE_SAMPLING_LEVEL);
+                }
+                catch(IOException e)
+                {
+                    throw new CorruptSSTableException(e, sstable.getFilename());
+                }
+            }
             long indexFileLength = new File(descriptor.filenameFor(Component.PRIMARY_INDEX)).length();
             int dataBufferSize = sstable.optimizationStrategy.bufferSize(statsMetadata.estimatedPartitionSize.percentile(DatabaseDescriptor.getDiskOptimizationEstimatePercentile()));
             int indexBufferSize = sstable.optimizationStrategy.bufferSize(indexFileLength / sstable.indexSummary.size());
@@ -463,7 +468,7 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
                                      Set<Component> components,
                                      TableMetadataRef metadata,
                                      boolean validate,
-                                     boolean trackHotness) throws IOException
+                                     boolean trackHotness)
     {
         // Minimum components without which we can't do anything
         assert components.contains(Component.DATA) : "Data component is missing for sstable " + descriptor;
@@ -473,7 +478,16 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
         assert components.contains(Component.STATS) : "Stats component is missing for sstable " + descriptor;
 
         EnumSet<MetadataType> types = EnumSet.of(MetadataType.VALIDATION, MetadataType.STATS, MetadataType.HEADER);
-        Map<MetadataType, MetadataComponent> sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);
+
+        Map<MetadataType, MetadataComponent> sstableMetadata;
+        try
+        {
+            sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);
+        }
+        catch (IOException e)
+        {
+            throw new CorruptSSTableException(e, descriptor.filenameFor(Component.STATS));
+        }
         ValidationMetadata validationMetadata = (ValidationMetadata) sstableMetadata.get(MetadataType.VALIDATION);
         StatsMetadata statsMetadata = (StatsMetadata) sstableMetadata.get(MetadataType.STATS);
         SerializationHeader.Component header = (SerializationHeader.Component) sstableMetadata.get(MetadataType.HEADER);
@@ -516,19 +530,16 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
 
             return sstable;
         }
+        catch (IOException e)
+        {
+            sstable.selfRef().release();
+            throw new CorruptSSTableException(e, sstable.getFilename());
+        }
         catch (Throwable t)
         {
             sstable.selfRef().release();
             throw t;
         }
-    }
-
-    public static void logOpenException(Descriptor descriptor, IOException e)
-    {
-        if (e instanceof FileNotFoundException)
-            logger.error("Missing sstable component in {}; skipped because of {}", descriptor, e.getMessage());
-        else
-            logger.error("Corrupt sstable {}; skipped", descriptor, e);
     }
 
     public static Collection<SSTableReader> openAll(Set<Map.Entry<Descriptor, Set<Component>>> entries,
@@ -558,11 +569,6 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
                     {
                         FileUtils.handleFSError(ex);
                         logger.error("Cannot read sstable {}; file system error, skipping table", entry, ex);
-                        return;
-                    }
-                    catch (IOException ex)
-                    {
-                        logger.error("Cannot read sstable {}; other IO error, skipping table", entry, ex);
                         return;
                     }
                     sstables.add(sstable);
@@ -1132,10 +1138,10 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
             // Always save the resampled index
             saveSummary(newSummary);
 
-            long newSize = bytesOnDisk();
-            StorageMetrics.load.inc(newSize - oldSize);
-            parent.metric.liveDiskSpaceUsed.inc(newSize - oldSize);
-            parent.metric.totalDiskSpaceUsed.inc(newSize - oldSize);
+            // The new size will be added in Transactional.commit() as an updated SSTable, more details: CASSANDRA-13738
+            StorageMetrics.load.dec(oldSize);
+            parent.metric.liveDiskSpaceUsed.dec(oldSize);
+            parent.metric.totalDiskSpaceUsed.dec(oldSize);
 
             return cloneAndReplace(first, OpenReason.METADATA_CHANGE, newSummary);
         }
@@ -1201,7 +1207,7 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
     {
         if (this.first.compareTo(this.last) > 0)
         {
-            throw new IllegalStateException(String.format("SSTable first key %s > last key %s", this.first, this.last));
+            throw new CorruptSSTableException(new IllegalStateException(String.format("SSTable first key %s > last key %s", this.first, this.last)), getFilename());
         }
     }
 
@@ -2231,7 +2237,7 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
             // Don't track read rates for tables in the system keyspace and don't bother trying to load or persist
             // the read meter when in client mode.
             // Also, do not track read rates when running in client or tools mode (syncExecuter isn't available in these modes)
-            if (SchemaConstants.isSystemKeyspace(desc.ksname) || DatabaseDescriptor.isClientOrToolInitialized())
+            if (SchemaConstants.isLocalSystemKeyspace(desc.ksname) || DatabaseDescriptor.isClientOrToolInitialized())
             {
                 readMeter = null;
                 readMeterSyncFuture = NULL;

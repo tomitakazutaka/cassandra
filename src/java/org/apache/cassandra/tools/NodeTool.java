@@ -76,6 +76,8 @@ public class NodeTool
                 EnableGossip.class,
                 DisableGossip.class,
                 EnableHandoff.class,
+                EnableFullQueryLog.class,
+                DisableFullQueryLog.class,
                 GcStats.class,
                 GetBatchlogReplayTrottle.class,
                 GetCompactionThreshold.class,
@@ -100,6 +102,7 @@ public class NodeTool
                 Refresh.class,
                 RemoveNode.class,
                 Assassinate.class,
+                ResetFullQueryLog.class,
                 Repair.class,
                 RepairAdmin.class,
                 ReplayBatchlog.class,
@@ -110,6 +113,8 @@ public class NodeTool
                 SetCompactionThroughput.class,
                 GetConcurrentCompactors.class,
                 SetConcurrentCompactors.class,
+                GetConcurrentViewBuilders.class,
+                SetConcurrentViewBuilders.class,
                 SetTimeout.class,
                 SetStreamThroughput.class,
                 SetInterDCStreamThroughput.class,
@@ -122,6 +127,7 @@ public class NodeTool
                 StatusGossip.class,
                 StatusBackup.class,
                 StatusHandoff.class,
+                StatusAutoCompaction.class,
                 Stop.class,
                 StopDaemon.class,
                 Version.class,
@@ -131,6 +137,7 @@ public class NodeTool
                 EnableBackup.class,
                 DisableBackup.class,
                 ResetLocalSchema.class,
+                ReloadLocalSchema.class,
                 ReloadTriggers.class,
                 SetCacheKeysToSave.class,
                 DisableHandoff.class,
@@ -145,7 +152,8 @@ public class NodeTool
                 FailureDetectorInfo.class,
                 RefreshSizeEstimates.class,
                 RelocateSSTables.class,
-                ViewBuildStatus.class
+                ViewBuildStatus.class,
+                HandoffWindow.class
         );
 
         Cli.CliBuilder<Runnable> builder = Cli.builder("nodetool");

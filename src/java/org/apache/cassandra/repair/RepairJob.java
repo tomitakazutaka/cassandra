@@ -43,7 +43,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
     private final RepairJobDesc desc;
     private final RepairParallelism parallelismDegree;
     private final ListeningExecutorService taskExecutor;
-    private final boolean isConsistent;
+    private final boolean isIncremental;
     private final PreviewKind previewKind;
 
     /**
@@ -52,13 +52,13 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
      * @param session RepairSession that this RepairJob belongs
      * @param columnFamily name of the ColumnFamily to repair
      */
-    public RepairJob(RepairSession session, String columnFamily, boolean isConsistent, PreviewKind previewKind)
+    public RepairJob(RepairSession session, String columnFamily, boolean isIncremental, PreviewKind previewKind)
     {
         this.session = session;
         this.desc = new RepairJobDesc(session.parentRepairSession, session.getId(), session.keyspace, columnFamily, session.getRanges());
         this.taskExecutor = session.taskExecutor;
         this.parallelismDegree = session.parallelismDegree;
-        this.isConsistent = isConsistent;
+        this.isIncremental = isIncremental;
         this.previewKind = previewKind;
     }
 
@@ -81,7 +81,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         if (parallelismDegree != RepairParallelism.PARALLEL)
         {
             ListenableFuture<List<InetAddress>> allSnapshotTasks;
-            if (isConsistent)
+            if (isIncremental)
             {
                 // consistent repair does it's own "snapshotting"
                 allSnapshotTasks = Futures.immediateFuture(allEndpoints);
@@ -100,7 +100,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
             }
 
             // When all snapshot complete, send validation requests
-            validations = Futures.transform(allSnapshotTasks, new AsyncFunction<List<InetAddress>, List<TreeResponse>>()
+            validations = Futures.transformAsync(allSnapshotTasks, new AsyncFunction<List<InetAddress>, List<TreeResponse>>()
             {
                 public ListenableFuture<List<TreeResponse>> apply(List<InetAddress> endpoints)
                 {
@@ -118,7 +118,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         }
 
         // When all validations complete, submit sync tasks
-        ListenableFuture<List<SyncStat>> syncResults = Futures.transform(validations, new AsyncFunction<List<TreeResponse>, List<SyncStat>>()
+        ListenableFuture<List<SyncStat>> syncResults = Futures.transformAsync(validations, new AsyncFunction<List<TreeResponse>, List<SyncStat>>()
         {
             public ListenableFuture<List<SyncStat>> apply(List<TreeResponse> trees)
             {
@@ -135,7 +135,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
                         SyncTask task;
                         if (r1.endpoint.equals(local) || r2.endpoint.equals(local))
                         {
-                            task = new LocalSyncTask(desc, r1, r2, isConsistent ? desc.parentSessionId : null, session.pullRepair, session.previewKind);
+                            task = new LocalSyncTask(desc, r1, r2, isIncremental ? desc.parentSessionId : null, session.pullRepair, session.previewKind);
                         }
                         else
                         {
@@ -180,9 +180,6 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
                 setException(t);
             }
         }, taskExecutor);
-
-        // Wait for validation to complete
-        Futures.getUnchecked(validations);
     }
 
     /**
@@ -196,11 +193,11 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         String message = String.format("Requesting merkle trees for %s (to %s)", desc.columnFamily, endpoints);
         logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
         Tracing.traceRepair(message);
-        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());
+        int nowInSec = FBUtilities.nowInSeconds();
         List<ListenableFuture<TreeResponse>> tasks = new ArrayList<>(endpoints.size());
         for (InetAddress endpoint : endpoints)
         {
-            ValidationTask task = new ValidationTask(desc, endpoint, gcBefore, previewKind);
+            ValidationTask task = new ValidationTask(desc, endpoint, nowInSec, previewKind);
             tasks.add(task);
             session.waitForValidation(Pair.create(desc, endpoint), task);
             taskExecutor.execute(task);
@@ -216,12 +213,12 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         String message = String.format("Requesting merkle trees for %s (to %s)", desc.columnFamily, endpoints);
         logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
         Tracing.traceRepair(message);
-        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());
+        int nowInSec = FBUtilities.nowInSeconds();
         List<ListenableFuture<TreeResponse>> tasks = new ArrayList<>(endpoints.size());
 
         Queue<InetAddress> requests = new LinkedList<>(endpoints);
         InetAddress address = requests.poll();
-        ValidationTask firstTask = new ValidationTask(desc, address, gcBefore, previewKind);
+        ValidationTask firstTask = new ValidationTask(desc, address, nowInSec, previewKind);
         logger.info("Validating {}", address);
         session.waitForValidation(Pair.create(desc, address), firstTask);
         tasks.add(firstTask);
@@ -229,7 +226,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         while (requests.size() > 0)
         {
             final InetAddress nextAddress = requests.poll();
-            final ValidationTask nextTask = new ValidationTask(desc, nextAddress, gcBefore, previewKind);
+            final ValidationTask nextTask = new ValidationTask(desc, nextAddress, nowInSec, previewKind);
             tasks.add(nextTask);
             Futures.addCallback(currentTask, new FutureCallback<TreeResponse>()
             {
@@ -258,7 +255,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         String message = String.format("Requesting merkle trees for %s (to %s)", desc.columnFamily, endpoints);
         logger.info("{} {}", previewKind.logPrefix(desc.sessionId), message);
         Tracing.traceRepair(message);
-        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());
+        int nowInSec = FBUtilities.nowInSeconds();
         List<ListenableFuture<TreeResponse>> tasks = new ArrayList<>(endpoints.size());
 
         Map<String, Queue<InetAddress>> requestsByDatacenter = new HashMap<>();
@@ -278,7 +275,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
         {
             Queue<InetAddress> requests = entry.getValue();
             InetAddress address = requests.poll();
-            ValidationTask firstTask = new ValidationTask(desc, address, gcBefore, previewKind);
+            ValidationTask firstTask = new ValidationTask(desc, address, nowInSec, previewKind);
             logger.info("Validating {}", address);
             session.waitForValidation(Pair.create(desc, address), firstTask);
             tasks.add(firstTask);
@@ -286,7 +283,7 @@ public class RepairJob extends AbstractFuture<RepairResult> implements Runnable
             while (requests.size() > 0)
             {
                 final InetAddress nextAddress = requests.poll();
-                final ValidationTask nextTask = new ValidationTask(desc, nextAddress, gcBefore, previewKind);
+                final ValidationTask nextTask = new ValidationTask(desc, nextAddress, nowInSec, previewKind);
                 tasks.add(nextTask);
                 Futures.addCallback(currentTask, new FutureCallback<TreeResponse>()
                 {

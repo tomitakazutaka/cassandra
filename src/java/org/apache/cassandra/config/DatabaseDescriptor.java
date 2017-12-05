@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.net.*;
 import java.nio.file.FileStore;
-import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -44,6 +43,7 @@ import org.apache.cassandra.auth.IAuthorizer;
 import org.apache.cassandra.auth.IInternodeAuthenticator;
 import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.Config.CommitLogSync;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions.InternodeEncryption;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -64,6 +64,8 @@ import org.apache.cassandra.utils.FBUtilities;
 
 import org.apache.commons.lang3.StringUtils;
 
+import static org.apache.cassandra.io.util.FileUtils.ONE_GB;
+
 public class DatabaseDescriptor
 {
     private static final Logger logger = LoggerFactory.getLogger(DatabaseDescriptor.class);
@@ -75,6 +77,11 @@ public class DatabaseDescriptor
     private static final int MAX_NUM_TOKENS = 1536;
 
     private static Config conf;
+
+    /**
+     * Request timeouts can not be less than below defined value (see CASSANDRA-9375)
+     */
+    static final long LOWEST_ACCEPTED_TIMEOUT = 10L;
 
     private static IEndpointSnitch snitch;
     private static InetAddress listenAddress; // leave null so we can fall through to getLocalHost
@@ -325,15 +332,23 @@ public class DatabaseDescriptor
 
         if (conf.commitlog_sync == Config.CommitLogSync.batch)
         {
-            if (Double.isNaN(conf.commitlog_sync_batch_window_in_ms) || conf.commitlog_sync_batch_window_in_ms <= 0d)
-            {
-                throw new ConfigurationException("Missing value for commitlog_sync_batch_window_in_ms: positive double value expected.", false);
-            }
-            else if (conf.commitlog_sync_period_in_ms != 0)
+            if (conf.commitlog_sync_period_in_ms != 0)
             {
                 throw new ConfigurationException("Batch sync specified, but commitlog_sync_period_in_ms found. Only specify commitlog_sync_batch_window_in_ms when using batch sync", false);
             }
-            logger.debug("Syncing log with a batch window of {}", conf.commitlog_sync_batch_window_in_ms);
+            logger.debug("Syncing log with batch mode");
+        }
+        else if (conf.commitlog_sync == CommitLogSync.group)
+        {
+            if (Double.isNaN(conf.commitlog_sync_group_window_in_ms) || conf.commitlog_sync_group_window_in_ms <= 0d)
+            {
+                throw new ConfigurationException("Missing value for commitlog_sync_group_window_in_ms: positive double value expected.", false);
+            }
+            else if (conf.commitlog_sync_period_in_ms != 0)
+            {
+                throw new ConfigurationException("Group sync specified, but commitlog_sync_period_in_ms found. Only specify commitlog_sync_group_window_in_ms when using group sync", false);
+            }
+            logger.debug("Syncing log with a group window of {}", conf.commitlog_sync_period_in_ms);
         }
         else
         {
@@ -398,6 +413,10 @@ public class DatabaseDescriptor
         if (conf.file_cache_size_in_mb == null)
             conf.file_cache_size_in_mb = Math.min(512, (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
 
+        // round down for SSDs and round up for spinning disks
+        if (conf.file_cache_round_up == null)
+            conf.file_cache_round_up = conf.disk_optimization_strategy == Config.DiskOptimizationStrategy.spinning;
+
         if (conf.memtable_offheap_space_in_mb == null)
             conf.memtable_offheap_space_in_mb = (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576));
         if (conf.memtable_offheap_space_in_mb < 0)
@@ -413,8 +432,13 @@ public class DatabaseDescriptor
         else
             logger.info("Global memtable off-heap threshold is enabled at {}MB", conf.memtable_offheap_space_in_mb);
 
+        checkForLowestAcceptedTimeouts(conf);
+
         if (conf.native_transport_max_frame_size_in_mb <= 0)
             throw new ConfigurationException("native_transport_max_frame_size_in_mb must be positive, but was " + conf.native_transport_max_frame_size_in_mb, false);
+        else if (conf.native_transport_max_frame_size_in_mb >= 2048)
+            throw new ConfigurationException("native_transport_max_frame_size_in_mb must be smaller than 2048, but was "
+                    + conf.native_transport_max_frame_size_in_mb, false);
 
         // if data dirs, commitlog dir, or saved caches dir are set in cassandra.yaml, use that.  Otherwise,
         // use -Dcassandra.storagedir (set in cassandra-env.sh) as the parent dir for data/, commitlog/, and saved_caches/
@@ -433,6 +457,10 @@ public class DatabaseDescriptor
             conf.cdc_raw_directory = storagedirFor("cdc_raw");
         }
 
+        // Windows memory-mapped CommitLog files is incompatible with CDC as we hard-link files in cdc_raw. Confirm we don't have both enabled.
+        if (FBUtilities.isWindows && conf.cdc_enabled && conf.commitlog_compression == null)
+            throw new ConfigurationException("Cannot enable cdc on Windows with uncompressed commitlog.");
+
         if (conf.commitlog_total_space_in_mb == null)
         {
             int preferredSize = 8192;
@@ -440,7 +468,7 @@ public class DatabaseDescriptor
             try
             {
                 // use 1/4 of available space.  See discussion on #10013 and #10199
-                minSize = Ints.checkedCast((guessFileStore(conf.commitlog_directory).getTotalSpace() / 1048576) / 4);
+                minSize = Ints.saturatedCast((guessFileStore(conf.commitlog_directory).getTotalSpace() / 1048576) / 4);
             }
             catch (IOException e)
             {
@@ -467,7 +495,7 @@ public class DatabaseDescriptor
             try
             {
                 // use 1/8th of available space.  See discussion on #10013 and #10199 on the CL, taking half that for CDC
-                minSize = Ints.checkedCast((guessFileStore(conf.cdc_raw_directory).getTotalSpace() / 1048576) / 8);
+                minSize = Ints.saturatedCast((guessFileStore(conf.cdc_raw_directory).getTotalSpace() / 1048576) / 8);
             }
             catch (IOException e)
             {
@@ -505,6 +533,8 @@ public class DatabaseDescriptor
         /* data file and commit log directories. they get created later, when they're needed. */
         for (String datadir : conf.data_file_directories)
         {
+            if (datadir == null)
+                throw new ConfigurationException("data_file_directories must not contain empty entry", false);
             if (datadir.equals(conf.commitlog_directory))
                 throw new ConfigurationException("commitlog_directory must not be the same as any data_file_directories", false);
             if (datadir.equals(conf.hints_directory))
@@ -514,7 +544,7 @@ public class DatabaseDescriptor
 
             try
             {
-                dataFreeBytes += guessFileStore(datadir).getUnallocatedSpace();
+                dataFreeBytes = saturatedSum(dataFreeBytes, guessFileStore(datadir).getUnallocatedSpace());
             }
             catch (IOException e)
             {
@@ -523,10 +553,9 @@ public class DatabaseDescriptor
                                                                datadir), e);
             }
         }
-        if (dataFreeBytes < 64L * 1024 * 1048576) // 64 GB
+        if (dataFreeBytes < 64 * ONE_GB) // 64 GB
             logger.warn("Only {} free across all data volumes. Consider adding more capacity to your cluster or removing obsolete snapshots",
                         FBUtilities.prettyPrintMemory(dataFreeBytes));
-
 
         if (conf.commitlog_directory.equals(conf.saved_caches_directory))
             throw new ConfigurationException("saved_caches_directory must not be the same as the commitlog_directory", false);
@@ -567,6 +596,9 @@ public class DatabaseDescriptor
 
         if (conf.concurrent_compactors <= 0)
             throw new ConfigurationException("concurrent_compactors should be strictly greater than 0, but was " + conf.concurrent_compactors, false);
+
+        if (conf.concurrent_materialized_view_builders <= 0)
+            throw new ConfigurationException("concurrent_materialized_view_builders should be strictly greater than 0, but was " + conf.concurrent_materialized_view_builders, false);
 
         if (conf.num_tokens > MAX_NUM_TOKENS)
             throw new ConfigurationException(String.format("A maximum number of %d tokens per node is supported", MAX_NUM_TOKENS), false);
@@ -628,13 +660,6 @@ public class DatabaseDescriptor
             throw new ConfigurationException("index_summary_capacity_in_mb option was set incorrectly to '"
                                              + conf.index_summary_capacity_in_mb + "', it should be a non-negative integer.", false);
 
-        if(conf.encryption_options != null)
-        {
-            logger.warn("Please rename encryption_options as server_encryption_options in the yaml");
-            //operate under the assumption that server_encryption_options is not set in yaml rather than both
-            conf.server_encryption_options = conf.encryption_options;
-        }
-
         if (conf.user_defined_function_fail_timeout < 0)
             throw new ConfigurationException("user_defined_function_fail_timeout must not be negative", false);
         if (conf.user_defined_function_warn_timeout < 0)
@@ -642,6 +667,13 @@ public class DatabaseDescriptor
 
         if (conf.user_defined_function_fail_timeout < conf.user_defined_function_warn_timeout)
             throw new ConfigurationException("user_defined_function_warn_timeout must less than user_defined_function_fail_timeout", false);
+
+        if (conf.commitlog_segment_size_in_mb <= 0)
+            throw new ConfigurationException("commitlog_segment_size_in_mb must be positive, but was "
+                    + conf.commitlog_segment_size_in_mb, false);
+        else if (conf.commitlog_segment_size_in_mb >= 2048)
+            throw new ConfigurationException("commitlog_segment_size_in_mb must be smaller than 2048, but was "
+                    + conf.commitlog_segment_size_in_mb, false);
 
         if (conf.max_mutation_size_in_kb == null)
             conf.max_mutation_size_in_kb = conf.commitlog_segment_size_in_mb * 1024 / 2;
@@ -656,8 +688,19 @@ public class DatabaseDescriptor
             throw new ConfigurationException("Encryption must be enabled in client_encryption_options for native_transport_port_ssl", false);
         }
 
+        // internode messaging encryption options
+        if (conf.server_encryption_options.internode_encryption != InternodeEncryption.none
+            && !conf.server_encryption_options.enabled)
+        {
+            throw new ConfigurationException("Encryption must be enabled in server_encryption_options when using peer-to-peer security. " +
+                                            "server_encryption_options.internode_encryption = " + conf.server_encryption_options.internode_encryption, false);
+        }
+
         if (conf.max_value_size_in_mb <= 0)
             throw new ConfigurationException("max_value_size_in_mb must be positive", false);
+        else if (conf.max_value_size_in_mb >= 2048)
+            throw new ConfigurationException("max_value_size_in_mb must be smaller than 2048, but was "
+                    + conf.max_value_size_in_mb, false);
 
         switch (conf.disk_optimization_strategy)
         {
@@ -838,6 +881,57 @@ public class DatabaseDescriptor
             throw new ConfigurationException("The seed provider lists no seeds.", false);
     }
 
+    @VisibleForTesting
+    static void checkForLowestAcceptedTimeouts(Config conf)
+    {
+        if(conf.read_request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("read_request_timeout_in_ms", conf.read_request_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.read_request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.range_request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("range_request_timeout_in_ms", conf.range_request_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.range_request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("request_timeout_in_ms", conf.request_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.write_request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("write_request_timeout_in_ms", conf.write_request_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.write_request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.cas_contention_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("cas_contention_timeout_in_ms", conf.cas_contention_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.cas_contention_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.counter_write_request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("counter_write_request_timeout_in_ms", conf.counter_cache_keys_to_save, LOWEST_ACCEPTED_TIMEOUT);
+           conf.counter_write_request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+
+        if(conf.truncate_request_timeout_in_ms < LOWEST_ACCEPTED_TIMEOUT)
+        {
+           logInfo("truncate_request_timeout_in_ms", conf.truncate_request_timeout_in_ms, LOWEST_ACCEPTED_TIMEOUT);
+           conf.truncate_request_timeout_in_ms = LOWEST_ACCEPTED_TIMEOUT;
+        }
+    }
+
+    private static void logInfo(String property, long actualValue, long lowestAcceptedValue)
+    {
+        logger.info("found {}::{} less than lowest acceptable value {}, continuing with {}", property, actualValue, lowestAcceptedValue, lowestAcceptedValue);
+    }
+
     public static void applyInitialTokens()
     {
         if (conf.initial_token != null)
@@ -898,6 +992,20 @@ public class DatabaseDescriptor
         paritionerName = partitioner.getClass().getCanonicalName();
     }
 
+    /**
+     * Computes the sum of the 2 specified positive values returning {@code Long.MAX_VALUE} if the sum overflow.
+     *
+     * @param left the left operand
+     * @param right the right operand
+     * @return the sum of the 2 specified positive values of {@code Long.MAX_VALUE} if the sum overflow.
+     */
+    private static long saturatedSum(long left, long right)
+    {
+        assert left >= 0 && right >= 0;
+        long sum = left + right;
+        return sum < 0 ? Long.MAX_VALUE : sum;
+    }
+
     private static FileStore guessFileStore(String dir) throws IOException
     {
         Path path = Paths.get(dir);
@@ -905,7 +1013,7 @@ public class DatabaseDescriptor
         {
             try
             {
-                return Files.getFileStore(path);
+                return FileUtils.getFileStore(path);
             }
             catch (IOException e)
             {
@@ -1155,6 +1263,11 @@ public class DatabaseDescriptor
     public static int getBatchSizeWarnThreshold()
     {
         return conf.batch_size_warn_threshold_in_kb * 1024;
+    }
+
+    public static int getBatchSizeWarnThresholdInKB()
+    {
+        return conf.batch_size_warn_threshold_in_kb;
     }
 
     public static long getBatchSizeFailThreshold()
@@ -1414,6 +1527,16 @@ public class DatabaseDescriptor
         conf.concurrent_validations = value;
     }
 
+    public static int getConcurrentViewBuilders()
+    {
+        return conf.concurrent_materialized_view_builders;
+    }
+
+    public static void setConcurrentViewBuilders(int value)
+    {
+        conf.concurrent_materialized_view_builders = value;
+    }
+
     public static long getMinFreeSpacePerDriveInBytes()
     {
         return conf.min_free_space_per_drive_in_mb * 1024L * 1024L;
@@ -1538,6 +1661,11 @@ public class DatabaseDescriptor
         return listenAddress;
     }
 
+    public static void setListenAddress(InetAddress newlistenAddress)
+    {
+        listenAddress = newlistenAddress;
+    }
+
     public static InetAddress getBroadcastAddress()
     {
         return broadcastAddress;
@@ -1546,6 +1674,16 @@ public class DatabaseDescriptor
     public static boolean shouldListenOnBroadcastAddress()
     {
         return conf.listen_on_broadcast_address;
+    }
+
+    public static void setShouldListenOnBroadcastAddress(boolean shouldListenOnBroadcastAddress)
+    {
+        conf.listen_on_broadcast_address = shouldListenOnBroadcastAddress;
+    }
+
+    public static void setListenOnBroadcastAddress(boolean listen_on_broadcast_address)
+    {
+        conf.listen_on_broadcast_address = listen_on_broadcast_address;
     }
 
     public static IInternodeAuthenticator getInternodeAuthenticator()
@@ -1654,14 +1792,14 @@ public class DatabaseDescriptor
         conf.native_transport_max_concurrent_connections_per_ip = native_transport_max_concurrent_connections_per_ip;
     }
 
-    public static double getCommitLogSyncBatchWindow()
+    public static double getCommitLogSyncGroupWindow()
     {
-        return conf.commitlog_sync_batch_window_in_ms;
+        return conf.commitlog_sync_group_window_in_ms;
     }
 
-    public static void setCommitLogSyncBatchWindow(double windowMillis)
+    public static void setCommitLogSyncGroupWindow(double windowMillis)
     {
-        conf.commitlog_sync_batch_window_in_ms = windowMillis;
+        conf.commitlog_sync_group_window_in_ms = windowMillis;
     }
 
     public static int getCommitLogSyncPeriod()
@@ -1834,7 +1972,12 @@ public class DatabaseDescriptor
         return conf.server_encryption_options;
     }
 
-    public static EncryptionOptions.ClientEncryptionOptions getClientEncryptionOptions()
+    public static void setServerEncryptionOptions(EncryptionOptions.ServerEncryptionOptions encryptionOptions)
+    {
+        conf.server_encryption_options = encryptionOptions;
+    }
+
+    public static EncryptionOptions getClientEncryptionOptions()
     {
         return conf.client_encryption_options;
     }
@@ -1904,6 +2047,18 @@ public class DatabaseDescriptor
         }
 
         return conf.file_cache_size_in_mb;
+    }
+
+    public static boolean getFileCacheRoundUp()
+    {
+        if (conf.file_cache_round_up == null)
+        {
+            // In client mode the value is not set.
+            assert DatabaseDescriptor.isClientInitialized();
+            return false;
+        }
+
+        return conf.file_cache_round_up;
     }
 
     public static boolean getBufferPoolUseHeapIfExhausted()
@@ -2036,21 +2191,6 @@ public class DatabaseDescriptor
         conf.counter_cache_keys_to_save = counterCacheKeysToSave;
     }
 
-    public static void setStreamingSocketTimeout(int value)
-    {
-        conf.streaming_socket_timeout_in_ms = value;
-    }
-
-    /**
-     * @deprecated use {@link #getStreamingKeepAlivePeriod()} instead
-     * @return streaming_socket_timeout_in_ms property
-     */
-    @Deprecated
-    public static int getStreamingSocketTimeout()
-    {
-        return conf.streaming_socket_timeout_in_ms;
-    }
-
     public static int getStreamingKeepAlivePeriod()
     {
         return conf.streaming_keep_alive_period_in_secs;
@@ -2074,6 +2214,11 @@ public class DatabaseDescriptor
     public static Config.InternodeCompression internodeCompression()
     {
         return conf.internode_compression;
+    }
+
+    public static void setInternodeCompression(Config.InternodeCompression compression)
+    {
+        conf.internode_compression = compression;
     }
 
     public static boolean getInterDCTcpNoDelay()
@@ -2135,6 +2280,11 @@ public class DatabaseDescriptor
     public static String getOtcCoalescingStrategy()
     {
         return conf.otc_coalescing_strategy;
+    }
+
+    public static void setOtcCoalescingStrategy(String strategy)
+    {
+        conf.otc_coalescing_strategy = strategy;
     }
 
     public static int getOtcCoalescingWindow()
@@ -2200,6 +2350,11 @@ public class DatabaseDescriptor
     public static void setUserDefinedFunctionWarnTimeout(long userDefinedFunctionWarnTimeout)
     {
         conf.user_defined_function_warn_timeout = userDefinedFunctionWarnTimeout;
+    }
+
+    public static boolean enableMaterializedViews()
+    {
+        return conf.enable_materialized_views;
     }
 
     public static long getUserDefinedFunctionFailTimeout()
@@ -2308,5 +2463,20 @@ public class DatabaseDescriptor
     public static void setIdealConsistencyLevel(ConsistencyLevel cl)
     {
         conf.ideal_consistency_level = cl;
+    }
+
+    public static int getRepairCommandPoolSize()
+    {
+        return conf.repair_command_pool_size;
+    }
+
+    public static Config.RepairCommandPoolFullStrategy getRepairCommandPoolFullStrategy()
+    {
+        return conf.repair_command_pool_full_strategy;
+    }
+
+    public static String getFullQueryLogPath()
+    {
+        return  conf.full_query_log_dir;
     }
 }

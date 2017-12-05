@@ -722,6 +722,11 @@ public class NodeProbe implements AutoCloseable
         ssProxy.enableAutoCompaction(ks, tableNames);
     }
 
+    public Map<String, Boolean> getAutoCompactionDisabled(String ks, String ... tableNames) throws IOException
+    {
+        return ssProxy.getAutoCompactionStatus(ks, tableNames);
+    }
+
     public void setIncrementalBackupsEnabled(boolean enabled)
     {
         ssProxy.setIncrementalBackupsEnabled(enabled);
@@ -1048,6 +1053,16 @@ public class NodeProbe implements AutoCloseable
         return ssProxy.getConcurrentCompactors();
     }
 
+    public void setConcurrentViewBuilders(int value)
+    {
+        ssProxy.setConcurrentViewBuilders(value);
+    }
+
+    public int getConcurrentViewBuilders()
+    {
+        return ssProxy.getConcurrentViewBuilders();
+    }
+
     public void setMaxHintWindow(int value)
     {
         spProxy.setMaxHintWindow(value);
@@ -1076,8 +1091,6 @@ public class NodeProbe implements AutoCloseable
                 return ssProxy.getCasContentionTimeout();
             case "truncate":
                 return ssProxy.getTruncateRpcTimeout();
-            case "streamingsocket":
-                return ssProxy.getStreamingSocketTimeout();
             default:
                 throw new RuntimeException("Timeout type requires one of (" + GetTimeout.TIMEOUT_TYPES + ")");
         }
@@ -1100,7 +1113,7 @@ public class NodeProbe implements AutoCloseable
 
     public int getExceptionCount()
     {
-        return (int)StorageMetrics.exceptions.getCount();
+        return (int)StorageMetrics.uncaughtExceptions.getCount();
     }
 
     public Map<String, Integer> getDroppedMessages()
@@ -1156,11 +1169,6 @@ public class NodeProbe implements AutoCloseable
             case "truncate":
                 ssProxy.setTruncateRpcTimeout(value);
                 break;
-            case "streamingsocket":
-                if (value > Integer.MAX_VALUE)
-                    throw new RuntimeException("streamingsocket timeout must be less than " + Integer.MAX_VALUE);
-                ssProxy.setStreamingSocketTimeout((int) value);
-                break;
             default:
                 throw new RuntimeException("Timeout type requires one of (" + GetTimeout.TIMEOUT_TYPES + ")");
         }
@@ -1209,6 +1217,11 @@ public class NodeProbe implements AutoCloseable
     public void resetLocalSchema() throws IOException
     {
         ssProxy.resetLocalSchema();
+    }
+
+    public void reloadLocalSchema()
+    {
+        ssProxy.reloadLocalSchema();
     }
 
     public boolean isFailed()
@@ -1339,6 +1352,9 @@ public class NodeProbe implements AutoCloseable
                 case "MemtableOffHeapSize":
                 case "MinPartitionSize":
                 case "PercentRepaired":
+                case "BytesRepaired":
+                case "BytesUnrepaired":
+                case "BytesPendingRepair":
                 case "RecentBloomFilterFalsePositives":
                 case "RecentBloomFilterFalseRatio":
                 case "SnapshotsSize":

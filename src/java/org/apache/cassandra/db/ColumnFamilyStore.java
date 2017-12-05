@@ -62,8 +62,11 @@ import org.apache.cassandra.exceptions.StartupException;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.format.*;
@@ -249,6 +252,9 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
     private final ScheduledFuture<?> latencyCalculator;
 
     private volatile boolean compactionSpaceCheck = true;
+
+    @VisibleForTesting
+    final DiskBoundaryManager diskBoundaryManager = new DiskBoundaryManager();
 
     public static void shutdownPostFlushExecutor() throws InterruptedException
     {
@@ -456,7 +462,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         // create the private ColumnFamilyStores for the secondary column indexes
         indexManager = new SecondaryIndexManager(this);
         for (IndexMetadata info : metadata.get().indexes)
-            indexManager.addIndex(info);
+            indexManager.addIndex(info, true);
 
         if (registerBookeeping)
         {
@@ -755,7 +761,8 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             }
             catch (IOException e)
             {
-                SSTableReader.logOpenException(entry.getKey(), e);
+                FileUtils.handleCorruptSSTable(new CorruptSSTableException(e, entry.getKey().filenameFor(Component.STATS)));
+                logger.error("Cannot read sstable {}; other IO error, skipping table", entry, e);
                 continue;
             }
 
@@ -781,9 +788,16 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             {
                 reader = SSTableReader.open(newDescriptor, entry.getValue(), metadata);
             }
-            catch (IOException e)
+            catch (CorruptSSTableException ex)
             {
-                SSTableReader.logOpenException(entry.getKey(), e);
+                FileUtils.handleCorruptSSTable(ex);
+                logger.error("Corrupt sstable {}; skipping table", entry, ex);
+                continue;
+            }
+            catch (FSError ex)
+            {
+                FileUtils.handleFSError(ex);
+                logger.error("Cannot read sstable {}; file system error, skipping table", entry, ex);
                 continue;
             }
             newSSTables.add(reader);
@@ -1621,7 +1635,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         return data.getUncompacting();
     }
 
-    public boolean isFilterFullyCoveredBy(ClusteringIndexFilter filter, DataLimits limits, CachedPartition cached, int nowInSec)
+    public boolean isFilterFullyCoveredBy(ClusteringIndexFilter filter,
+                                          DataLimits limits,
+                                          CachedPartition cached,
+                                          int nowInSec,
+                                          boolean enforceStrictLiveness)
     {
         // We can use the cached value only if we know that no data it doesn't contain could be covered
         // by the query filter, that is if:
@@ -1639,7 +1657,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         // is not in the cache. We can guarantee that if either the filter is a "head filter" and the cached
         // partition has more live rows that queried (where live rows refers to the rows that are live now),
         // or if we can prove that everything the filter selects is in the cached partition based on its content.
-        return (filter.isHeadFilter() && limits.hasEnoughLiveData(cached, nowInSec)) || filter.isFullyCoveredBy(cached);
+        return (filter.isHeadFilter() && limits.hasEnoughLiveData(cached,
+                                                                  nowInSec,
+                                                                  filter.selectsAllPartition(),
+                                                                  enforceStrictLiveness))
+                || filter.isFullyCoveredBy(cached);
     }
 
     public int gcBefore(int nowInSec)
@@ -1799,7 +1821,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                 }
 
                 writeSnapshotManifest(filesJSONArr, snapshotName);
-                if (!SchemaConstants.SYSTEM_KEYSPACE_NAMES.contains(metadata.keyspace) && !SchemaConstants.REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(metadata.keyspace))
+                if (!SchemaConstants.isLocalSystemKeyspace(metadata.keyspace) && !SchemaConstants.isReplicatedSystemKeyspace(metadata.keyspace))
                     writeSnapshotSchema(snapshotName);
             }
         }
@@ -1911,7 +1933,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
                 }
             }
         }
-        catch (IOException | RuntimeException e)
+        catch (FSReadError | RuntimeException e)
         {
             // In case one of the snapshot sstables fails to open,
             // we must release the references to the ones we opened so far
@@ -2647,5 +2669,20 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             return null;
 
         return keyspace.getColumnFamilyStore(table.id);
+    }
+
+    public static TableMetrics metricsFor(TableId tableId)
+    {
+        return getIfExists(tableId).metric;
+    }
+
+    public DiskBoundaries getDiskBoundaries()
+    {
+        return diskBoundaryManager.getDiskBoundaries(this);
+    }
+
+    public void invalidateDiskBoundaries()
+    {
+        diskBoundaryManager.invalidate();
     }
 }

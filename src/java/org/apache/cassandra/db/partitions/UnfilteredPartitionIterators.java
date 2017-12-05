@@ -19,8 +19,9 @@ package org.apache.cassandra.db.partitions;
 
 import java.io.IOError;
 import java.io.IOException;
-import java.security.MessageDigest;
 import java.util.*;
+
+import com.google.common.hash.Hasher;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
@@ -93,13 +94,6 @@ public abstract class UnfilteredPartitionIterators
             }
         }
         return MorePartitions.extend(iterators.get(0), new Extend());
-    }
-
-
-    public static PartitionIterator mergeAndFilter(List<UnfilteredPartitionIterator> iterators, int nowInSec, MergeListener listener)
-    {
-        // TODO: we could have a somewhat faster version if we were to merge the UnfilteredRowIterators directly as RowIterators
-        return filter(merge(iterators, nowInSec, listener), nowInSec);
     }
 
     public static PartitionIterator filter(final UnfilteredPartitionIterator iterator, final int nowInSec)
@@ -241,10 +235,10 @@ public abstract class UnfilteredPartitionIterators
      * Digests the the provided iterator.
      *
      * @param iterator the iterator to digest.
-     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param hasher the {@link Hasher} to use for the digest.
      * @param version the messaging protocol to use when producing the digest.
      */
-    public static void digest(UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+    public static void digest(UnfilteredPartitionIterator iterator, Hasher hasher, int version)
     {
         try (UnfilteredPartitionIterator iter = iterator)
         {
@@ -252,7 +246,7 @@ public abstract class UnfilteredPartitionIterators
             {
                 try (UnfilteredRowIterator partition = iter.next())
                 {
-                    UnfilteredRowIterators.digest(partition, digest, version);
+                    UnfilteredRowIterators.digest(partition, hasher, version);
                 }
             }
         }
@@ -324,10 +318,21 @@ public abstract class UnfilteredPartitionIterators
                     if (!nextReturned)
                         return hasNext;
 
-                    // We can't answer this until the previously returned iterator has been fully consumed,
-                    // so complain if that's not the case.
-                    if (next != null && next.hasNext())
-                        throw new IllegalStateException("Cannot call hasNext() until the previous iterator has been fully consumed");
+                    /*
+                     * We must consume the previous iterator before we start deserializing the next partition, so
+                     * that we start from the right position in the byte stream.
+                     *
+                     * It's possible however that it hasn't been fully consumed by upstream consumers - for example,
+                     * if a per partition limit caused merge iterator to stop early (see CASSANDRA-13911).
+                     *
+                     * In that case we must drain the unconsumed iterator fully ourselves, here.
+                     *
+                     * NOTE: transformations of the upstream BaseRows won't be applied for these consumed elements,
+                     * so, for exmaple, they won't be counted.
+                     */
+                    if (null != next)
+                        while (next.hasNext())
+                            next.next();
 
                     try
                     {

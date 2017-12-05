@@ -186,11 +186,14 @@ public abstract class CqlOperation<V> extends PredefinedOperation
 
         public boolean validate(ByteBuffer[][] result)
         {
-            if (result.length != expect.size())
-                return false;
-            for (int i = 0 ; i < result.length ; i++)
-                if (expect.get(i) != null && !expect.get(i).equals(Arrays.asList(result[i])))
+            if (!settings.errors.skipReadValidation)
+            {
+                if (result.length != expect.size())
                     return false;
+                for (int i = 0; i < result.length; i++)
+                    if (expect.get(i) != null && !expect.get(i).equals(Arrays.asList(result[i])))
+                        return false;
+            }
             return true;
         }
     }
@@ -278,11 +281,11 @@ public abstract class CqlOperation<V> extends PredefinedOperation
         }
 
         @Override
-        public <V> V execute(Object preparedStatementId, ByteBuffer key, List<Object> queryParams, ResultHandler<V> handler)
+        public <V> V execute(Object preparedStatement, ByteBuffer key, List<Object> queryParams, ResultHandler<V> handler)
         {
             return handler.javaDriverHandler().apply(
                     client.executePrepared(
-                            (PreparedStatement) preparedStatementId,
+                            (PreparedStatement) preparedStatement,
                             queryParams,
                             settings.command.consistencyLevel));
         }
@@ -310,11 +313,11 @@ public abstract class CqlOperation<V> extends PredefinedOperation
         }
 
         @Override
-        public <V> V execute(Object preparedStatementId, ByteBuffer key, List<Object> queryParams, ResultHandler<V> handler)
+        public <V> V execute(Object preparedStatement, ByteBuffer key, List<Object> queryParams, ResultHandler<V> handler)
         {
             return handler.simpleClientHandler().apply(
                     client.executePrepared(
-                            (byte[]) preparedStatementId,
+                            (ResultMessage.Prepared) preparedStatement,
                             toByteBufferParams(queryParams),
                             settings.command.consistencyLevel));
         }

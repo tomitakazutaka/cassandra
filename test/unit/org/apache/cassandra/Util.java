@@ -551,13 +551,15 @@ public class Util
     public static void spinAssertEquals(Object expected, Supplier<Object> s, int timeoutInSeconds)
     {
         long start = System.currentTimeMillis();
+        Object lastValue = null;
         while (System.currentTimeMillis() < start + (1000 * timeoutInSeconds))
         {
-            if (s.get().equals(expected))
+            lastValue = s.get();
+            if (lastValue.equals(expected))
                 break;
             Thread.yield();
         }
-        assertEquals(expected, s.get());
+        assertEquals(expected, lastValue);
     }
 
     public static void joinThread(Thread thread) throws InterruptedException
@@ -655,30 +657,7 @@ public class Util
                                                              ColumnFamilyStore cfs,
                                                              ReadExecutionController controller)
     {
-        return new InternalPartitionRangeReadCommand(command).queryStorageInternal(cfs, controller);
-    }
-
-    private static final class InternalPartitionRangeReadCommand extends PartitionRangeReadCommand
-    {
-
-        private InternalPartitionRangeReadCommand(PartitionRangeReadCommand original)
-        {
-            super(original.isDigestQuery(),
-                  original.digestVersion(),
-                  original.metadata(),
-                  original.nowInSec(),
-                  original.columnFilter(),
-                  original.rowFilter(),
-                  original.limits(),
-                  original.dataRange(),
-                  Optional.empty());
-        }
-
-        private UnfilteredPartitionIterator queryStorageInternal(ColumnFamilyStore cfs,
-                                                                 ReadExecutionController controller)
-        {
-            return queryStorage(cfs, controller);
-        }
+        return command.queryStorage(cfs, controller);
     }
 
     public static Closeable markDirectoriesUnwriteable(ColumnFamilyStore cfs)

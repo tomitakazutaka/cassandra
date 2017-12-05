@@ -453,14 +453,17 @@ A table supports the following options:
 +================================+==========+=============+===========================================================+
 | ``comment``                    | *simple* | none        | A free-form, human-readable comment.                      |
 +--------------------------------+----------+-------------+-----------------------------------------------------------+
-| ``read_repair_chance``         | *simple* | 0.1         | The probability with which to query extra nodes (e.g.     |
+| ``read_repair_chance``         | *simple* | 0           | The probability with which to query extra nodes (e.g.     |
 |                                |          |             | more nodes than required by the consistency level) for    |
 |                                |          |             | the purpose of read repairs.                              |
 +--------------------------------+----------+-------------+-----------------------------------------------------------+
-| ``dclocal_read_repair_chance`` | *simple* | 0           | The probability with which to query extra nodes (e.g.     |
+| ``dclocal_read_repair_chance`` | *simple* | 0.1         | The probability with which to query extra nodes (e.g.     |
 |                                |          |             | more nodes than required by the consistency level)        |
 |                                |          |             | belonging to the same data center than the read           |
 |                                |          |             | coordinator for the purpose of read repairs.              |
++--------------------------------+----------+-------------+-----------------------------------------------------------+
+| ``speculative_retry``          | *simple* | 99PERCENTILE| :ref:`Speculative retry options                           |
+|                                |          |             | <speculative-retry-options>`.                             |
 +--------------------------------+----------+-------------+-----------------------------------------------------------+
 | ``gc_grace_seconds``           | *simple* | 864000      | Time to wait before garbage collecting tombstones         |
 |                                |          |             | (deletion markers).                                       |
@@ -479,6 +482,37 @@ A table supports the following options:
 +--------------------------------+----------+-------------+-----------------------------------------------------------+
 | ``caching``                    | *map*    | *see below* | :ref:`Caching options <cql-caching-options>`.             |
 +--------------------------------+----------+-------------+-----------------------------------------------------------+
+| ``memtable_flush_period_in_ms``| *simple* | 0           | Time (in ms) before Cassandra flushes memtables to disk.  |
++--------------------------------+----------+-------------+-----------------------------------------------------------+
+
+.. _speculative-retry-options:
+
+Speculative retry options
+#########################
+
+By default, Cassandra read coordinators only query as many replicas as necessary to satisfy
+consistency levels: one for consistency level ``ONE``, a quorum for ``QUORUM``, and so on.
+``speculative_retry`` determines when coordinators may query additional replicas, which is useful
+when replicas are slow or unresponsive.  The following are legal values (case-insensitive):
+
+========================= ================ =============================================================================
+ Format                    Example          Description
+========================= ================ =============================================================================
+ ``XPERCENTILE``           90.5PERCENTILE   Coordinators record average per-table response times for all replicas.
+                                            If a replica takes longer than ``X`` percent of this table's average
+                                            response time, the coordinator queries an additional replica.
+                                            ``X`` must be between 0 and 100.
+ ``XP``                    90.5P            Synonym for ``XPERCENTILE``
+ ``Yms``                   25ms             If a replica takes more than ``Y`` milliseconds to respond,
+                                            the coordinator queries an additional replica.
+ ``ALWAYS``                                 Coordinators always query all replicas.
+ ``NONE``                                   Coordinators never query additional replicas.
+========================= ================ =============================================================================
+
+This setting does not affect reads with consistency level ``ALL`` because they already query all replicas.
+
+Note that frequently reading from additional replicas can hurt cluster performance.
+When in doubt, keep the default ``99PERCENTILE``.
 
 .. _cql-compaction-options:
 
@@ -512,7 +546,7 @@ available:
                                            compression. Custom compressor can be provided by specifying the full class
                                            name as a “string constant”:#constants.
  ``enabled``               true            Enable/disable sstable compression.
- ``chunk_length_in_kb``    64KB            On disk SSTables are compressed by block (to allow random reads). This
+ ``chunk_length_in_kb``    64              On disk SSTables are compressed by block (to allow random reads). This
                                            defines the size (in KB) of said block. Bigger values may improve the
                                            compression rate, but increases the minimum size of data to be read from disk
                                            for a read
@@ -523,6 +557,17 @@ available:
                                            they are always checked. Set to 0 to disable checksum checking and to 0.5 for
                                            instance to check them every other read   |
 ========================= =============== =============================================================================
+
+
+For instance, to create a table with LZ4Compressor and a chunk_lenth_in_kb of 4KB::
+
+   CREATE TABLE simple (
+      id int,
+      key text,
+      value text,
+      PRIMARY KEY (key, value)
+   ) with compression = {'class': 'LZ4Compressor', 'chunk_length_in_kb': 4};
+
 
 .. _cql-caching-options:
 
@@ -542,6 +587,17 @@ sub-options are available:
                                     possible options are ``ALL``, to cache all rows of a queried partition, or ``NONE``
                                     to disable row caching.
 ======================== ========= ====================================================================================
+
+
+For instance, to create a table with both a key cache and 10 rows per partition::
+
+    CREATE TABLE simple (
+    id int,
+    key text,
+    value text,
+    PRIMARY KEY (key, value)
+    ) WITH caching = {'keys': 'ALL', 'rows_per_partition': 10};
+
 
 Other considerations:
 #####################

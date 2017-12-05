@@ -207,7 +207,7 @@ public class CassandraDaemon
         {
             public void uncaughtException(Thread t, Throwable e)
             {
-                StorageMetrics.exceptions.inc();
+                StorageMetrics.uncaughtExceptions.inc();
                 logger.error("Exception in thread " + t, e);
                 Tracing.trace("Exception in thread {}", t, e);
                 for (Throwable e2 = e; e2 != null; e2 = e2.getCause())
@@ -234,8 +234,17 @@ public class CassandraDaemon
         // Populate token metadata before flushing, for token-aware sstable partitioning (#6696)
         StorageService.instance.populateTokenMetadata();
 
-        // load schema from disk
-        Schema.instance.loadFromDisk();
+        try
+        {
+            // load schema from disk
+            Schema.instance.loadFromDisk();
+        }
+        catch (Exception e)
+        {
+            logger.error("Error while loading schema: ", e);
+            throw e;
+        }
+
 
         // clean up debris in the rest of the keyspaces
         for (String keyspaceName : Schema.instance.getKeyspaces())

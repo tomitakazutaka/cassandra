@@ -31,6 +31,7 @@ import com.google.common.util.concurrent.AsyncFunction;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListenableFutureTask;
+import com.google.common.util.concurrent.MoreExecutors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,6 +76,8 @@ public class PendingAntiCompaction
                 refs.release();
         }
     }
+
+    static class SSTableAcquisitionException extends RuntimeException {}
 
     static class AcquisitionCallable implements Callable<AcquireResult>
     {
@@ -150,7 +153,7 @@ public class PendingAntiCompaction
                         result.abort();
                     }
                 }
-                return Futures.immediateFailedFuture(new RuntimeException("unable to acquire sstables"));
+                return Futures.immediateFailedFuture(new SSTableAcquisitionException());
             }
             else
             {
@@ -183,8 +186,9 @@ public class PendingAntiCompaction
     public ListenableFuture run()
     {
         ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(prsId);
-        List<ListenableFutureTask<AcquireResult>> tasks = new ArrayList<>();
-        for (ColumnFamilyStore cfs : prs.getColumnFamilyStores())
+        Collection<ColumnFamilyStore> cfss = prs.getColumnFamilyStores();
+        List<ListenableFutureTask<AcquireResult>> tasks = new ArrayList<>(cfss.size());
+        for (ColumnFamilyStore cfs : cfss)
         {
             cfs.forceBlockingFlush();
             ListenableFutureTask<AcquireResult> task = ListenableFutureTask.create(new AcquisitionCallable(cfs, ranges, prsId));
@@ -192,7 +196,7 @@ public class PendingAntiCompaction
             tasks.add(task);
         }
         ListenableFuture<List<AcquireResult>> acquisitionResults = Futures.successfulAsList(tasks);
-        ListenableFuture compactionResult = Futures.transform(acquisitionResults, new AcquisitionCallback(prsId, ranges));
+        ListenableFuture compactionResult = Futures.transformAsync(acquisitionResults, new AcquisitionCallback(prsId, ranges), MoreExecutors.directExecutor());
         return compactionResult;
     }
 }

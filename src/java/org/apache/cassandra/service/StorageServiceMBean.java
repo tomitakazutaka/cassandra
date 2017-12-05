@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -502,9 +501,6 @@ public interface StorageServiceMBean extends NotificationEmitter
     public void setTruncateRpcTimeout(long value);
     public long getTruncateRpcTimeout();
 
-    public void setStreamingSocketTimeout(int value);
-    public int getStreamingSocketTimeout();
-
     public void setStreamThroughputMbPerSec(int value);
     public int getStreamThroughputMbPerSec();
 
@@ -522,6 +518,9 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     public int getConcurrentValidators();
     public void setConcurrentValidators(int value);
+
+    public int getConcurrentViewBuilders();
+    public void setConcurrentViewBuilders(int value);
 
     public boolean isIncrementalBackupsEnabled();
     public void setIncrementalBackupsEnabled(boolean value);
@@ -581,6 +580,8 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     public void resetLocalSchema() throws IOException;
 
+    public void reloadLocalSchema();
+
     /**
      * Enables/Disables tracing for the whole system.
      *
@@ -597,6 +598,7 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     void disableAutoCompaction(String ks, String ... tables) throws IOException;
     void enableAutoCompaction(String ks, String ... tables) throws IOException;
+    Map<String, Boolean> getAutoCompactionStatus(String ks, String... tables) throws IOException;
 
     public void deliverHints(String host) throws UnknownHostException;
 
@@ -619,6 +621,11 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int getBatchSizeFailureThreshold();
     /** Sets the threshold for rejecting queries due to a large batch size */
     public void setBatchSizeFailureThreshold(int batchSizeDebugThreshold);
+
+    /** Returns the threshold for warning queries due to a large batch size */
+    public int getBatchSizeWarnThreshold();
+    /** Sets the threshold for warning queries due to a large batch size */
+    public void setBatchSizeWarnThreshold(int batchSizeDebugThreshold);
 
     /** Sets the hinted handoff throttle in kb per second, per delivery thread. */
     public void setHintedHandoffThrottleInKB(int throttleInKB);

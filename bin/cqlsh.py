@@ -1084,7 +1084,9 @@ class Shell(cmd.Cmd):
                     num_rows += len(result.current_rows)
                     self.print_static_result(result, table_meta)
                 if result.has_more_pages:
-                    raw_input("---MORE---")
+                    if self.shunted_query_out is None:
+                        # Only pause when not capturing.
+                        raw_input("---MORE---")
                     result.fetch_next_page()
                 else:
                     break
@@ -1956,6 +1958,12 @@ class Shell(cmd.Cmd):
             session = conn.connect(self.current_keyspace)
         else:
             session = conn.connect()
+
+        # Copy session properties
+        session.default_timeout = self.session.default_timeout
+        session.row_factory = self.session.row_factory
+        session.default_consistency_level = self.session.default_consistency_level
+        session.max_trace_wait = self.session.max_trace_wait
 
         # Update after we've connected in case we fail to authenticate
         self.conn = conn
