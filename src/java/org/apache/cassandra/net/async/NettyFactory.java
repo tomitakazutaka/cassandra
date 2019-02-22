@@ -2,6 +2,7 @@ package org.apache.cassandra.net.async;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.Checksum;
 
 import javax.annotation.Nullable;
@@ -21,6 +22,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
+import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.epoll.EpollSocketChannel;
@@ -48,6 +50,7 @@ import org.apache.cassandra.auth.IInternodeAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.service.NativeTransportService;
@@ -121,7 +124,7 @@ public final class NettyFactory
     NettyFactory(boolean useEpoll)
     {
         this.useEpoll = useEpoll;
-        acceptGroup = getEventLoopGroup(useEpoll, determineAcceptGroupSize(DatabaseDescriptor.getServerEncryptionOptions()),
+        acceptGroup = getEventLoopGroup(useEpoll, determineAcceptGroupSize(DatabaseDescriptor.getInternodeMessagingEncyptionOptions()),
                                         "MessagingService-NettyAcceptor-Thread", false);
         inboundGroup = getEventLoopGroup(useEpoll, FBUtilities.getAvailableProcessors(), "MessagingService-NettyInbound-Thread", false);
         outboundGroup = getEventLoopGroup(useEpoll, FBUtilities.getAvailableProcessors(), "MessagingService-NettyOutbound-Thread", true);
@@ -184,9 +187,9 @@ public final class NettyFactory
      * Create a {@link Channel} that listens on the {@code localAddr}. This method will block while trying to bind to the address,
      * but it does not make a remote call.
      */
-    public Channel createInboundChannel(InetSocketAddress localAddr, InboundInitializer initializer, int receiveBufferSize) throws ConfigurationException
+    public Channel createInboundChannel(InetAddressAndPort localAddr, InboundInitializer initializer, int receiveBufferSize) throws ConfigurationException
     {
-        String nic = FBUtilities.getNetworkInterface(localAddr.getAddress());
+        String nic = FBUtilities.getNetworkInterface(localAddr.address);
         logger.info("Starting Messaging Service on {} {}, encryption: {}",
                     localAddr, nic == null ? "" : String.format(" (%s)", nic), encryptionLogStatement(initializer.encryptionOptions));
         Class<? extends ServerChannel> transport = useEpoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class;
@@ -199,10 +202,13 @@ public final class NettyFactory
                                                          .childOption(ChannelOption.SO_SNDBUF, INBOUND_CHANNEL_SEND_BUFFER_SIZE)
                                                          .childHandler(initializer);
 
+        if (useEpoll)
+            bootstrap.childOption(EpollChannelOption.TCP_USER_TIMEOUT, DatabaseDescriptor.getInternodeTcpUserTimeoutInMS());
+
         if (receiveBufferSize > 0)
             bootstrap.childOption(ChannelOption.SO_RCVBUF, receiveBufferSize);
 
-        ChannelFuture channelFuture = bootstrap.bind(localAddr);
+        ChannelFuture channelFuture = bootstrap.bind(new InetSocketAddress(localAddr.address, localAddr.port));
 
         if (!channelFuture.awaitUninterruptibly().isSuccess())
         {
@@ -248,7 +254,7 @@ public final class NettyFactory
         }
         else
         {
-            logger.debug("Creating SSL handler for %s:%d", peer.getHostString(), peer.getPort());
+            logger.debug("Creating SSL handler for {}:{}", peer.getHostString(), peer.getPort());
             SslHandler sslHandler = sslContext.newHandler(channel.alloc(), peer.getHostString(), peer.getPort());
             SSLEngine engine = sslHandler.engine();
             SSLParameters sslParameters = engine.getSSLParameters();
@@ -286,7 +292,7 @@ public final class NettyFactory
                 }
                 else
                 {
-                    SslContext sslContext = SSLFactory.getSslContext(encryptionOptions, true, true);
+                    SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, true, SSLFactory.SocketType.SERVER);
                     InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? channel.remoteAddress() : null;
                     SslHandler sslHandler = newSslHandler(channel, sslContext, peer);
                     logger.trace("creating inbound netty SslContext: context={}, engine={}", sslContext.getClass().getName(), sslHandler.engine().getClass().getName());
@@ -325,7 +331,7 @@ public final class NettyFactory
         Class<? extends Channel> transport = useEpoll ? EpollSocketChannel.class : NioSocketChannel.class;
         Bootstrap bootstrap = new Bootstrap().group(params.mode == Mode.MESSAGING ? outboundGroup : streamingGroup)
                               .channel(transport)
-                              .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)
+                              .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, params.tcpConnectTimeoutInMS)
                               .option(ChannelOption.SO_KEEPALIVE, true)
                               .option(ChannelOption.SO_REUSEADDR, true)
                               .option(ChannelOption.SO_SNDBUF, params.sendBufferSize)
@@ -333,8 +339,11 @@ public final class NettyFactory
                               .option(ChannelOption.TCP_NODELAY, params.tcpNoDelay)
                               .option(ChannelOption.WRITE_BUFFER_WATER_MARK, params.waterMark)
                               .handler(new OutboundInitializer(params));
-        bootstrap.localAddress(params.connectionId.local(), 0);
-        bootstrap.remoteAddress(params.connectionId.connectionAddress());
+        if (useEpoll)
+            bootstrap.option(EpollChannelOption.TCP_USER_TIMEOUT, params.tcpUserTimeoutInMS);
+
+        InetAddressAndPort remoteAddress = params.connectionId.connectionAddress();
+        bootstrap.remoteAddress(new InetSocketAddress(remoteAddress.address, remoteAddress.port));
         return bootstrap;
     }
 
@@ -360,9 +369,10 @@ public final class NettyFactory
             // order of handlers: ssl -> logger -> handshakeHandler
             if (params.encryptionOptions != null)
             {
-                SslContext sslContext = SSLFactory.getSslContext(params.encryptionOptions, true, false);
+                SslContext sslContext = SSLFactory.getOrCreateSslContext(params.encryptionOptions, true, SSLFactory.SocketType.CLIENT);
                 // for some reason channel.remoteAddress() will return null
-                InetSocketAddress peer = params.encryptionOptions.require_endpoint_verification ? params.connectionId.remoteAddress() : null;
+                InetAddressAndPort address = params.connectionId.remote();
+                InetSocketAddress peer = params.encryptionOptions.require_endpoint_verification ? new InetSocketAddress(address.address, address.port) : null;
                 SslHandler sslHandler = newSslHandler(channel, sslContext, peer);
                 logger.trace("creating outbound netty SslContext: context={}, engine={}", sslContext.getClass().getName(), sslHandler.engine().getClass().getName());
                 pipeline.addFirst(SSL_CHANNEL_HANDLER_NAME, sslHandler);
@@ -375,12 +385,13 @@ public final class NettyFactory
         }
     }
 
-    public void close()
+    public void close() throws InterruptedException
     {
-        acceptGroup.shutdownGracefully();
-        outboundGroup.shutdownGracefully();
-        inboundGroup.shutdownGracefully();
-        streamingGroup.shutdownGracefully();
+        EventLoopGroup[] groups = new EventLoopGroup[] { acceptGroup, outboundGroup, inboundGroup, streamingGroup };
+        for (EventLoopGroup group : groups)
+            group.shutdownGracefully(0, 2, TimeUnit.SECONDS);
+        for (EventLoopGroup group : groups)
+            group.awaitTermination(60, TimeUnit.SECONDS);
     }
 
     static Lz4FrameEncoder createLz4Encoder(int protocolVersion)

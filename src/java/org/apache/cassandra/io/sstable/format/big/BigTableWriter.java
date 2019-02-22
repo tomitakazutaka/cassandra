@@ -21,6 +21,7 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,7 +29,6 @@ import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.FSWriteError;
@@ -68,14 +68,15 @@ public class BigTableWriter extends SSTableWriter
                           long keyCount,
                           long repairedAt,
                           UUID pendingRepair,
+                          boolean isTransient,
                           TableMetadataRef metadata,
                           MetadataCollector metadataCollector, 
                           SerializationHeader header,
                           Collection<SSTableFlushObserver> observers,
-                          LifecycleTransaction txn)
+                          LifecycleNewTracker lifecycleNewTracker)
     {
-        super(descriptor, keyCount, repairedAt, pendingRepair, metadata, metadataCollector, header, observers);
-        txn.trackNew(this); // must track before any files are created
+        super(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadata, metadataCollector, header, observers);
+        lifecycleNewTracker.trackNew(this); // must track before any files are created
 
         if (compression)
         {
@@ -439,7 +440,7 @@ public class BigTableWriter extends SSTableWriter
             builder = new FileHandle.Builder(descriptor.filenameFor(Component.PRIMARY_INDEX)).mmapped(DatabaseDescriptor.getIndexAccessMode() == Config.DiskAccessMode.mmap);
             chunkCache.ifPresent(builder::withChunkCache);
             summary = new IndexSummaryBuilder(keyCount, metadata().params.minIndexInterval, Downsampling.BASE_SAMPLING_LEVEL);
-            bf = FilterFactory.getFilter(keyCount, metadata().params.bloomFilterFpChance, true);
+            bf = FilterFactory.getFilter(keyCount, metadata().params.bloomFilterFpChance);
             // register listeners to be alerted when the data files are flushed
             indexFile.setPostFlushListener(() -> summary.markIndexSynced(indexFile.getLastFlushOffset()));
             dataFile.setPostFlushListener(() -> summary.markDataSynced(dataFile.getLastFlushOffset()));
@@ -484,7 +485,7 @@ public class BigTableWriter extends SSTableWriter
                      DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(fos))
                 {
                     // bloom filter
-                    FilterFactory.serialize(bf, stream);
+                    BloomFilterSerializer.serialize((BloomFilter) bf, stream);
                     stream.flush();
                     SyncUtil.sync(fos);
                 }

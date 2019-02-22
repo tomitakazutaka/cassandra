@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.annotations.VisibleForTesting;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +34,6 @@ import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.concurrent.EventExecutor;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.metrics.AuthMetrics;
 import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.transport.RequestThreadPoolExecutor;
 import org.apache.cassandra.transport.Server;
@@ -85,7 +85,7 @@ public class NativeTransportService
                                                                 .withEventLoopGroup(workerGroup)
                                                                 .withHost(nativeAddr);
 
-        if (!DatabaseDescriptor.getClientEncryptionOptions().enabled)
+        if (!DatabaseDescriptor.getNativeProtocolEncryptionOptions().enabled)
         {
             servers = Collections.singleton(builder.withSSL(false).withPort(nativePort).build());
         }
@@ -108,16 +108,7 @@ public class NativeTransportService
             }
         }
 
-        // register metrics
-        ClientMetrics.instance.addCounter("connectedNativeClients", () ->
-        {
-            int ret = 0;
-            for (Server server : servers)
-                ret += server.getConnectedClients();
-            return ret;
-        });
-
-        AuthMetrics.init();
+        ClientMetrics.instance.init(servers);
 
         initialized = true;
     }
@@ -155,14 +146,14 @@ public class NativeTransportService
     }
 
     /**
-     * @return intend to use epoll bassed event looping
+     * @return intend to use epoll based event looping
      */
     public static boolean useEpoll()
     {
         final boolean enableEpoll = Boolean.parseBoolean(System.getProperty("cassandra.native.epoll.enabled", "true"));
 
         if (enableEpoll && !Epoll.isAvailable() && NativeLibrary.osType == NativeLibrary.OSType.LINUX)
-            logger.warn("epoll not availble {}", Epoll.unavailabilityCause());
+            logger.warn("epoll not available {}", Epoll.unavailabilityCause());
 
         return enableEpoll && Epoll.isAvailable();
     }
@@ -193,5 +184,11 @@ public class NativeTransportService
     Collection<Server> getServers()
     {
         return servers;
+    }
+
+    public void clearConnectionHistory()
+    {
+        for (Server server : servers)
+            server.clearConnectionHistory();
     }
 }

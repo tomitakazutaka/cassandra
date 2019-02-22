@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.schema;
 
-import java.net.InetAddress;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Set;
@@ -32,6 +31,7 @@ import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.SystemKeyspace.BootstrapState;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.IAsyncCallback;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
@@ -46,11 +46,12 @@ final class MigrationTask extends WrappedRunnable
 
     private static final Set<BootstrapState> monitoringBootstrapStates = EnumSet.of(BootstrapState.NEEDS_BOOTSTRAP, BootstrapState.IN_PROGRESS);
 
-    private final InetAddress endpoint;
+    private final InetAddressAndPort endpoint;
 
-    MigrationTask(InetAddress endpoint)
+    MigrationTask(InetAddressAndPort endpoint)
     {
         this.endpoint = endpoint;
+        SchemaMigrationDiagnostics.taskCreated(endpoint);
     }
 
     static ConcurrentLinkedQueue<CountDownLatch> getInflightTasks()
@@ -63,6 +64,7 @@ final class MigrationTask extends WrappedRunnable
         if (!FailureDetector.instance.isAlive(endpoint))
         {
             logger.warn("Can't send schema pull request: node {} is down.", endpoint);
+            SchemaMigrationDiagnostics.taskSendAborted(endpoint);
             return;
         }
 
@@ -72,6 +74,7 @@ final class MigrationTask extends WrappedRunnable
         if (!MigrationManager.shouldPullSchemaFrom(endpoint))
         {
             logger.info("Skipped sending a migration request: node {} has a higher major version now.", endpoint);
+            SchemaMigrationDiagnostics.taskSendAborted(endpoint);
             return;
         }
 
@@ -109,5 +112,7 @@ final class MigrationTask extends WrappedRunnable
             inflightTasks.offer(completionLatch);
 
         MessagingService.instance().sendRR(message, endpoint, cb);
+
+        SchemaMigrationDiagnostics.taskRequestSend(endpoint);
     }
 }

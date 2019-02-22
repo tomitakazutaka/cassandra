@@ -27,9 +27,9 @@ import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.rows.Row;
@@ -193,8 +193,9 @@ public class CompactionsPurgeTest
         }
         cfs.forceBlockingFlush();
 
-        new Mutation(KEYSPACE1, dk(key))
+        new Mutation.PartitionUpdateCollector(KEYSPACE1, dk(key))
             .add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), Long.MAX_VALUE, FBUtilities.nowInSeconds()))
+            .build()
             .applyUnsafe();
         cfs.forceBlockingFlush();
 
@@ -304,7 +305,7 @@ public class CompactionsPurgeTest
         cfs.forceBlockingFlush();
         List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstablesIncomplete, Integer.MAX_VALUE);
         assertEquals(1, tasks.size());
-        tasks.get(0).execute(null);
+        tasks.get(0).execute(ActiveCompactionsTracker.NOOP);
 
         // verify that minor compaction does GC when key is provably not
         // present in a non-compacted sstable
@@ -355,7 +356,7 @@ public class CompactionsPurgeTest
         // compact the sstables with the c1/c2 data and the c1 tombstone
         List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstablesIncomplete, Integer.MAX_VALUE);
         assertEquals(1, tasks.size());
-        tasks.get(0).execute(null);
+        tasks.get(0).execute(ActiveCompactionsTracker.NOOP);
 
         // We should have both the c1 and c2 tombstones still. Since the min timestamp in the c2 tombstone
         // sstable is older than the c1 tombstone, it is invalid to throw out the c1 tombstone.
@@ -423,9 +424,9 @@ public class CompactionsPurgeTest
         }
 
         // deletes partition
-        Mutation rm = new Mutation(KEYSPACE_CACHED, dk(key));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KEYSPACE_CACHED, dk(key));
         rm.add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), 1, FBUtilities.nowInSeconds()));
-        rm.applyUnsafe();
+        rm.build().applyUnsafe();
 
         // Adds another unrelated partition so that the sstable is not considered fully expired. We do not
         // invalidate the row cache in that latter case.
@@ -463,9 +464,9 @@ public class CompactionsPurgeTest
         }
 
         // deletes partition with timestamp such that not all columns are deleted
-        Mutation rm = new Mutation(KEYSPACE1, dk(key));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KEYSPACE1, dk(key));
         rm.add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), 4, FBUtilities.nowInSeconds()));
-        rm.applyUnsafe();
+        rm.build().applyUnsafe();
 
         ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
         assertFalse(partition.partitionLevelDeletion().isLive());

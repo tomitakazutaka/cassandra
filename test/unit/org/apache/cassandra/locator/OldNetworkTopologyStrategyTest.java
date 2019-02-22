@@ -17,11 +17,9 @@
  */
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -36,16 +34,19 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.RangeRelocator;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class OldNetworkTopologyStrategyTest
 {
+
     private List<Token> keyTokens;
     private TokenMetadata tmd;
-    private Map<String, ArrayList<InetAddress>> expectedResults;
+    private Map<String, ArrayList<InetAddressAndPort>> expectedResults;
 
     @BeforeClass
     public static void setupDD()
@@ -54,11 +55,11 @@ public class OldNetworkTopologyStrategyTest
     }
 
     @Before
-    public void init()
+    public void init() throws Exception
     {
         keyTokens = new ArrayList<Token>();
         tmd = new TokenMetadata();
-        expectedResults = new HashMap<String, ArrayList<InetAddress>>();
+        expectedResults = new HashMap<String, ArrayList<InetAddressAndPort>>();
     }
 
     /**
@@ -136,12 +137,12 @@ public class OldNetworkTopologyStrategyTest
         testGetEndpoints(strategy, keyTokens.toArray(new Token[0]));
     }
 
-    private ArrayList<InetAddress> buildResult(String... addresses) throws UnknownHostException
+    private ArrayList<InetAddressAndPort> buildResult(String... addresses) throws UnknownHostException
     {
-        ArrayList<InetAddress> result = new ArrayList<InetAddress>();
+        ArrayList<InetAddressAndPort> result = new ArrayList<>();
         for (String address : addresses)
         {
-            result.add(InetAddress.getByName(address));
+            result.add(InetAddressAndPort.getByName(address));
         }
         return result;
     }
@@ -153,7 +154,7 @@ public class OldNetworkTopologyStrategyTest
         BigIntegerToken keyToken = new BigIntegerToken(keyTokenID);
         keyTokens.add(keyToken);
 
-        InetAddress ep = InetAddress.getByName(endpointAddress);
+        InetAddressAndPort ep = InetAddressAndPort.getByName(endpointAddress);
         tmd.updateNormalToken(endpointToken, ep);
     }
 
@@ -161,11 +162,11 @@ public class OldNetworkTopologyStrategyTest
     {
         for (Token keyToken : keyTokens)
         {
-            List<InetAddress> endpoints = strategy.getNaturalEndpoints(keyToken);
-            for (int j = 0; j < endpoints.size(); j++)
+            int j = 0;
+            for (InetAddressAndPort endpoint : strategy.getNaturalReplicasForToken(keyToken).endpoints())
             {
-                ArrayList<InetAddress> hostsExpected = expectedResults.get(keyToken.toString());
-                assertEquals(endpoints.get(j), hostsExpected.get(j));
+                ArrayList<InetAddressAndPort> hostsExpected = expectedResults.get(keyToken.toString());
+                assertEquals(endpoint, hostsExpected.get(j++));
             }
         }
     }
@@ -189,7 +190,6 @@ public class OldNetworkTopologyStrategyTest
         assertEquals(ranges.left.iterator().next().left, tokensAfterMove[movingNodeIdx]);
         assertEquals(ranges.left.iterator().next().right, tokens[movingNodeIdx]);
         assertEquals("No data should be fetched", ranges.right.size(), 0);
-
     }
 
     @Test
@@ -206,7 +206,6 @@ public class OldNetworkTopologyStrategyTest
         assertEquals("No data should be streamed", ranges.left.size(), 0);
         assertEquals(ranges.right.iterator().next().left, tokens[movingNodeIdx]);
         assertEquals(ranges.right.iterator().next().right, tokensAfterMove[movingNodeIdx]);
-
     }
 
     @SuppressWarnings("unchecked")
@@ -340,7 +339,7 @@ public class OldNetworkTopologyStrategyTest
 
         int lastIPPart = 1;
         for (BigIntegerToken token : tokens)
-            tokenMetadataCurrent.updateNormalToken(token, InetAddress.getByName("254.0.0." + Integer.toString(lastIPPart++)));
+            tokenMetadataCurrent.updateNormalToken(token, InetAddressAndPort.getByName("254.0.0." + Integer.toString(lastIPPart++)));
 
         return tokenMetadataCurrent;
     }
@@ -360,23 +359,28 @@ public class OldNetworkTopologyStrategyTest
     {
         RackInferringSnitch endpointSnitch = new RackInferringSnitch();
 
-        InetAddress movingNode = InetAddress.getByName("254.0.0." + Integer.toString(movingNodeIdx + 1));
+        InetAddressAndPort movingNode = InetAddressAndPort.getByName("254.0.0." + Integer.toString(movingNodeIdx + 1));
 
 
         TokenMetadata tokenMetadataCurrent = initTokenMetadata(tokens);
         TokenMetadata tokenMetadataAfterMove = initTokenMetadata(tokensAfterMove);
         AbstractReplicationStrategy strategy = new OldNetworkTopologyStrategy("Keyspace1", tokenMetadataCurrent, endpointSnitch, optsWithRF(2));
 
-        Collection<Range<Token>> currentRanges = strategy.getAddressRanges().get(movingNode);
-        Collection<Range<Token>> updatedRanges = strategy.getPendingAddressRanges(tokenMetadataAfterMove, tokensAfterMove[movingNodeIdx], movingNode);
+        RangesAtEndpoint currentRanges = strategy.getAddressReplicas().get(movingNode);
+        RangesAtEndpoint updatedRanges = strategy.getPendingAddressRanges(tokenMetadataAfterMove, tokensAfterMove[movingNodeIdx], movingNode);
 
-        Pair<Set<Range<Token>>, Set<Range<Token>>> ranges = StorageService.instance.calculateStreamAndFetchRanges(currentRanges, updatedRanges);
-
-        return ranges;
+        return asRanges(RangeRelocator.calculateStreamAndFetchRanges(currentRanges, updatedRanges));
     }
 
     private static Map<String, String> optsWithRF(int rf)
     {
         return Collections.singletonMap("replication_factor", Integer.toString(rf));
+    }
+
+    public static Pair<Set<Range<Token>>, Set<Range<Token>>> asRanges(Pair<RangesAtEndpoint, RangesAtEndpoint> replicas)
+    {
+        Set<Range<Token>> leftRanges = replicas.left.ranges();
+        Set<Range<Token>> rightRanges = replicas.right.ranges();
+        return Pair.create(leftRanges, rightRanges);
     }
 }

@@ -16,6 +16,8 @@
 
 .. highlight:: none
 
+.. _monitoring-metrics:
+
 Monitoring
 ----------
 
@@ -54,6 +56,8 @@ All metrics reported by cassandra fit into one of the following types.
 ``Meter``
     A meter metric which measures mean throughput and one-, five-, and fifteen-minute exponentially-weighted moving
     average throughputs.
+
+.. _table-metrics:
 
 Table Metrics
 ^^^^^^^^^^^^^
@@ -95,6 +99,7 @@ ReadLatency                             Latency        Local read latency for th
 RangeLatency                            Latency        Local range scan latency for this table.
 WriteLatency                            Latency        Local write latency for this table.
 CoordinatorReadLatency                  Timer          Coordinator read latency for this table.
+CoordinatorWriteLatency                 Timer          Coordinator write latency for this table.
 CoordinatorScanLatency                  Timer          Coordinator range scan latency for this table.
 PendingFlushes                          Counter        Estimated number of flush tasks pending for this table.
 BytesFlushed                            Counter        Total number of bytes flushed since server [re]start.
@@ -396,6 +401,7 @@ RegularStatementsExecuted  Counter        Number of **non** prepared statements 
 PreparedStatementsRatio    Gauge<Double>  Percentage of statements that are prepared vs unprepared.
 ========================== ============== ===========
 
+.. _dropped-metrics:
 
 DroppedMessage Metrics
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -631,11 +637,13 @@ Reported name format:
 **JMX MBean**
     ``org.apache.cassandra.metrics:type=Client name=<MetricName>``
 
-=========================== ============== ===========
-Name                        Type           Description
-=========================== ============== ===========
-connectedNativeClients      Counter        Number of clients connected to this nodes native protocol server
-=========================== ============== ===========
+============================== =============================== ===========
+Name                           Type                            Description
+============================== =============================== ===========
+connectedNativeClients         Gauge<Integer>                  Number of clients connected to this nodes native protocol server
+connections                    Gauge<List<Map<String, String>> List of all connections and their state information
+connectedNativeClientsByUser   Gauge<Map<String, Int>          Number of connnective native clients by username
+============================== =============================== ===========
 
 
 Batch Metrics

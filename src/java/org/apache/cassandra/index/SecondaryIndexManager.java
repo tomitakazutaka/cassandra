@@ -50,7 +50,7 @@ import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -164,10 +164,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * The underlying column family containing the source data for these indexes
      */
     public final ColumnFamilyStore baseCfs;
+    private final Keyspace keyspace;
 
     public SecondaryIndexManager(ColumnFamilyStore baseCfs)
     {
         this.baseCfs = baseCfs;
+        this.keyspace = baseCfs.keyspace;
         baseCfs.getTracker().subscribe(this);
     }
 
@@ -842,7 +844,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             while (!pager.isExhausted())
             {
                 try (ReadExecutionController controller = cmd.executionController();
-                     OpOrder.Group writeGroup = Keyspace.writeOrder.start();
+                     WriteContext ctx = keyspace.getWriteHandler().createContextForIndexing();
                      UnfilteredPartitionIterator page = pager.fetchPageUnfiltered(baseCfs.metadata(), pageSize, controller))
                 {
                     if (!page.hasNext())
@@ -854,7 +856,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                                              .map(index -> index.indexerFor(key,
                                                                                             partition.columns(),
                                                                                             nowInSec,
-                                                                                            writeGroup,
+                                                                                            ctx,
                                                                                             IndexTransaction.Type.UPDATE))
                                                              .filter(Objects::nonNull)
                                                              .collect(Collectors.toSet());
@@ -897,7 +899,10 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                         {
                             Iterator<RangeTombstone> iter = deletionInfo.rangeIterator(false);
                             while (iter.hasNext())
-                                indexers.forEach(indexer -> indexer.rangeTombstone(iter.next()));
+                            {
+                                RangeTombstone rt = iter.next();
+                                indexers.forEach(indexer -> indexer.rangeTombstone(rt));
+                            }
                         }
 
                         indexers.forEach(Index.Indexer::finish);
@@ -1115,7 +1120,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     /**
      * Transaction for updates on the write path.
      */
-    public UpdateTransaction newUpdateTransaction(PartitionUpdate update, OpOrder.Group opGroup, int nowInSec)
+    public UpdateTransaction newUpdateTransaction(PartitionUpdate update, WriteContext ctx, int nowInSec)
     {
         if (!hasIndexes())
             return UpdateTransaction.NO_OP;
@@ -1124,7 +1129,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                           .map(i -> i.indexerFor(update.partitionKey(),
                                                                  update.columns(),
                                                                  nowInSec,
-                                                                 opGroup,
+                                                                 ctx,
                                                                  IndexTransaction.Type.UPDATE))
                                           .filter(Objects::nonNull)
                                           .toArray(Index.Indexer[]::new);
@@ -1141,7 +1146,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                                           int nowInSec)
     {
         // the check for whether there are any registered indexes is already done in CompactionIterator
-        return new IndexGCTransaction(key, regularAndStaticColumns, versions, nowInSec, listIndexes());
+        return new IndexGCTransaction(key, regularAndStaticColumns, keyspace, versions, nowInSec, listIndexes());
     }
 
     /**
@@ -1154,7 +1159,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         if (!hasIndexes())
             return CleanupTransaction.NO_OP;
 
-        return new CleanupGCTransaction(key, regularAndStaticColumns, nowInSec, listIndexes());
+        return new CleanupGCTransaction(key, regularAndStaticColumns, keyspace, nowInSec, listIndexes());
     }
 
     /**
@@ -1267,6 +1272,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         private final DecoratedKey key;
         private final RegularAndStaticColumns columns;
+        private final Keyspace keyspace;
         private final int versions;
         private final int nowInSec;
         private final Collection<Index> indexes;
@@ -1275,12 +1281,13 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         private IndexGCTransaction(DecoratedKey key,
                                    RegularAndStaticColumns columns,
-                                   int versions,
+                                   Keyspace keyspace, int versions,
                                    int nowInSec,
                                    Collection<Index> indexes)
         {
             this.key = key;
             this.columns = columns;
+            this.keyspace = keyspace;
             this.versions = versions;
             this.indexes = indexes;
             this.nowInSec = nowInSec;
@@ -1342,11 +1349,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             if (rows == null)
                 return;
 
-            try (OpOrder.Group opGroup = Keyspace.writeOrder.start())
+            try (WriteContext ctx = keyspace.getWriteHandler().createContextForIndexing())
             {
                 for (Index index : indexes)
                 {
-                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.COMPACTION);
+                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, ctx, Type.COMPACTION);
                     if (indexer == null)
                         continue;
 
@@ -1370,6 +1377,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         private final DecoratedKey key;
         private final RegularAndStaticColumns columns;
+        private final Keyspace keyspace;
         private final int nowInSec;
         private final Collection<Index> indexes;
 
@@ -1378,11 +1386,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         private CleanupGCTransaction(DecoratedKey key,
                                      RegularAndStaticColumns columns,
-                                     int nowInSec,
+                                     Keyspace keyspace, int nowInSec,
                                      Collection<Index> indexes)
         {
             this.key = key;
             this.columns = columns;
+            this.keyspace = keyspace;
             this.indexes = indexes;
             this.nowInSec = nowInSec;
         }
@@ -1406,11 +1415,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             if (row == null && partitionDelete == null)
                 return;
 
-            try (OpOrder.Group opGroup = Keyspace.writeOrder.start())
+            try (WriteContext ctx = keyspace.getWriteHandler().createContextForIndexing())
             {
                 for (Index index : indexes)
                 {
-                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.CLEANUP);
+                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, ctx, Type.CLEANUP);
                     if (indexer == null)
                         continue;
 
@@ -1475,5 +1484,15 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                             .collect(Collectors.toSet()),
                                      false);
         }
+    }
+
+    @VisibleForTesting
+    public static void shutdownExecutors() throws InterruptedException
+    {
+        ExecutorService[] executors = new ExecutorService[]{ asyncExecutor, blockingExecutor };
+        for (ExecutorService executor : executors)
+            executor.shutdown();
+        for (ExecutorService executor : executors)
+            executor.awaitTermination(60, TimeUnit.SECONDS);
     }
 }

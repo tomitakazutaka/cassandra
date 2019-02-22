@@ -22,6 +22,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.ssl.SslHandler;
 import org.apache.cassandra.auth.IInternodeAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.async.HandshakeProtocol.FirstHandshakeMessage;
 import org.apache.cassandra.net.async.HandshakeProtocol.SecondHandshakeMessage;
@@ -209,7 +210,7 @@ class InboundHandshakeHandler extends ByteToMessageDecoder
     {
         ChannelPipeline pipeline = ctx.pipeline();
         InetSocketAddress address = (InetSocketAddress) ctx.channel().remoteAddress();
-        pipeline.addLast(NettyFactory.instance.streamingGroup, "streamInbound", new StreamingInboundHandler(address, protocolVersion, null));
+        pipeline.addLast(NettyFactory.instance.streamingGroup, "streamInbound", new StreamingInboundHandler(InetAddressAndPort.getByAddressOverrideDefaults(address.getAddress(), address.getPort()), protocolVersion, null));
         pipeline.remove(this);
 
         // pass a custom recv ByteBuf allocator to the channel. the default recv ByteBuf size is 1k, but in streaming we're
@@ -244,21 +245,26 @@ class InboundHandshakeHandler extends ByteToMessageDecoder
         }
 
         // record the (true) version of the endpoint
-        InetAddress from = msg.address;
+        InetAddressAndPort from = msg.address;
         MessagingService.instance().setVersion(from, maxVersion);
-        logger.trace("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
+        if (logger.isTraceEnabled())
+            logger.trace("Set version for {} to {} (will use {})", from, maxVersion, MessagingService.instance().getVersion(from));
 
         setupMessagingPipeline(ctx.pipeline(), from, compressed, version);
         return State.HANDSHAKE_COMPLETE;
     }
 
     @VisibleForTesting
-    void setupMessagingPipeline(ChannelPipeline pipeline, InetAddress peer, boolean compressed, int messagingVersion)
+    void setupMessagingPipeline(ChannelPipeline pipeline, InetAddressAndPort peer, boolean compressed, int messagingVersion)
     {
         if (compressed)
             pipeline.addLast(NettyFactory.INBOUND_COMPRESSOR_HANDLER_NAME, NettyFactory.createLz4Decoder(messagingVersion));
 
-        pipeline.addLast("messageInHandler", new MessageInHandler(peer, messagingVersion));
+        BaseMessageInHandler messageInHandler = messagingVersion >= MessagingService.VERSION_40
+                                                ? new MessageInHandler(peer, messagingVersion)
+                                                : new MessageInHandlerPre40(peer, messagingVersion);
+
+        pipeline.addLast("messageInHandler", messageInHandler);
         pipeline.remove(this);
     }
 

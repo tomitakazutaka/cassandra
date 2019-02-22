@@ -19,7 +19,6 @@
 package org.apache.cassandra.repair.messages;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,9 +29,7 @@ import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 
-import org.apache.cassandra.OrderedJUnit4ClassRunner;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
@@ -44,8 +41,9 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.repair.NodePair;
+import org.apache.cassandra.repair.SyncNodePair;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.repair.RepairJobDesc;
 import org.apache.cassandra.schema.TableId;
@@ -148,9 +146,9 @@ public class RepairMessageSerializationsTest
     @Test
     public void syncRequestMessage() throws IOException
     {
-        InetAddress initiator = InetAddress.getByName("127.0.0.1");
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
+        InetAddressAndPort initiator = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
 
         SyncRequest msg = new SyncRequest(buildRepairJobDesc(), initiator, src, dst, buildTokenRanges(), PreviewKind.NONE);
         serializeRoundTrip(msg, SyncRequest.serializer);
@@ -159,14 +157,14 @@ public class RepairMessageSerializationsTest
     @Test
     public void syncCompleteMessage() throws IOException
     {
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
         List<SessionSummary> summaries = new ArrayList<>();
         summaries.add(new SessionSummary(src, dst,
                                          Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUIDGen.getTimeUUID()), 5, 100)),
                                          Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUIDGen.getTimeUUID()), 500, 10))
         ));
-        SyncComplete msg = new SyncComplete(buildRepairJobDesc(), new NodePair(src, dst), true, summaries);
+        SyncComplete msg = new SyncComplete(buildRepairJobDesc(), new SyncNodePair(src, dst), true, summaries);
         serializeRoundTrip(msg, SyncComplete.serializer);
     }
 

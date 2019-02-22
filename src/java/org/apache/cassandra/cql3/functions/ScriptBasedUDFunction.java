@@ -35,6 +35,8 @@ import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.security.SecurityThreadGroup;
+import org.apache.cassandra.security.ThreadAwareSecurityManager;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 final class ScriptBasedUDFunction extends UDFunction
@@ -71,6 +73,14 @@ final class ScriptBasedUDFunction extends UDFunction
     "jdk.internal.org.objectweb.asm.commons",
     "jdk.nashorn.internal.runtime",
     "jdk.nashorn.internal.runtime.linker",
+    // Nashorn / Java 11
+    "java.lang.ref",
+    "java.io",
+    "java.util.function",
+    "jdk.dynalink.linker",
+    "jdk.internal.org.objectweb.asm",
+    "jdk.internal.reflect",
+    "jdk.nashorn.internal.scripts",
     // following required by Java Driver
     "java.math",
     "java.nio",
@@ -80,7 +90,9 @@ final class ScriptBasedUDFunction extends UDFunction
     "com.google.common.reflect",
     // following required by UDF
     "com.datastax.driver.core",
-    "com.datastax.driver.core.utils"
+    "com.datastax.driver.core.utils",
+    //Driver Metadata class requires hashmap from this
+    "com.datastax.shaded.netty.util.collection"
     };
 
     // use a JVM standard ExecutorService as DebuggableThreadPoolExecutor references internal

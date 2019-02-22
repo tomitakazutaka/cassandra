@@ -19,7 +19,6 @@
 package org.apache.cassandra.db.compaction;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -30,12 +29,11 @@ import org.junit.BeforeClass;
 import org.junit.Ignore;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
-import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.IMessageSink;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
@@ -43,6 +41,8 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.repair.AbstractRepairTest;
 import org.apache.cassandra.repair.consistent.LocalSessionAccessor;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
 
 @Ignore
@@ -67,7 +67,7 @@ public class AbstractPendingRepairTest extends AbstractRepairTest
         // cutoff messaging service
         MessagingService.instance().addMessageSink(new IMessageSink()
         {
-            public boolean allowOutgoingMessage(MessageOut message, int id, InetAddress to)
+            public boolean allowOutgoingMessage(MessageOut message, int id, InetAddressAndPort to)
             {
                 return false;
             }
@@ -109,17 +109,16 @@ public class AbstractPendingRepairTest extends AbstractRepairTest
         SSTableReader sstable = diff.iterator().next();
         if (orphan)
         {
-            Iterables.any(csm.getUnrepaired(), s -> s.getSSTables().contains(sstable));
-            csm.getUnrepaired().forEach(s -> s.removeSSTable(sstable));
+            csm.getUnrepairedUnsafe().allStrategies().forEach(acs -> acs.removeSSTable(sstable));
         }
         return sstable;
     }
 
-    protected static void mutateRepaired(SSTableReader sstable, long repairedAt, UUID pendingRepair)
+    public static void mutateRepaired(SSTableReader sstable, long repairedAt, UUID pendingRepair, boolean isTransient)
     {
         try
         {
-            sstable.descriptor.getMetadataSerializer().mutateRepaired(sstable.descriptor, repairedAt, pendingRepair);
+            sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, repairedAt, pendingRepair, isTransient);
             sstable.reloadSSTableMetadata();
         }
         catch (IOException e)
@@ -128,13 +127,13 @@ public class AbstractPendingRepairTest extends AbstractRepairTest
         }
     }
 
-    protected static void mutateRepaired(SSTableReader sstable, long repairedAt)
+    public static void mutateRepaired(SSTableReader sstable, long repairedAt)
     {
-        mutateRepaired(sstable, repairedAt, ActiveRepairService.NO_PENDING_REPAIR);
+        mutateRepaired(sstable, repairedAt, ActiveRepairService.NO_PENDING_REPAIR, false);
     }
 
-    protected static void mutateRepaired(SSTableReader sstable, UUID pendingRepair)
+    public static void mutateRepaired(SSTableReader sstable, UUID pendingRepair, boolean isTransient)
     {
-        mutateRepaired(sstable, ActiveRepairService.UNREPAIRED_SSTABLE, pendingRepair);
+        mutateRepaired(sstable, ActiveRepairService.UNREPAIRED_SSTABLE, pendingRepair, isTransient);
     }
 }

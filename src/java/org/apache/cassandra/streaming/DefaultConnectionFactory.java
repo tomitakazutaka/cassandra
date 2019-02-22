@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 
 import javax.annotation.Nullable;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.Uninterruptibles;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,13 +44,15 @@ public class DefaultConnectionFactory implements StreamConnectionFactory
 
     private static final int DEFAULT_CHANNEL_BUFFER_SIZE = 1 << 22;
 
-    private static final long MAX_WAIT_TIME_NANOS = TimeUnit.SECONDS.toNanos(30);
-    private static final int MAX_CONNECT_ATTEMPTS = 3;
+    @VisibleForTesting
+    public static long MAX_WAIT_TIME_NANOS = TimeUnit.SECONDS.toNanos(30);
+    @VisibleForTesting
+    public static int MAX_CONNECT_ATTEMPTS = 3;
 
     @Override
     public Channel createConnection(OutboundConnectionIdentifier connectionId, int protocolVersion) throws IOException
     {
-        ServerEncryptionOptions encryptionOptions = DatabaseDescriptor.getServerEncryptionOptions();
+        ServerEncryptionOptions encryptionOptions = DatabaseDescriptor.getInternodeMessagingEncyptionOptions();
 
         if (encryptionOptions.internode_encryption == ServerEncryptionOptions.InternodeEncryption.none)
             encryptionOptions = null;
@@ -67,12 +70,17 @@ public class DefaultConnectionFactory implements StreamConnectionFactory
                              ? DatabaseDescriptor.getInternodeSendBufferSize()
                              : OutboundConnectionParams.DEFAULT_SEND_BUFFER_SIZE;
 
+        int tcpConnectTimeout = DatabaseDescriptor.getInternodeTcpConnectTimeoutInMS();
+        int tcpUserTimeout = DatabaseDescriptor.getInternodeTcpUserTimeoutInMS();
+
         OutboundConnectionParams params = OutboundConnectionParams.builder()
                                                                   .connectionId(connectionId)
                                                                   .encryptionOptions(encryptionOptions)
                                                                   .mode(NettyFactory.Mode.STREAMING)
                                                                   .protocolVersion(protocolVersion)
                                                                   .sendBufferSize(sendBufferSize)
+                                                                  .tcpConnectTimeoutInMS(tcpConnectTimeout)
+                                                                  .tcpUserTimeoutInMS(tcpUserTimeout)
                                                                   .waterMark(waterMark)
                                                                   .build();
 

@@ -24,11 +24,15 @@ import java.net.InetAddress;
 import java.util.Objects;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Ints;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.ByteBufOutputStream;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.CompactEndpointSerializationHelper;
 import org.apache.cassandra.net.MessagingService;
 
@@ -210,6 +214,7 @@ public class HandshakeProtocol
      * The third message of the handshake, sent by the connection initiator on reception of {@link SecondHandshakeMessage}.
      * This message contains:
      *   1) the connection initiator's messaging version (4 bytes) - {@link org.apache.cassandra.net.MessagingService#current_version}.
+     *      This indicates the max messaging version supported by this node.
      *   2) the connection initiator's broadcast address as encoded by {@link org.apache.cassandra.net.CompactEndpointSerializationHelper}.
      *      This can be either 5 bytes for an IPv4 address, or 17 bytes for an IPv6 one.
      * <p>
@@ -226,10 +231,13 @@ public class HandshakeProtocol
          */
         private static final int MIN_LENGTH = 9;
 
+        /**
+         * The internode messaging version of the peer; used for serializing to a version the peer understands.
+         */
         final int messagingVersion;
-        final InetAddress address;
+        final InetAddressAndPort address;
 
-        ThirdHandshakeMessage(int messagingVersion, InetAddress address)
+        ThirdHandshakeMessage(int messagingVersion, InetAddressAndPort address)
         {
             this.messagingVersion = messagingVersion;
             this.address = address;
@@ -238,14 +246,16 @@ public class HandshakeProtocol
         @SuppressWarnings("resource")
         public ByteBuf encode(ByteBufAllocator allocator)
         {
-            int bufLength = Integer.BYTES + CompactEndpointSerializationHelper.serializedSize(address);
+            int bufLength = Ints.checkedCast(Integer.BYTES + CompactEndpointSerializationHelper.instance.serializedSize(address, messagingVersion));
             ByteBuf buffer = allocator.directBuffer(bufLength, bufLength);
             buffer.writerIndex(0);
-            buffer.writeInt(messagingVersion);
+
+            // the max messaging version supported by the local node (not #messagingVersion)
+            buffer.writeInt(MessagingService.current_version);
             try
             {
-                DataOutput bbos = new ByteBufOutputStream(buffer);
-                CompactEndpointSerializationHelper.serialize(address, bbos);
+                DataOutputPlus dop = new ByteBufDataOutputPlus(buffer);
+                CompactEndpointSerializationHelper.instance.serialize(address, dop, messagingVersion);
                 return buffer;
             }
             catch (IOException e)
@@ -263,10 +273,10 @@ public class HandshakeProtocol
 
             in.markReaderIndex();
             int version = in.readInt();
-            DataInput inputStream = new ByteBufInputStream(in);
+            DataInputPlus input = new ByteBufDataInputPlus(in);
             try
             {
-                InetAddress address = CompactEndpointSerializationHelper.deserialize(inputStream);
+                InetAddressAndPort address = CompactEndpointSerializationHelper.instance.deserialize(input, version);
                 return new ThirdHandshakeMessage(version, address);
             }
             catch (IOException e)

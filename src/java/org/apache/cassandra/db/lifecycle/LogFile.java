@@ -66,7 +66,7 @@ final class LogFile implements AutoCloseable
     private final LogReplicaSet replicas = new LogReplicaSet();
 
     // The transaction records, this set must be ORDER PRESERVING
-    private final LinkedHashSet<LogRecord> records = new LinkedHashSet<>();
+    private final Set<LogRecord> records = Collections.synchronizedSet(new LinkedHashSet<>()); // TODO: Hack until we fix CASSANDRA-14554
 
     // The type of the transaction
     private final OperationType type;
@@ -247,13 +247,11 @@ final class LogFile implements AutoCloseable
 
     void commit()
     {
-        assert !completed() : "Already completed!";
         addRecord(LogRecord.makeCommit(System.currentTimeMillis()));
     }
 
     void abort()
     {
-        assert !completed() : "Already completed!";
         addRecord(LogRecord.makeAbort(System.currentTimeMillis()));
     }
 
@@ -282,18 +280,16 @@ final class LogFile implements AutoCloseable
 
     void add(Type type, SSTable table)
     {
-        if (!addRecord(makeRecord(type, table)))
-            throw new IllegalStateException();
+        addRecord(makeRecord(type, table));
     }
 
     public void addAll(Type type, Iterable<SSTableReader> toBulkAdd)
     {
-        for (LogRecord record : makeRecords(type, toBulkAdd))
-            if (!addRecord(record))
-                throw new IllegalStateException();
+        for (LogRecord record : makeRecords(type, toBulkAdd).values())
+            addRecord(record);
     }
 
-    private Collection<LogRecord> makeRecords(Type type, Iterable<SSTableReader> tables)
+    Map<SSTable, LogRecord> makeRecords(Type type, Iterable<SSTableReader> tables)
     {
         assert type == Type.ADD || type == Type.REMOVE;
 
@@ -316,14 +312,32 @@ final class LogFile implements AutoCloseable
         return LogRecord.make(type, table);
     }
 
-    private boolean addRecord(LogRecord record)
+    /**
+     * this version of makeRecord takes an existing LogRecord and converts it to a
+     * record with the given type. This avoids listing the directory and if the
+     * LogRecord already exists, we have all components for the sstable
+     */
+    private LogRecord makeRecord(Type type, SSTable table, LogRecord record)
     {
+        assert type == Type.ADD || type == Type.REMOVE;
+
+        File directory = table.descriptor.directory;
+        String fileName = StringUtils.join(directory, File.separator, getFileName());
+        replicas.maybeCreateReplica(directory, fileName, records);
+        return record.asType(type);
+    }
+
+    void addRecord(LogRecord record)
+    {
+        if (completed())
+            throw new IllegalStateException("Transaction already completed");
+
         if (records.contains(record))
-            return false;
+            throw new IllegalStateException("Record already exists");
 
         replicas.append(record);
-
-        return records.add(record);
+        if (!records.add(record))
+            throw new IllegalStateException("Failed to add record");
     }
 
     void remove(Type type, SSTable table)
@@ -337,7 +351,17 @@ final class LogFile implements AutoCloseable
 
     boolean contains(Type type, SSTable table)
     {
-        return records.contains(makeRecord(type, table));
+        return contains(makeRecord(type, table));
+    }
+
+    boolean contains(Type type, SSTable sstable, LogRecord record)
+    {
+        return contains(makeRecord(type, sstable, record));
+    }
+
+    private boolean contains(LogRecord record)
+    {
+        return records.contains(record);
     }
 
     void deleteFilesForRecordsOfType(Type type)

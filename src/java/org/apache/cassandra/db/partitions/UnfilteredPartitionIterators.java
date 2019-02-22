@@ -49,6 +49,16 @@ public abstract class UnfilteredPartitionIterators
     {
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions);
         public void close();
+
+        public static MergeListener NOOP = new MergeListener()
+        {
+            public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
+            {
+                return UnfilteredRowIterators.MergeListener.NOOP;
+            }
+
+            public void close() {}
+        };
     }
 
     @SuppressWarnings("resource") // The created resources are returned right away
@@ -101,7 +111,8 @@ public abstract class UnfilteredPartitionIterators
         return FilteredPartitions.filter(iterator, nowInSec);
     }
 
-    public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec, final MergeListener listener)
+    @SuppressWarnings("resource")
+    public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final MergeListener listener)
     {
         assert listener != null;
         assert !iterators.isEmpty();
@@ -125,16 +136,26 @@ public abstract class UnfilteredPartitionIterators
                 toMerge.set(idx, current);
             }
 
+            @SuppressWarnings("resource")
             protected UnfilteredRowIterator getReduced()
             {
                 UnfilteredRowIterators.MergeListener rowListener = listener.getRowMergeListener(partitionKey, toMerge);
 
+                // Make a single empty iterator object to merge, we don't need toMerge.size() copiess
+                UnfilteredRowIterator empty = null;
+
                 // Replace nulls by empty iterators
                 for (int i = 0; i < toMerge.size(); i++)
+                {
                     if (toMerge.get(i) == null)
-                        toMerge.set(i, EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder));
+                    {
+                        if (null == empty)
+                            empty = EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder);
+                        toMerge.set(i, empty);
+                    }
+                }
 
-                return UnfilteredRowIterators.merge(toMerge, nowInSec, rowListener);
+                return UnfilteredRowIterators.merge(toMerge, rowListener);
             }
 
             protected void onKeyChange()
@@ -171,7 +192,8 @@ public abstract class UnfilteredPartitionIterators
         };
     }
 
-    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec)
+    @SuppressWarnings("resource")
+    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators)
     {
         assert !iterators.isEmpty();
 
@@ -195,7 +217,7 @@ public abstract class UnfilteredPartitionIterators
                 {
                     protected UnfilteredRowIterator initializeIterator()
                     {
-                        return UnfilteredRowIterators.merge(toMerge, nowInSec);
+                        return UnfilteredRowIterators.merge(toMerge);
                     }
                 };
             }

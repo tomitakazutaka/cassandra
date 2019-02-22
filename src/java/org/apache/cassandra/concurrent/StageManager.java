@@ -20,6 +20,7 @@ package org.apache.cassandra.concurrent;
 import java.util.EnumMap;
 import java.util.concurrent.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -112,6 +113,15 @@ public class StageManager
         }
     }
 
+    @VisibleForTesting
+    public static void shutdownAndWait() throws InterruptedException
+    {
+        for (Stage stage : Stage.values())
+            StageManager.stages.get(stage).shutdown();
+        for (Stage stage : Stage.values())
+            StageManager.stages.get(stage).awaitTermination(60, TimeUnit.SECONDS);
+    }
+
     /**
      * The executor used for tracing.
      */
@@ -131,6 +141,18 @@ public class StageManager
         public void maybeExecuteImmediately(Runnable command)
         {
             execute(command);
+        }
+
+        @Override
+        public int getActiveTaskCount()
+        {
+            return getActiveCount();
+        }
+
+        @Override
+        public int getPendingTaskCount()
+        {
+            return getQueue().size();
         }
     }
 }

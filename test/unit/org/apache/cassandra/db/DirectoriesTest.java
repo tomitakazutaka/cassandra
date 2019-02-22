@@ -35,7 +35,7 @@ import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.Config.DiskFailurePolicy;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.Directories.DataDirectory;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.index.internal.CassandraIndex;
@@ -46,7 +46,6 @@ import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.service.DefaultFSErrorHandler;
-import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -79,7 +78,7 @@ public class DirectoriesTest
                                  .build());
         }
 
-        tempDataDir = File.createTempFile("cassandra", "unittest");
+        tempDataDir = FileUtils.createTempFile("cassandra", "unittest");
         tempDataDir.delete(); // hack to create a temp dir
         tempDataDir.mkdir();
 
@@ -216,13 +215,13 @@ public class DirectoriesTest
         assertEquals(40, indexDirectories.trueSnapshotsSize());
 
         // check snapshot details
-        Map<String, Pair<Long, Long>> parentSnapshotDetail = parentDirectories.getSnapshotDetails();
+        Map<String, Directories.SnapshotSizeDetails> parentSnapshotDetail = parentDirectories.getSnapshotDetails();
         assertTrue(parentSnapshotDetail.containsKey("test"));
-        assertEquals(30L, parentSnapshotDetail.get("test").right.longValue());
+        assertEquals(30L, parentSnapshotDetail.get("test").dataSizeBytes);
 
-        Map<String, Pair<Long, Long>> indexSnapshotDetail = indexDirectories.getSnapshotDetails();
+        Map<String, Directories.SnapshotSizeDetails> indexSnapshotDetail = indexDirectories.getSnapshotDetails();
         assertTrue(indexSnapshotDetail.containsKey("test"));
-        assertEquals(40L, indexSnapshotDetail.get("test").right.longValue());
+        assertEquals(40L, indexSnapshotDetail.get("test").dataSizeBytes);
 
         // check backup directory
         File parentBackupDirectory = Directories.getBackupsDirectory(parentDesc);
