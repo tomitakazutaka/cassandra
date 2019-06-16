@@ -32,6 +32,7 @@ import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -125,12 +126,12 @@ public class AntiCompactionBytemanTest extends CQLTester
 
         try (LifecycleTransaction txn = getCurrentColumnFamilyStore().getTracker().tryModify(getCurrentColumnFamilyStore().getLiveSSTables(), OperationType.ANTICOMPACTION))
         {
-            CompactionManager.instance.antiCompactGroup(getCurrentColumnFamilyStore(), ranges, txn, UUID.randomUUID());
+            CompactionManager.instance.antiCompactGroup(getCurrentColumnFamilyStore(), ranges, txn, UUID.randomUUID(), () -> false);
         }
         finished.set(true);
         t.join();
         assertFalse(failed.get());
         assertFalse(getCurrentColumnFamilyStore().getLiveSSTables().contains(sstableBefore));
-        AntiCompactionTest.assertOnDiskState(getCurrentColumnFamilyStore(), 3);
+        Util.assertOnDiskState(getCurrentColumnFamilyStore(), 3);
     }
 }

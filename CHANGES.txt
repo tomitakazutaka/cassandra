@@ -1,4 +1,16 @@
 4.0
+ * Reduce heap pressure during compactions (CASSANDRA-14654)
+ * Support building Cassandra with JDK 11 (CASSANDRA-15108)
+ * Use quilt to patch cassandra.in.sh in Debian packaging (CASSANDRA-14710)
+ * Take sstable references before calculating approximate key count (CASSANDRA-14647)
+ * Restore snapshotting of system keyspaces on version change (CASSANDRA-14412)
+ * Fix AbstractBTreePartition locking in java 11 (CASSANDRA-14607)
+ * SimpleClient should pass connection properties as options (CASSANDRA-15056)
+ * Set repaired data tracking flag on range reads if enabled (CASSANDRA-15019)
+ * Calculate pending ranges for BOOTSTRAP_REPLACE correctly (CASSANDRA-14802)
+ * Make TableCQLHelper reuse the single quote pattern (CASSANDRA-15033)
+ * Add Zstd compressor (CASSANDRA-14482)
+ * Fix IR prepare anti-compaction race (CASSANDRA-15027)
  * Fix SimpleStrategy option validation (CASSANDRA-15007)
  * Don't try to cancel 2i compactions when starting anticompaction (CASSANDRA-15024)
  * Avoid NPE in RepairRunnable.recordFailure (CASSANDRA-15025)
@@ -349,12 +361,24 @@
 
 
 3.11.5
+ * Fix cassandra-env.sh to use $CASSANDRA_CONF to find cassandra-jaas.config (CASSANDRA-14305)
+ * Fixed nodetool cfstats printing index name twice (CASSANDRA-14903)
  * Add flag to disable SASI indexes, and warnings on creation (CASSANDRA-14866)
 Merged from 3.0:
+ * Add ability to customize cassandra log directory using $CASSANDRA_LOG_DIR (CASSANDRA-15090)
+ * Fix assorted gossip races and add related runtime checks (CASSANDRA-15059)
+ * cassandra-stress works with frozen collections: list and set (CASSANDRA-14907)
+ * Fix handling FS errors on writing and reading flat files - LogTransaction and hints (CASSANDRA-15053)
+ * Avoid double closing the iterator to avoid overcounting the number of requests (CASSANDRA-15058)
  * Improve `nodetool status -r` speed (CASSANDRA-14847)
  * Improve merkle tree size and time on heap (CASSANDRA-14096)
  * Add missing commands to nodetool_completion (CASSANDRA-14916)
  * Anti-compaction temporarily corrupts sstable state for readers (CASSANDRA-15004)
+Merged from 2.2:
+ * Support cross version messaging in in-jvm upgrade dtests (CASSANDRA-15078)
+ * Fix index summary redistribution cancellation (CASSANDRA-15045)
+ * Refactor Circle CI configuration (CASSANDRA-14806)
+ * Fixing invalid CQL in security documentation (CASSANDRA-15020)
 
 
 3.11.4

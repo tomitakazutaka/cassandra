@@ -69,6 +69,7 @@ import org.apache.cassandra.utils.concurrent.Transactional;
 
 import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
 import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
+import static org.apache.cassandra.Util.assertOnDiskState;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -150,7 +151,7 @@ public class AntiCompactionTest
             if (txn == null)
                 throw new IllegalStateException();
             registerParentRepairSession(sessionID, ranges.ranges(), FBUtilities.nowInSeconds(), sessionID);
-            CompactionManager.instance.performAnticompaction(store, ranges, refs, txn, sessionID);
+            CompactionManager.instance.performAnticompaction(store, ranges, refs, txn, sessionID, () -> false);
         }
 
         SSTableStats stats = new SSTableStats();
@@ -251,7 +252,7 @@ public class AntiCompactionTest
         try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.ANTICOMPACTION);
              Refs<SSTableReader> refs = Refs.ref(sstables))
         {
-            CompactionManager.instance.performAnticompaction(cfs, atEndpoint(ranges, NO_RANGES), refs, txn, parentRepairSession);
+            CompactionManager.instance.performAnticompaction(cfs, atEndpoint(ranges, NO_RANGES), refs, txn, parentRepairSession, () -> false);
         }
         long sum = 0;
         long rows = 0;
@@ -381,7 +382,7 @@ public class AntiCompactionTest
         try (LifecycleTransaction txn = store.getTracker().tryModify(sstables, OperationType.ANTICOMPACTION);
              Refs<SSTableReader> refs = Refs.ref(sstables))
         {
-            CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, pendingRepair);
+            CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, pendingRepair, () -> false);
         }
 
         assertThat(store.getLiveSSTables().size(), is(1));
@@ -415,7 +416,7 @@ public class AntiCompactionTest
         try (LifecycleTransaction txn = store.getTracker().tryModify(sstables, OperationType.ANTICOMPACTION);
              Refs<SSTableReader> refs = Refs.ref(sstables))
         {
-            CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, parentRepairSession);
+            CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, parentRepairSession, () -> false);
         }
         catch (IllegalStateException e)
         {
@@ -485,7 +486,7 @@ public class AntiCompactionTest
             Assert.assertFalse(refs.isEmpty());
             try
             {
-                CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, missingRepairSession);
+                CompactionManager.instance.performAnticompaction(store, atEndpoint(ranges, NO_RANGES), refs, txn, missingRepairSession, () -> false);
                 Assert.fail("expected RuntimeException");
             }
             catch (RuntimeException e)
@@ -580,26 +581,5 @@ public class AntiCompactionTest
     private Token t(long t)
     {
         return new Murmur3Partitioner.LongToken(t);
-    }
-
-    static void assertOnDiskState(ColumnFamilyStore cfs, int expectedSSTableCount)
-    {
-        LifecycleTransaction.waitForDeletions();
-        assertEquals(expectedSSTableCount, cfs.getLiveSSTables().size());
-        Set<Integer> liveGenerations = cfs.getLiveSSTables().stream().map(sstable -> sstable.descriptor.generation).collect(Collectors.toSet());
-        int fileCount = 0;
-        for (File f : cfs.getDirectories().getCFDirectories())
-        {
-            for (File sst : f.listFiles())
-            {
-                if (sst.getName().contains("Data"))
-                {
-                    Descriptor d = Descriptor.fromFilename(sst.getAbsolutePath());
-                    assertTrue(liveGenerations.contains(d.generation));
-                    fileCount++;
-                }
-            }
-        }
-        assertEquals(expectedSSTableCount, fileCount);
     }
 }

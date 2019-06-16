@@ -20,6 +20,8 @@ package org.apache.cassandra.distributed.impl;
 
 import com.google.common.base.Predicate;
 import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.Memory;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.Pair;
 
@@ -61,12 +63,16 @@ public class InstanceClassLoader extends URLClassLoader
         InstanceClassLoader create(int id, URL[] urls, ClassLoader sharedClassLoader);
     }
 
+    private final URL[] urls;
+    private final int generation; // used to help debug class loader leaks, by helping determine which classloaders should have been collected
     private final ClassLoader sharedClassLoader;
 
-    InstanceClassLoader(int id, URL[] urls, ClassLoader sharedClassLoader)
+    InstanceClassLoader(int generation, URL[] urls, ClassLoader sharedClassLoader)
     {
         super(urls, null);
+        this.urls = urls;
         this.sharedClassLoader = sharedClassLoader;
+        this.generation = generation;
     }
 
     @Override
@@ -100,4 +106,11 @@ public class InstanceClassLoader extends URLClassLoader
         return clazz.getClassLoader().getClass().getName().equals(InstanceClassLoader.class.getName());
     }
 
+    public String toString()
+    {
+        return "InstanceClassLoader{" +
+               "generation=" + generation +
+               ", urls=" + Arrays.toString(urls) +
+               '}';
+    }
 }

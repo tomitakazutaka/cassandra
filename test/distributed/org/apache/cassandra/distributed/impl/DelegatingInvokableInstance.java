@@ -74,6 +74,18 @@ public abstract class DelegatingInvokableInstance implements IInvokableInstance
     }
 
     @Override
+    public int getMessagingVersion()
+    {
+        return delegate().getMessagingVersion();
+    }
+
+    @Override
+    public void setMessagingVersion(InetAddressAndPort endpoint, int version)
+    {
+        delegate().setMessagingVersion(endpoint, version);
+    }
+
+    @Override
     public IInstanceConfig config()
     {
         return delegate().config();
@@ -92,9 +104,9 @@ public abstract class DelegatingInvokableInstance implements IInvokableInstance
     }
 
     @Override
-    public void shutdown()
+    public Future<Void> shutdown()
     {
-        delegate().shutdown();
+        return delegate().shutdown();
     }
 
     @Override
