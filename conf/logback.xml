@@ -33,10 +33,10 @@ appender reference in the root level section below.
     <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
       <level>INFO</level>
     </filter>
-    <file>${cassandra.logdir}/system.log</file>
+    <file>/mnt/e/tomit/Developer/apache-cassandra-trunck/data/system.log</file>
     <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
       <!-- rollover daily -->
-      <fileNamePattern>${cassandra.logdir}/system.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
+      <fileNamePattern>/mnt/e/tomit/Developer/apache-cassandra-trunck/data/system.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
       <!-- each file should be at most 50MB, keep 7 days worth of history, but at most 5GB -->
       <maxFileSize>50MB</maxFileSize>
       <maxHistory>7</maxHistory>
@@ -50,10 +50,10 @@ appender reference in the root level section below.
   <!-- DEBUGLOG rolling file appender to debug.log (all levels) -->
 
   <appender name="DEBUGLOG" class="ch.qos.logback.core.rolling.RollingFileAppender">
-    <file>${cassandra.logdir}/debug.log</file>
+    <file>/mnt/e/tomit/Developer/apache-cassandra-trunck/data/debug.log</file>
     <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
       <!-- rollover daily -->
-      <fileNamePattern>${cassandra.logdir}/debug.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
+      <fileNamePattern>/mnt/e/tomit/Developer/apache-cassandra-trunck/data/debug.log.%d{yyyy-MM-dd}.%i.zip</fileNamePattern>
       <!-- each file should be at most 50MB, keep 7 days worth of history, but at most 5GB -->
       <maxFileSize>50MB</maxFileSize>
       <maxHistory>7</maxHistory>
@@ -96,14 +96,10 @@ appender reference in the root level section below.
     <appender-ref ref="LogbackMetrics" />
     -->
   </root>
-<<<<<<< HEAD
   
   <logger name="com.thinkaurelius.thrift" level="ERROR"/>
   <logger name="org.apache.cassandra.db.compaction.CompactionManager" level="INFO"/>
   <logger name="org.apache.cassandra.db.ColumnFamilyStore" level="INFO"/>
   <logger name="org.apache.cassandra.config.CFMetaData" level="INFO"/> */
-=======
-
   <logger name="org.apache.cassandra" level="DEBUG"/>
->>>>>>> upstream/trunk
 </configuration>
