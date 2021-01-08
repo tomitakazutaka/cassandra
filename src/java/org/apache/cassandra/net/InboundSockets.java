@@ -19,6 +19,7 @@ package org.apache.cassandra.net;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -61,6 +62,9 @@ class InboundSockets
 
         // purely to prevent close racing with open
         private boolean closedWithoutOpening;
+
+        // used to prevent racing on close
+        private Future<Void> closeFuture;
 
         /**
          * A group of the open, inbound {@link Channel}s connected to this node. This is mostly interesting so that all of
@@ -108,8 +112,11 @@ class InboundSockets
          * Close this socket and any connections created on it. Once closed, this socket may not be re-opened.
          *
          * This may not execute synchronously, so a Future is returned encapsulating its result.
+         * @param shutdownExecutors consumer invoked with the internal executor on completion
+         *                          Note that the consumer will only be invoked once per InboundSocket.
+         *                          Subsequent calls to close will not register a callback to different consumers.
          */
-        private Future<Void> close()
+        private Future<Void> close(Consumer<? super ExecutorService> shutdownExecutors)
         {
             AsyncPromise<Void> done = AsyncPromise.uncancellable(GlobalEventExecutor.INSTANCE);
 
@@ -119,7 +126,10 @@ class InboundSockets
                     closing.add(listen.close());
                 closing.add(connections.close());
                 new FutureCombiner(closing)
-                       .addListener(future -> executor.shutdownGracefully())
+                       .addListener(future -> {
+                           executor.shutdownGracefully();
+                           shutdownExecutors.accept(executor);
+                       })
                        .addListener(new PromiseNotifier<>(done));
             };
 
@@ -130,6 +140,13 @@ class InboundSockets
                     closedWithoutOpening = true;
                     return new SucceededFuture<>(GlobalEventExecutor.INSTANCE, null);
                 }
+
+                if (closeFuture != null)
+                {
+                    return closeFuture;
+                }
+
+                closeFuture = done;
 
                 if (listen != null)
                 {
@@ -182,10 +199,23 @@ class InboundSockets
 
     private static void addBindings(InboundConnectionSettings template, ImmutableList.Builder<InboundSocket> out)
     {
-        InboundConnectionSettings settings = template.withDefaults();
+        InboundConnectionSettings       settings = template.withDefaults();
+        InboundConnectionSettings legacySettings = template.withLegacySslStoragePortDefaults();
+
+        if (settings.encryption.enable_legacy_ssl_storage_port)
+        {
+            out.add(new InboundSocket(legacySettings));
+
+            /*
+             * If the legacy ssl storage port and storage port match, only bind to the
+             * legacy ssl port. This makes it possible to configure a 4.0 node like a 3.0
+             * node with only the ssl_storage_port if required.
+             */
+            if (settings.bindAddress.equals(legacySettings.bindAddress))
+                return;
+        }
+
         out.add(new InboundSocket(settings));
-        if (settings.encryption.enable_legacy_ssl_storage_port && settings.encryption.enabled)
-            out.add(new InboundSocket(template.withLegacyDefaults()));
     }
 
     public Future<Void> open(Consumer<ChannelPipeline> pipelineInjector)
@@ -213,12 +243,16 @@ class InboundSockets
         return false;
     }
 
-    public Future<Void> close()
+    public Future<Void> close(Consumer<? super ExecutorService> shutdownExecutors)
     {
         List<Future<Void>> closing = new ArrayList<>();
         for (InboundSocket address : sockets)
-            closing.add(address.close());
+            closing.add(address.close(shutdownExecutors));
         return new FutureCombiner(closing);
+    }
+    public Future<Void> close()
+    {
+        return close(e -> {});
     }
 
     private static boolean shouldListenOnBroadcastAddress()

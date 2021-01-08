@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NavigableSet;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
@@ -32,7 +33,6 @@ import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.utils.SearchIterator;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 import org.apache.cassandra.utils.concurrent.OpOrder;
@@ -163,8 +163,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
         RowUpdater updater = new RowUpdater(this, allocator, writeOp, indexer);
         try
         {
-            boolean shouldLock = usePessimisticLocking();
-
+            boolean shouldLock = shouldLock(writeOp);
             indexer.start();
 
             while (true)
@@ -184,11 +183,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
                     if (result != null)
                         return result;
 
-                    shouldLock = usePessimisticLocking();
-                    if (!shouldLock)
-                    {
-                        shouldLock = updateWastedAllocationTracker(updater.heapSize);
-                    }
+                    shouldLock = shouldLock(updater.heapSize, writeOp);
                 }
             }
         }
@@ -217,7 +212,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
     }
 
     @Override
-    public Row getRow(Clustering clustering)
+    public Row getRow(Clustering<?> clustering)
     {
         return allocator.ensureOnHeap().applyToRow(super.getRow(clustering));
     }
@@ -229,15 +224,15 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
     }
 
     @Override
-    public SearchIterator<Clustering, Row> searchIterator(ColumnFilter columns, boolean reversed)
-    {
-        return allocator.ensureOnHeap().applyToPartition(super.searchIterator(columns, reversed));
-    }
-
-    @Override
     public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, Slices slices, boolean reversed)
     {
         return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator(selection, slices, reversed));
+    }
+
+    @Override
+    public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, NavigableSet<Clustering<?>> clusteringsInQueryOrder, boolean reversed)
+    {
+        return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator(selection, clusteringsInQueryOrder, reversed));
     }
 
     @Override
@@ -258,7 +253,35 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
         return allocator.ensureOnHeap().applyToPartition(super.iterator());
     }
 
-    public boolean usePessimisticLocking()
+    private boolean shouldLock(OpOrder.Group writeOp)
+    {
+        if (!useLock())
+            return false;
+
+        return lockIfOldest(writeOp);
+    }
+
+    private boolean shouldLock(long addWaste, OpOrder.Group writeOp)
+    {
+        if (!updateWastedAllocationTracker(addWaste))
+            return false;
+
+        return lockIfOldest(writeOp);
+    }
+
+    private boolean lockIfOldest(OpOrder.Group writeOp)
+    {
+        if (!writeOp.isOldestLiveGroup())
+        {
+            Thread.yield();
+            if (!writeOp.isOldestLiveGroup())
+                return false;
+        }
+
+        return true;
+    }
+
+    public boolean useLock()
     {
         return wasteTracker == TRACKER_PESSIMISTIC_LOCKING;
     }
@@ -329,7 +352,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             this.indexer = indexer;
         }
 
-        private Row.Builder builder(Clustering clustering)
+        private Row.Builder builder(Clustering<?> clustering)
         {
             boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;
             // We know we only insert/update one static per PartitionUpdate, so no point in saving the builder

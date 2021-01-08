@@ -24,10 +24,10 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.*;
-import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,10 +38,13 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.BiMultiValMap;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.SortedBiMultiValMap;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.LINE_SEPARATOR;
 
 public class TokenMetadata
 {
@@ -107,9 +110,17 @@ public class TokenMetadata
 
     public TokenMetadata()
     {
-        this(SortedBiMultiValMap.<Token, InetAddressAndPort>create(),
+        this(SortedBiMultiValMap.create(),
              HashBiMap.create(),
              Topology.empty(),
+             DatabaseDescriptor.getPartitioner());
+    }
+
+    public TokenMetadata(IEndpointSnitch snitch)
+    {
+        this(SortedBiMultiValMap.create(),
+             HashBiMap.create(),
+             Topology.builder(() -> snitch).build(),
              DatabaseDescriptor.getPartitioner());
     }
 
@@ -783,7 +794,7 @@ public class TokenMetadata
             Replica replica = entry.getValue();
             if (replica.endpoint().equals(endpoint))
             {
-                builder.add(replica);
+                builder.add(replica, Conflict.DUPLICATE);
             }
         }
         return builder.build();
@@ -895,11 +906,15 @@ public class TokenMetadata
         {
             EndpointsForRange currentReplicas = strategy.calculateNaturalReplicas(range.right, metadata);
             EndpointsForRange newReplicas = strategy.calculateNaturalReplicas(range.right, allLeftMetadata);
-            for (Replica replica : newReplicas)
+            for (Replica newReplica : newReplicas)
             {
-                if (currentReplicas.endpoints().contains(replica.endpoint()))
+                if (currentReplicas.endpoints().contains(newReplica.endpoint()))
                     continue;
-                newPendingRanges.addPendingRange(range, replica);
+
+                // we calculate pending replicas for leave- and move- affected ranges in the same way to avoid
+                // a possible conflict when 2 pending replicas have the same endpoint and different ranges.
+                for (Replica pendingReplica : newReplica.subtractSameReplication(addressRanges.get(newReplica.endpoint())))
+                    newPendingRanges.addPendingRange(range, pendingReplica);
             }
         }
 
@@ -1201,42 +1216,42 @@ public class TokenMetadata
             if (!eps.isEmpty())
             {
                 sb.append("Normal Tokens:");
-                sb.append(System.getProperty("line.separator"));
+                sb.append(LINE_SEPARATOR.getString());
                 for (InetAddressAndPort ep : eps)
                 {
                     sb.append(ep);
                     sb.append(':');
                     sb.append(endpointToTokenMap.get(ep));
-                    sb.append(System.getProperty("line.separator"));
+                    sb.append(LINE_SEPARATOR.getString());
                 }
             }
 
             if (!bootstrapTokens.isEmpty())
             {
                 sb.append("Bootstrapping Tokens:" );
-                sb.append(System.getProperty("line.separator"));
+                sb.append(LINE_SEPARATOR.getString());
                 for (Map.Entry<Token, InetAddressAndPort> entry : bootstrapTokens.entrySet())
                 {
                     sb.append(entry.getValue()).append(':').append(entry.getKey());
-                    sb.append(System.getProperty("line.separator"));
+                    sb.append(LINE_SEPARATOR.getString());
                 }
             }
 
             if (!leavingEndpoints.isEmpty())
             {
                 sb.append("Leaving Endpoints:");
-                sb.append(System.getProperty("line.separator"));
+                sb.append(LINE_SEPARATOR.getString());
                 for (InetAddressAndPort ep : leavingEndpoints)
                 {
                     sb.append(ep);
-                    sb.append(System.getProperty("line.separator"));
+                    sb.append(LINE_SEPARATOR.getString());
                 }
             }
 
             if (!pendingRanges.isEmpty())
             {
                 sb.append("Pending Ranges:");
-                sb.append(System.getProperty("line.separator"));
+                sb.append(LINE_SEPARATOR.getString());
                 sb.append(printPendingRanges());
             }
         }
@@ -1356,6 +1371,7 @@ public class TokenMetadata
         private final ImmutableMap<String, ImmutableMultimap<String, InetAddressAndPort>> dcRacks;
         /** reverse-lookup map for endpoint to current known dc/rack assignment */
         private final ImmutableMap<InetAddressAndPort, Pair<String, String>> currentLocations;
+        private final Supplier<IEndpointSnitch> snitchSupplier;
 
         private Topology(Builder builder)
         {
@@ -1367,6 +1383,7 @@ public class TokenMetadata
             this.dcRacks = dcRackBuilder.build();
 
             this.currentLocations = ImmutableMap.copyOf(builder.currentLocations);
+            this.snitchSupplier = builder.snitchSupplier;
         }
 
         /**
@@ -1398,14 +1415,14 @@ public class TokenMetadata
             return new Builder(this);
         }
 
-        static Builder builder()
+        static Builder builder(Supplier<IEndpointSnitch> snitchSupplier)
         {
-            return new Builder();
+            return new Builder(snitchSupplier);
         }
 
         static Topology empty()
         {
-            return builder().build();
+            return builder(() -> DatabaseDescriptor.getEndpointSnitch()).build();
         }
 
         private static class Builder
@@ -1416,12 +1433,14 @@ public class TokenMetadata
             private final Map<String, Multimap<String, InetAddressAndPort>> dcRacks;
             /** reverse-lookup map for endpoint to current known dc/rack assignment */
             private final Map<InetAddressAndPort, Pair<String, String>> currentLocations;
+            private final Supplier<IEndpointSnitch> snitchSupplier;
 
-            Builder()
+            Builder(Supplier<IEndpointSnitch> snitchSupplier)
             {
                 this.dcEndpoints = HashMultimap.create();
                 this.dcRacks = new HashMap<>();
                 this.currentLocations = new HashMap<>();
+                this.snitchSupplier = snitchSupplier;
             }
 
             Builder(Topology from)
@@ -1433,6 +1452,7 @@ public class TokenMetadata
                     dcRacks.put(entry.getKey(), HashMultimap.create(entry.getValue()));
 
                 this.currentLocations = new HashMap<>(from.currentLocations);
+                this.snitchSupplier = from.snitchSupplier;
             }
 
             /**
@@ -1440,9 +1460,8 @@ public class TokenMetadata
              */
             Builder addEndpoint(InetAddressAndPort ep)
             {
-                IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
-                String dc = snitch.getDatacenter(ep);
-                String rack = snitch.getRack(ep);
+                String dc = snitchSupplier.get().getDatacenter(ep);
+                String rack = snitchSupplier.get().getRack(ep);
                 Pair<String, String> current = currentLocations.get(ep);
                 if (current != null)
                 {

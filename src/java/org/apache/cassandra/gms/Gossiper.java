@@ -27,23 +27,24 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
-import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Suppliers;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFutureTask;
 import com.google.common.util.concurrent.Uninterruptibles;
 
+import org.apache.cassandra.concurrent.JMXEnabledSingleThreadExecutor;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.NoPayload;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.utils.CassandraVersion;
-import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.ExpiringMemoizingSupplier;
 import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
@@ -53,8 +54,8 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.net.RequestCallback;
 import org.apache.cassandra.net.Message;
@@ -63,6 +64,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.GOSSIPER_QUARANTINE_DELAY;
 import static org.apache.cassandra.net.NoPayload.noPayload;
 import static org.apache.cassandra.net.Verb.ECHO_REQ;
 import static org.apache.cassandra.net.Verb.GOSSIP_DIGEST_SYN;
@@ -85,6 +87,7 @@ import static org.apache.cassandra.net.Verb.GOSSIP_DIGEST_SYN;
 public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.net:type=Gossiper";
+
     public static class Props
     {
         public static final String DISABLE_THREAD_VALIDATION = "cassandra.gossip.disable_thread_validation";
@@ -106,7 +109,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     private volatile ScheduledFuture<?> scheduledGossipTask;
     private static final ReentrantLock taskLock = new ReentrantLock();
     public final static int intervalInMillis = 1000;
-    public final static int QUARANTINE_DELAY = StorageService.RING_DELAY * 2;
+    public final static int QUARANTINE_DELAY = GOSSIPER_QUARANTINE_DELAY.getInt(StorageService.RING_DELAY * 2);
     private static final Logger logger = LoggerFactory.getLogger(Gossiper.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 15L, TimeUnit.MINUTES);
 
@@ -115,7 +118,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     // Timestamp to prevent processing any in-flight messages for we've not send any SYN yet, see CASSANDRA-12653.
     volatile long firstSynSendAt = 0L;
 
-    public static final long aVeryLongTime = 259200 * 1000; // 3 days
+    public static final long aVeryLongTime = getVeryLongTime();
 
     // Maximimum difference between generation value and local time we are willing to accept about a peer
     static final int MAX_GENERATION_DIFFERENCE = 86400 * 365;
@@ -158,11 +161,11 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     //This property and anything that checks it should be removed in 5.0
     private boolean haveMajorVersion3Nodes = true;
 
-    final com.google.common.base.Supplier<Boolean> haveMajorVersion3NodesSupplier = () ->
+    final Supplier<ExpiringMemoizingSupplier.ReturnValue<Boolean>> haveMajorVersion3NodesSupplier = () ->
     {
         //Once there are no prior version nodes we don't need to keep rechecking
         if (!haveMajorVersion3Nodes)
-            return false;
+            return new ExpiringMemoizingSupplier.Memoized<>(false);
 
         Iterable<InetAddressAndPort> allHosts = Iterables.concat(Gossiper.instance.getLiveMembers(), Gossiper.instance.getUnreachableMembers());
         CassandraVersion referenceVersion = null;
@@ -171,36 +174,39 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         {
             CassandraVersion version = getReleaseVersion(host);
 
-            //Raced with changes to gossip state
+            //Raced with changes to gossip state, wait until next iteration
             if (version == null)
-                continue;
+                return new ExpiringMemoizingSupplier.NotMemoized(true);
 
             if (referenceVersion == null)
                 referenceVersion = version;
 
             if (version.major < 4)
-                return true;
+                return new ExpiringMemoizingSupplier.Memoized<>(true);
         }
 
         haveMajorVersion3Nodes = false;
-        return false;
+        return new ExpiringMemoizingSupplier.Memoized(false);
     };
 
-    private final Supplier<Boolean> haveMajorVersion3NodesMemoized = Suppliers.memoizeWithExpiration(haveMajorVersion3NodesSupplier, 1, TimeUnit.MINUTES);
-
-    private static FastThreadLocal<Boolean> isGossipStage = new FastThreadLocal<>();
+    private Supplier<Boolean> haveMajorVersion3NodesMemoized = ExpiringMemoizingSupplier.memoizeWithExpiration(haveMajorVersion3NodesSupplier, 1, TimeUnit.MINUTES);
 
     private static final boolean disableThreadValidation = Boolean.getBoolean(Props.DISABLE_THREAD_VALIDATION);
 
+    private static long getVeryLongTime()
+    {
+        String newVLT =  System.getProperty("cassandra.very_long_time_ms");
+        if (newVLT != null)
+        {
+            logger.info("Overriding aVeryLongTime to {}ms", newVLT);
+            return Long.parseLong(newVLT);
+        }
+        return 259200 * 1000; // 3 days
+    }
+
     private static boolean isInGossipStage()
     {
-        Boolean isGossip = isGossipStage.get();
-        if (isGossip == null)
-        {
-            isGossip = Thread.currentThread().getName().contains(Stage.GOSSIP.getJmxName());
-            isGossipStage.set(isGossip);
-        }
-        return isGossip;
+        return ((JMXEnabledSingleThreadExecutor) Stage.GOSSIP.executor()).isExecutedBy(Thread.currentThread());
     }
 
     private static void checkProperThreadForStateMutation()
@@ -438,7 +444,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         }
 
         ListenableFutureTask task = ListenableFutureTask.create(runnable, null);
-        StageManager.getStage(Stage.GOSSIP).execute(task);
+        Stage.GOSSIP.execute(task);
         try
         {
             task.get();
@@ -704,6 +710,16 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         assassinateEndpoint(address);
     }
 
+    @VisibleForTesting
+    public void unsafeAnulEndpoint(InetAddressAndPort endpoint)
+    {
+        removeEndpoint(endpoint);
+        justRemovedEndpoints.remove(endpoint);
+        endpointStateMap.remove(endpoint);
+        expireTimeEndpointMap.remove(endpoint);
+        unreachableEndpoints.remove(endpoint);
+    }
+
     /**
      * Do not call this method unless you know what you are doing.
      * It will try extremely hard to obliterate any endpoint from the ring,
@@ -754,7 +770,6 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                 tokens = Collections.singletonList(StorageService.instance.getTokenMetadata().partitioner.getRandomToken());
             }
 
-            // do not pass go, do not collect 200 dollars, just gtfo
             long expireTime = computeExpireTime();
             epState.addApplicationState(ApplicationState.STATUS_WITH_PORT, StorageService.instance.valueFactory.left(tokens, expireTime));
             epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.left(tokens, computeExpireTime()));
@@ -783,14 +798,14 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
      */
     private boolean sendGossip(Message<GossipDigestSyn> message, Set<InetAddressAndPort> epSet)
     {
-        List<InetAddressAndPort> liveEndpoints = ImmutableList.copyOf(epSet);
+        List<InetAddressAndPort> endpoints = ImmutableList.copyOf(epSet);
 
-        int size = liveEndpoints.size();
+        int size = endpoints.size();
         if (size < 1)
             return false;
         /* Generate a random number from 0 -> size */
         int index = (size == 1) ? 0 : random.nextInt(size);
-        InetAddressAndPort to = liveEndpoints.get(index);
+        InetAddressAndPort to = endpoints.get(index);
         if (logger.isTraceEnabled())
             logger.trace("Sending a GossipDigestSyn to {} ...", to);
         if (firstSynSendAt == 0)
@@ -822,7 +837,10 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
             double prob = unreachableEndpointCount / (liveEndpointCount + 1);
             double randDbl = random.nextDouble();
             if (randDbl < prob)
-                sendGossip(message, unreachableEndpoints.keySet());
+            {
+                sendGossip(message, Sets.filter(unreachableEndpoints.keySet(),
+                                                ep -> !isDeadState(getEndpointStateMap().get(ep))));
+            }
         }
     }
 
@@ -881,13 +899,25 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                                     Map<InetAddressAndPort, EndpointState> epStates)
     {
         EndpointState epState = epStates.get(endpoint);
-        // if there's no previous state, or the node was previously removed from the cluster, we're good
-        if (epState == null || isDeadState(epState))
+        // if there's no previous state, we're good
+        if (epState == null)
+            return true;
+
+        String status = getGossipStatus(epState);
+
+        if (status.equals(VersionedValue.HIBERNATE)
+            && !SystemKeyspace.bootstrapComplete())
+        {
+            logger.warn("A node with the same IP in hibernate status was detected. Was a replacement already attempted?");
+            return false;
+        }
+
+        //the node was previously removed from the cluster
+        if (isDeadState(epState))
             return true;
 
         if (isBootstrapping)
         {
-            String status = getGossipStatus(epState);
             // these states are not allowed to join the cluster as it would not be safe
             final List<String> unsafeStatuses = new ArrayList<String>()
             {{
@@ -907,7 +937,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         }
     }
 
-    private void doStatusCheck()
+    @VisibleForTesting
+    void doStatusCheck()
     {
         if (logger.isTraceEnabled())
             logger.trace("Performing status check ...");
@@ -915,7 +946,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         long now = System.currentTimeMillis();
         long nowNano = System.nanoTime();
 
-        long pending = ((JMXEnabledThreadPoolExecutor) StageManager.getStage(Stage.GOSSIP)).metrics.pendingTasks.getValue();
+        long pending = ((JMXEnabledThreadPoolExecutor) Stage.GOSSIP.executor()).metrics.pendingTasks.getValue();
         if (pending > 0 && lastProcessedMessageAt < now - 1000)
         {
             // if some new messages just arrived, give the executor some time to work on them
@@ -961,7 +992,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                     {
                         logger.debug("time is expiring for endpoint : {} ({})", endpoint, expireTime);
                     }
-                    evictFromMembership(endpoint);
+                    runInGossipStageBlocking(() -> evictFromMembership(endpoint));
                 }
             }
         }
@@ -1189,9 +1220,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         checkProperThreadForStateMutation();
         if (logger.isTraceEnabled())
             logger.trace("marking as down {}", addr);
-        localState.markDead();
-        liveEndpoints.remove(addr);
-        unreachableEndpoints.put(addr, System.nanoTime());
+        silentlyMarkDead(addr, localState);
         logger.info("InetAddress {} is now DOWN", addr);
         for (IEndpointStateChangeSubscriber subscriber : subscribers)
             subscriber.onDead(addr, localState);
@@ -1199,6 +1228,18 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
             logger.trace("Notified {}", subscribers);
 
         GossiperDiagnostics.markedDead(this, addr, localState);
+    }
+
+    /**
+     * Used by {@link #markDead(InetAddressAndPort, EndpointState)} and {@link #addSavedEndpoint(InetAddressAndPort)}
+     * to register a endpoint as dead.  This method is "silent" to avoid triggering listeners, diagnostics, or logs
+     * on startup via addSavedEndpoint.
+     */
+    private void silentlyMarkDead(InetAddressAndPort addr, EndpointState localState)
+    {
+        localState.markDead();
+        liveEndpoints.remove(addr);
+        unreachableEndpoints.put(addr, System.nanoTime());
     }
 
     /**
@@ -1293,7 +1334,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return pieces[0];
     }
 
-    void applyStateLocally(Map<InetAddressAndPort, EndpointState> epStateMap)
+    @VisibleForTesting
+    public void applyStateLocally(Map<InetAddressAndPort, EndpointState> epStateMap)
     {
         checkProperThreadForStateMutation();
         for (Entry<InetAddressAndPort, EndpointState> entry : epStateMap.entrySet())
@@ -1450,23 +1492,73 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
             deltaEpStateMap.put(gDigest.getEndpoint(), localEpStatePtr);
     }
 
-    /*
-        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
-        and the delta state are built up.
-    */
+    /**
+     * Used during a shadow round to collect the current state; this method clones the current state, no filtering
+     * is done.
+     *
+     * During the shadow round its desirable to return gossip state for remote instances that were created by this
+     * process also known as "empty", this is done for host replacement to be able to replace downed hosts that are
+     * in the ring but have no state in gossip (see CASSANDRA-16213).
+     *
+     * This method is different than {@link #examineGossiper(List, List, Map)} with respect to how "empty" states are
+     * dealt with; they are kept.
+     */
+    Map<InetAddressAndPort, EndpointState> examineShadowState()
+    {
+        logger.debug("Shadow request received, adding all states");
+        Map<InetAddressAndPort, EndpointState> map = new HashMap<>();
+        for (Entry<InetAddressAndPort, EndpointState> e : endpointStateMap.entrySet())
+        {
+            InetAddressAndPort endpoint = e.getKey();
+            EndpointState state = new EndpointState(e.getValue());
+            if (state.isEmptyWithoutStatus())
+            {
+                // We have no app states loaded for this endpoint, but we may well have
+                // some state persisted in the system keyspace. This can happen in the case
+                // of a full cluster bounce where one or more nodes fail to come up. As
+                // gossip state is transient, the peers which do successfully start will be
+                // aware of the failed nodes thanks to StorageService::initServer calling
+                // Gossiper.instance::addSavedEndpoint with every endpoint in TokenMetadata,
+                // which itself is populated from the system tables at startup.
+                // Here we know that a peer which is starting up and attempting to perform
+                // a shadow round of gossip. This peer is in one of two states:
+                // * it is replacing a down node, in which case it needs to learn the tokens
+                //   of the down node and optionally its host id.
+                // * it needs to check that no other instance is already associated with its
+                //   endpoint address and port.
+                // To support both of these cases, we can add the tokens and host id from
+                // the system table, if they exist. These are only ever persisted to the system
+                // table when the actual node to which they apply enters the UP/NORMAL state.
+                // This invariant will be preserved as nodes never persist or propagate the
+                // results of a shadow round, so this communication will be strictly limited
+                // to this node and the node performing the shadow round.
+                UUID hostId = SystemKeyspace.loadHostIds().get(endpoint);
+                if (null != hostId)
+                {
+                    state.addApplicationState(ApplicationState.HOST_ID,
+                                                 StorageService.instance.valueFactory.hostId(hostId));
+                }
+                Set<Token> tokens = SystemKeyspace.loadTokens().get(endpoint);
+                if (null != tokens && !tokens.isEmpty())
+                {
+                    state.addApplicationState(ApplicationState.TOKENS,
+                                                 StorageService.instance.valueFactory.tokens(tokens));
+                }
+            }
+            map.put(endpoint, state);
+        }
+        return map;
+    }
+
+    /**
+     * This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+     * and the delta state are built up.
+     *
+     * When a {@link EndpointState} is "empty" then it is filtered out and not added to the delta state (see CASSANDRA-16213).
+     */
     void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddressAndPort, EndpointState> deltaEpStateMap)
     {
-        if (gDigestList.size() == 0)
-        {
-           /* we've been sent a *completely* empty syn, which should normally never happen since an endpoint will at least send a syn with itself.
-              If this is happening then the node is attempting shadow gossip, and we should respond with everything we know.
-            */
-            logger.debug("Shadow request received, adding all states");
-            for (Map.Entry<InetAddressAndPort, EndpointState> entry : endpointStateMap.entrySet())
-            {
-                gDigestList.add(new GossipDigest(entry.getKey(), 0, 0));
-            }
-        }
+        assert !gDigestList.isEmpty() : "examineGossiper called with empty digest list";
         for ( GossipDigest gDigest : gDigestList )
         {
             int remoteGeneration = gDigest.getGeneration();
@@ -1493,8 +1585,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                 }
                 else if (remoteGeneration < localGeneration)
                 {
-                    /* send all data with generation = localgeneration and version > 0 */
-                    sendAll(gDigest, deltaEpStateMap, 0);
+                    /* send all data with generation = localgeneration and version > -1 */
+                    sendAll(gDigest, deltaEpStateMap, HeartBeatState.EMPTY_VERSION);
                 }
                 else if (remoteGeneration == localGeneration)
                 {
@@ -1749,16 +1841,17 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         if (epState != null)
         {
             logger.debug("not replacing a previous epState for {}, but reusing it: {}", ep, epState);
-            epState.setHeartBeatState(new HeartBeatState(0));
+            epState.setHeartBeatState(HeartBeatState.empty());
         }
         else
         {
-            epState = new EndpointState(new HeartBeatState(0));
+            epState = new EndpointState(HeartBeatState.empty());
+            logger.info("Adding {} as there was no previous epState; new state is {}", ep, epState);
         }
 
         epState.markDead();
         endpointStateMap.put(ep, epState);
-        unreachableEndpoints.put(ep, System.nanoTime());
+        silentlyMarkDead(ep, epState);
         if (logger.isTraceEnabled())
             logger.trace("Adding saved endpoint {} {}", ep, epState.getHeartBeatState().getGeneration());
     }
@@ -1766,9 +1859,9 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     private void addLocalApplicationStateInternal(ApplicationState state, VersionedValue value)
     {
         assert taskLock.isHeldByCurrentThread();
-        EndpointState epState = endpointStateMap.get(FBUtilities.getBroadcastAddressAndPort());
         InetAddressAndPort epAddr = FBUtilities.getBroadcastAddressAndPort();
-        assert epState != null;
+        EndpointState epState = endpointStateMap.get(epAddr);
+        assert epState != null : "Can't find endpoint state for " + epAddr;
         // Fire "before change" notifications:
         doBeforeChangeNotifications(epAddr, epState, state, value);
         // Notifications may have taken some time, so preventively raise the version
@@ -1823,6 +1916,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
 
     public boolean isEnabled()
     {
+        ScheduledFuture<?> scheduledGossipTask = this.scheduledGossipTask;
         return (scheduledGossipTask != null) && (!scheduledGossipTask.isCancelled());
     }
 
@@ -1864,8 +1958,33 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return inShadowRound;
     }
 
+    /**
+     * Creates a new dead {@link EndpointState} that is {@link EndpointState#isEmptyWithoutStatus() empty}.  This is used during
+     * host replacement for edge cases where the seed notified that the endpoint was empty, so need to add such state
+     * into gossip explicitly (as empty endpoints are not gossiped outside of the shadow round).
+     *
+     * see CASSANDRA-16213
+     */
+    public void initializeUnreachableNodeUnsafe(InetAddressAndPort addr)
+    {
+        EndpointState state = new EndpointState(HeartBeatState.empty());
+        state.markDead();
+        EndpointState oldState = endpointStateMap.putIfAbsent(addr, state);
+        if (null != oldState)
+        {
+            throw new RuntimeException("Attempted to initialize endpoint state for unreachable node, " +
+                                       "but found existing endpoint state for it.");
+        }
+    }
+
     @VisibleForTesting
     public void initializeNodeUnsafe(InetAddressAndPort addr, UUID uuid, int generationNbr)
+    {
+        initializeNodeUnsafe(addr, uuid, MessagingService.current_version, generationNbr);
+    }
+
+    @VisibleForTesting
+    public void initializeNodeUnsafe(InetAddressAndPort addr, UUID uuid, int netVersion, int generationNbr)
     {
         HeartBeatState hbState = new HeartBeatState(generationNbr);
         EndpointState newState = new EndpointState(hbState);
@@ -1875,7 +1994,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
 
         // always add the version state
         Map<ApplicationState, VersionedValue> states = new EnumMap<>(ApplicationState.class);
-        states.put(ApplicationState.NET_VERSION, StorageService.instance.valueFactory.networkVersion());
+        states.put(ApplicationState.NET_VERSION, StorageService.instance.valueFactory.networkVersion(netVersion));
         states.put(ApplicationState.HOST_ID, StorageService.instance.valueFactory.hostId(uuid));
         localState.addApplicationStates(states);
     }
@@ -1933,7 +2052,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                 hosts = new ArrayList<>();
                 results.put(stringVersion, hosts);
             }
-            hosts.add(host.getHostAddress(true));
+            hosts.add(host.getHostAddressAndPort());
         }
 
         return results;
@@ -2041,5 +2160,12 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         }
 
         return true;
+    }
+
+    @VisibleForTesting
+    public void stopShutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        stop();
+        ExecutorUtils.shutdownAndWait(timeout, unit, executor);
     }
 }

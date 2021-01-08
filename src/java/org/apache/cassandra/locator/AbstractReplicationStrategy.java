@@ -53,7 +53,6 @@ public abstract class AbstractReplicationStrategy
 
     @VisibleForTesting
     final String keyspaceName;
-    private Keyspace keyspace;
     public final Map<String, String> configOptions;
     private final TokenMetadata tokenMetadata;
 
@@ -64,14 +63,12 @@ public abstract class AbstractReplicationStrategy
 
     protected AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
-        assert keyspaceName != null;
         assert snitch != null;
         assert tokenMetadata != null;
         this.tokenMetadata = tokenMetadata;
         this.snitch = snitch;
         this.configOptions = configOptions == null ? Collections.<String, String>emptyMap() : configOptions;
         this.keyspaceName = keyspaceName;
-        // lazy-initialize keyspace itself since we don't create them until after the replication strategies
     }
 
     private final Map<Token, EndpointsForRange> cachedReplicas = new NonBlockingHashMap<>();
@@ -202,13 +199,6 @@ public abstract class AbstractReplicationStrategy
         }
 
         return resultResponseHandler;
-    }
-
-    private Keyspace getKeyspace()
-    {
-        if (keyspace == null)
-            keyspace = Keyspace.open(keyspaceName);
-        return keyspace;
     }
 
     /**
@@ -419,6 +409,10 @@ public abstract class AbstractReplicationStrategy
     public static Class<AbstractReplicationStrategy> getClass(String cls) throws ConfigurationException
     {
         String className = cls.contains(".") ? cls : "org.apache.cassandra.locator." + cls;
+
+        if ("org.apache.cassandra.locator.OldNetworkTopologyStrategy".equals(className)) // see CASSANDRA-16301 
+            throw new ConfigurationException("The support for the OldNetworkTopologyStrategy has been removed in C* version 4.0. The keyspace strategy should be switch to NetworkTopologyStrategy");
+
         Class<AbstractReplicationStrategy> strategyClass = FBUtilities.classForName(className, "replication strategy");
         if (!AbstractReplicationStrategy.class.isAssignableFrom(strategyClass))
         {

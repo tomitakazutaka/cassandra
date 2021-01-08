@@ -31,7 +31,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Mutation;
@@ -168,11 +167,8 @@ public class RequestCallbacks implements OutboundMessageCallbacks
         InternodeOutboundMetrics.totalExpiredCallbacks.mark();
         messagingService.markExpiredCallback(info.peer);
 
-        if (info.callback.supportsBackPressure())
-            messagingService.updateBackPressureOnReceive(info.peer, info.callback, true);
-
         if (info.invokeOnFailure())
-            StageManager.getStage(INTERNAL_RESPONSE).submit(() -> info.callback.onFailure(info.peer, RequestFailureReason.TIMEOUT));
+            INTERNAL_RESPONSE.submit(() -> info.callback.onFailure(info.peer, RequestFailureReason.TIMEOUT));
 
         // FIXME: this has never belonged here, should be part of onFailure() in AbstractWriteResponseHandler
         if (info.shouldHint())

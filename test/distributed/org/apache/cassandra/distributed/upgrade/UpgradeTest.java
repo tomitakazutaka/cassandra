@@ -20,9 +20,10 @@ package org.apache.cassandra.distributed.upgrade;
 
 import org.junit.Test;
 
-import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.distributed.impl.Versions;
-import org.apache.cassandra.distributed.test.DistributedTestBase;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.Feature;
+import org.apache.cassandra.distributed.shared.Versions;
+import static org.apache.cassandra.distributed.shared.AssertUtils.*;
 
 public class UpgradeTest extends UpgradeTestBase
 {
@@ -31,23 +32,48 @@ public class UpgradeTest extends UpgradeTestBase
     public void upgradeTest() throws Throwable
     {
         new TestCase()
-            .upgrade(Versions.Major.v22, Versions.Major.v30, Versions.Major.v3X)
-            .upgrade(Versions.Major.v30, Versions.Major.v3X, Versions.Major.v4)
-            .setup((cluster) -> {
-                cluster.schemaChange("CREATE TABLE " + DistributedTestBase.KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
+        .upgrade(Versions.Major.v22, Versions.Major.v30, Versions.Major.v3X)
+        .upgrade(Versions.Major.v30, Versions.Major.v3X, Versions.Major.v4)
+        .setup((cluster) -> {
+            cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
 
-                cluster.get(1).executeInternal("INSERT INTO " + DistributedTestBase.KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 1, 1)");
-                cluster.get(2).executeInternal("INSERT INTO " + DistributedTestBase.KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 2, 2)");
-                cluster.get(3).executeInternal("INSERT INTO " + DistributedTestBase.KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 3, 3)");
-            })
-            .runAfterClusterUpgrade((cluster) -> {
-                DistributedTestBase.assertRows(cluster.coordinator(1).execute("SELECT * FROM " + DistributedTestBase.KEYSPACE + ".tbl WHERE pk = ?",
-                                                                              ConsistencyLevel.ALL,
-                                                                              1),
-                                               DistributedTestBase.row(1, 1, 1),
-                                               DistributedTestBase.row(1, 2, 2),
-                                               DistributedTestBase.row(1, 3, 3));
-            }).run();
+            cluster.get(1).executeInternal("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 1, 1)");
+            cluster.get(2).executeInternal("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 2, 2)");
+            cluster.get(3).executeInternal("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 3, 3)");
+        })
+        .runAfterNodeUpgrade((cluster, node) -> {
+            for (int i = 1; i <= cluster.size(); i++)
+            {
+                assertRows(cluster.coordinator(1).execute("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = ?",
+                                                          ConsistencyLevel.ALL,
+                                                          1),
+                           row(1, 1, 1),
+                           row(1, 2, 2),
+                           row(1, 3, 3));
+            }
+        }).run();
     }
-
+    
+    @Test
+    public void simpleUpgradeWithNetworkAndGossipTest() throws Throwable
+    {
+        new TestCase()
+        .nodes(2)
+        .nodesToUpgrade(1)
+        .withConfig((cfg) -> cfg.with(Feature.NETWORK, Feature.GOSSIP))
+        .upgrade(Versions.Major.v3X, Versions.Major.v4)
+        .setup((cluster) -> {
+            cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
+            cluster.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 1, 1)", ConsistencyLevel.ALL);
+        })
+        .runAfterNodeUpgrade((cluster, node) -> {
+            for (int i : new int[]{ 1, 2 })
+            {
+                assertRows(cluster.coordinator(i).execute("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = ?",
+                                                          ConsistencyLevel.ALL,
+                                                          1),
+                           row(1, 1, 1));
+            }
+        }).run();
+    }
 }

@@ -20,6 +20,7 @@ package org.apache.cassandra.hints;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -33,6 +34,7 @@ import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.SyncUtil;
 
@@ -64,10 +66,10 @@ final class HintsCatalog
      */
     static HintsCatalog load(File hintsDirectory, ImmutableMap<String, Object> writerParams)
     {
-        try
+        try(Stream<Path> list = Files.list(hintsDirectory.toPath()))
         {
             Map<UUID, List<HintsDescriptor>> stores =
-                Files.list(hintsDirectory.toPath())
+                     list
                      .filter(HintsDescriptor::isHintFileName)
                      .map(HintsDescriptor::readFromFileQuietly)
                      .filter(Optional::isPresent)
@@ -160,7 +162,7 @@ final class HintsCatalog
                 FileUtils.handleFSErrorAndPropagate(e);
             }
         }
-        else
+        else if (!FBUtilities.isWindows)
         {
             logger.error("Unable to open directory {}", hintsDirectory.getAbsolutePath());
             FileUtils.handleFSErrorAndPropagate(new FSWriteError(new IOException(String.format("Unable to open hint directory %s", hintsDirectory.getAbsolutePath())), hintsDirectory.getAbsolutePath()));

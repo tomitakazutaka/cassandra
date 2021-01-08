@@ -188,6 +188,11 @@ public class Message<T>
         return outWithParam(nextId(), verb, payload, null, null);
     }
 
+    public static <T> Message<T> out(Verb verb, T payload, long expiresAtNanos)
+    {
+        return outWithParam(nextId(), verb, expiresAtNanos, payload, 0, null, null);
+    }
+
     public static <T> Message<T> outWithFlag(Verb verb, T payload, MessageFlag flag)
     {
         assert !verb.isResponse();
@@ -362,8 +367,8 @@ public class Message<T>
             this.id = id;
             this.verb = verb;
             this.from = from;
-            this.createdAtNanos = createdAtNanos;
             this.expiresAtNanos = expiresAtNanos;
+            this.createdAtNanos = createdAtNanos;
             this.flags = flags;
             this.params = params;
         }
@@ -458,6 +463,18 @@ public class Message<T>
         public Builder<T> withParam(ParamType type, Object value)
         {
             params.put(type, value);
+            return this;
+        }
+
+        /**
+         * A shortcut to add tracing params.
+         * Effectively, it is the same as calling {@link #withParam(ParamType, Object)} with tracing params
+         * If there is already tracing params, calling this method overrides any existing ones.
+         */
+        public Builder<T> withTracingParams()
+        {
+            if (Tracing.isTracing())
+                Tracing.instance.addTraceHeaders(params);
             return this;
         }
 
@@ -666,7 +683,7 @@ public class Message<T>
             // int cast cuts off the high-order half of the timestamp, which we can assume remains
             // the same between now and when the recipient reconstructs it.
             out.writeInt((int) approxTime.translate().toMillisSinceEpoch(header.createdAtNanos));
-            out.writeUnsignedVInt(1 + NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
+            out.writeUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
             out.writeUnsignedVInt(header.verb.id);
             out.writeUnsignedVInt(header.flags);
             serializeParams(header.params, out, version);
@@ -700,7 +717,7 @@ public class Message<T>
             long size = 0;
             size += sizeofUnsignedVInt(header.id);
             size += CREATION_TIME_SIZE;
-            size += sizeofUnsignedVInt(1 + NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
+            size += sizeofUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));
             size += sizeofUnsignedVInt(header.verb.id);
             size += sizeofUnsignedVInt(header.flags);
             size += serializedParamsSize(header.params, version);
